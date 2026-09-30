@@ -16,7 +16,7 @@ ifeq ($(shell uname -s),Linux)
   TAGS += gtk3
 endif
 
-.PHONY: build cli install test app icons release release-cli release-windows release-linux clean dev dev-once
+.PHONY: build cli install install-app test app icons release release-cli release-windows release-linux clean dev dev-once
 
 build:
 	go build -tags "$(TAGS)" -trimpath -ldflags="$(LDFLAGS)" -o magpie .
@@ -26,6 +26,22 @@ cli:
 
 install:
 	go install -tags "$(TAGS)" -trimpath -ldflags="$(LDFLAGS)" .
+
+# One step: build the desktop app and put it where the release installer
+# does, then open it. macOS: magpie.app in /Applications (~/Applications
+# when that is not writable) and ~/.local/bin/magpie. Linux: the binary
+# there, plus a menu entry. MAGPIE_OPEN=0 skips launching.
+install-app:
+ifeq ($(shell uname -s),Darwin)
+	@$(MAKE) --no-print-directory app
+	@build/install-app.sh
+else ifeq ($(shell uname -s),Linux)
+	@$(MAKE) --no-print-directory build
+	@build/install-app.sh
+else
+	@$(MAKE) --no-print-directory install
+	@echo "  installed with go install (no app bundle on this OS)"
+endif
 
 test:
 	go vet ./... && go test ./...
