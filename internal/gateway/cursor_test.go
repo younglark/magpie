@@ -17,6 +17,20 @@ import (
 
 func cursorFrame(msg pb) []byte { return connectFrame(msg) }
 
+// cursorDuplex has a fake Cursor answer a Run while its body is still
+// open, as Cursor does, and close the connection after the reply. A Go
+// server in full duplex that ends a reply before the request's body has
+// ended reads the rest of it in finishRequest, after it has stopped its
+// background read, and that read's EOF starts another; the connection's
+// next request then reads beside it and panics "invalid concurrent
+// Body.Read call" (net/http recovers it, and the test goes on), in the
+// log of CI Test run 37791950740 at 8db24fd6 and of green runs. A
+// connection closed after the reply has no next request.
+func cursorDuplex(w http.ResponseWriter) {
+	http.NewResponseController(w).EnableFullDuplex()
+	w.Header().Set("Connection", "close")
+}
+
 func cursorEnd(js string) []byte {
 	b := connectFrame([]byte(js))
 	b[0] = 2
@@ -101,7 +115,7 @@ func TestCursorDecodesTheEnd(t *testing.T) {
 		t.Fatal(got)
 	}
 	for _, ev := range evs {
-		if ev.Kind == KUsage && (ev.Usage.Input != 120 || ev.Usage.Output != 30 || ev.Usage.CacheRead != 7) {
+		if ev.Kind == KUsage && (ev.Usage.Input != 113 || ev.Usage.Output != 30 || ev.Usage.CacheRead != 7) {
 			t.Fatalf("usage %+v", ev.Usage)
 		}
 	}
@@ -153,7 +167,7 @@ func TestCursorMessages(t *testing.T) {
 func TestBuildCursorRun(t *testing.T) {
 	msgs := [][]byte{[]byte(`{"role":"user","content":"hi"}`)}
 	tools := []bridgeTool{{Name: "read", InputSchema: json.RawMessage(`{"type":"object","required":["p"]}`)}}
-	run, blobs := buildCursorRun(msgs, "hi", tools, "gpt-5.4")
+	run, blobs := buildCursorRun(msgs, "hi", tools, "gpt-5.4", "", false)
 	rr := pbFields(pbFields(run)[0].data)
 	var state []pbField
 	var models, mcp []string
@@ -213,7 +227,7 @@ func TestServeCursor(t *testing.T) {
 		}
 		// the Run's body stays open: the reply is flushed, not held until
 		// the body is read to its end
-		http.NewResponseController(w).EnableFullDuplex()
+		cursorDuplex(w)
 		w.Header().Set("Content-Type", "application/connect+proto")
 		w.Write(reply)
 		w.(http.Flusher).Flush()
@@ -336,7 +350,7 @@ func TestServeCursorRegion(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ran = append(ran, name)
 			readConnectFrame(bufio.NewReader(r.Body))
-			http.NewResponseController(w).EnableFullDuplex()
+			cursorDuplex(w)
 			w.Header().Set("Content-Type", "application/connect+proto")
 			if !ok { // a stream's error comes at its end
 				w.Write(cursorEnd(`{"error":` + regionErr + `}`))

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,9 @@ var savedTokenMu sync.Mutex
 // SetLoginOn puts a saved account in use beside the agent's own, or takes
 // it out. The account the agent is signed in to is always in use.
 func SetLoginOn(agent, user string, on bool) error {
+	if pp, ok := pluginOfAgent(agent); ok {
+		return setPluginLoginOn(pp, user, on)
+	}
 	switch agent {
 	case "grok":
 		return setGrokLoginOn(user, on)
@@ -39,28 +43,49 @@ func SetLoginOn(agent, user string, on bool) error {
 		return setWorkBuddyLoginOn(wbSiteOf(agent), user, on)
 	case CommandCodePlanID:
 		return setCommandCodeLoginOn(user, on)
-	case "qoder":
-		return setSideLoginOn("qoder", user, on, qoderLogins())
-	case "dimagent":
-		return setDimAgentLoginOn(user, on)
+	case "qoder", QoderCNID:
+		return setSideLoginOn(agent, user, on, qoderLoginsOf(agent))
 	case "zed":
 		return setZedLoginOn(user, on)
 	case "factory":
 		return setFactoryLoginOn(user, on)
 	case MiMoID:
 		return setMiMoLoginOn(user, on)
+	case ChatGPTAPIID:
+		return setSIWCLoginOn(user, on)
 	case "gemini", "antigravity":
 		return setGoogleLoginOn(agent, user, on)
 	}
 	loginsMu.Lock()
 	defer loginsMu.Unlock()
-	if live, ok := liveLogin(agent); ok && strings.EqualFold(live.User, user) {
+	ls := readLogins()
+	live, ok := liveLogin(agent)
+	if !ok && agent == "claude" {
+		// Claude Code signed out, the account served in its place is as its own
+		if u := claudeStandIn(ls); u != "" {
+			live, ok = savedLogin{Agent: agent, User: u}, true
+		}
+	}
+	if ok && strings.EqualFold(live.User, user) {
+		// the account the agent is signed in to stays so: off, it is
+		// paused, passed over while another is on (#263) — the user's
+		// own ChatGPT sign-in kept for Codex's remote control, a shared
+		// Pro account doing the work
+		if !on && !slices.ContainsFunc(ls, func(l savedLogin) bool { return l.Agent == agent && l.On && !strings.EqualFold(l.User, user) }) {
+			return fmt.Errorf("%s is the only %s account in use; turn another on first to pause it", user, agent)
+		}
+		for i := range ls {
+			if ls[i].Agent == agent && strings.EqualFold(ls[i].User, user) {
+				ls[i].Paused = !on
+				return writeLogins(ls)
+			}
+		}
 		if on {
 			return nil
 		}
-		return fmt.Errorf("%s is signed in to %s; make another account first to stop using it", agent, user)
+		live.Paused, live.Seen = true, time.Now().UTC().Truncate(time.Second)
+		return writeLogins(append(ls, live))
 	}
-	ls := readLogins()
 	for i := range ls {
 		if ls[i].Agent == agent && strings.EqualFold(ls[i].User, user) {
 			ls[i].On = on
@@ -70,9 +95,42 @@ func SetLoginOn(agent, user string, on bool) error {
 	return fmt.Errorf("no saved %s account %q", agent, user)
 }
 
+// pausedOwn says the account user, the one the agent is signed in to, is
+// paused and another of the agent's accounts is on to take its place; the
+// last other one off, it is used again.
+func pausedOwn(ls []savedLogin, agent, user string) bool {
+	paused, others := false, false
+	for _, l := range ls {
+		if l.Agent != agent {
+			continue
+		}
+		if strings.EqualFold(l.User, user) {
+			paused = l.Paused
+		} else {
+			others = others || l.On
+		}
+	}
+	return paused && others
+}
+
+// OwnPaused says the provider is the account a Claude Code or Codex agent
+// is signed in to, paused while another of its accounts is on (#263): the
+// gateway passes over it, the agent staying signed in to it.
+func (p Provider) OwnPaused() bool {
+	if p.Account == nil || p.Account.token != nil && !p.Account.standIn || !slices.Contains(loginAgents, p.Account.Agent) {
+		return false
+	}
+	loginsMu.Lock()
+	defer loginsMu.Unlock()
+	return pausedOwn(readLogins(), p.Account.Agent, p.Account.User)
+}
+
 // AlsoOn is a signed-in agent's other accounts that are on, each as a
 // provider of its own, in the order they were saved.
 func (p Provider) AlsoOn() []Provider {
+	if p.IsPlugin() {
+		return pluginAlsoOn(*p.Account.plugin)
+	}
 	if p.Account != nil && p.Account.Agent == "grok" && p.Account.token == nil {
 		return grokAlsoOn(p)
 	}
@@ -94,11 +152,8 @@ func (p Provider) AlsoOn() []Provider {
 	if p.Account != nil && p.Account.Agent == CommandCodePlanID {
 		return commandCodeAlsoOn()
 	}
-	if p.Account != nil && p.Account.Agent == "qoder" {
-		return qoderAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == "dimagent" {
-		return dimagentAlsoOn()
+	if p.Account != nil && (p.Account.Agent == "qoder" || p.Account.Agent == QoderCNID) {
+		return qoderAlsoOn(p.Account.Agent)
 	}
 	if p.Account != nil && p.Account.Agent == "zed" {
 		return zedAlsoOn()
@@ -109,23 +164,31 @@ func (p Provider) AlsoOn() []Provider {
 	if p.Account != nil && p.Account.Agent == MiMoID {
 		return mimoAlsoOn()
 	}
+	if p.Account != nil && p.Account.Agent == ChatGPTAPIID {
+		return siwcAlsoOn()
+	}
 	if p.Account != nil && (p.Account.Agent == "gemini" || p.Account.Agent == "antigravity") {
 		return googleAlsoOn(p.Account.Agent)
 	}
-	if p.Account == nil || p.Account.token != nil || (p.Account.Agent != "claude" && p.Account.Agent != "codex") {
+	if p.Account == nil || p.Account.token != nil && !p.Account.standIn || (p.Account.Agent != "claude" && p.Account.Agent != "codex") {
 		return nil
 	}
 	var out []Provider
 	for _, l := range Logins(p.Account.Agent) {
-		if l.Active || !l.On {
+		if l.Active || l.first || !l.On {
 			continue
 		}
 		agent, user := l.Agent, l.User
 		a := *p.Account
-		a.User, a.Plan = user, l.Plan
+		a.User, a.Plan, a.standIn = user, l.Plan, false
 		a.token = func(ctx context.Context) (string, error) {
 			tok, _, err := savedLoginToken(ctx, agent, user)
 			return tok, err
+		}
+		if agent == "claude" {
+			// Claude Code runs on it in a config directory of its own
+			// (claude_dirs.go), and keeps the sign-in there itself
+			a.token = func(context.Context) (string, error) { return claudeSavedDir(user) }
 		}
 		if agent == "codex" {
 			a.sign = codexSign(func(ctx context.Context) (string, string, error) { return savedLoginToken(ctx, agent, user) })
@@ -138,9 +201,20 @@ func (p Provider) AlsoOn() []Provider {
 }
 
 // Token is the access token of a saved account in use beside the agent's
-// own; ok is false for the agent's own, which the agent signs itself.
+// own — for a Claude account, the config directory Claude Code runs on it
+// in; ok is false for the agent's own, which the agent signs itself. A
+// Claude account that can't be used, Anthropic having refused its sign-in,
+// is an error, whichever it is (claude_auth.go).
 func (a *Account) Token(ctx context.Context) (tok string, ok bool, err error) {
-	if a == nil || a.token == nil {
+	if a == nil {
+		return "", false, nil
+	}
+	if a.token == nil {
+		if a.Agent == "claude" {
+			if why := claudeOwnRefused(a.User); why != "" {
+				return "", false, errors.New(why)
+			}
+		}
 		return "", false, nil
 	}
 	tok, err = a.token(ctx)
@@ -175,21 +249,6 @@ func renewSavedLogin(ctx context.Context, agent, user string, force bool) (tok, 
 	}
 	var auth []byte
 	switch agent {
-	case "claude":
-		c, ok := parseClaudeCredentials(l.Auth)
-		if !ok {
-			return "", "", errors.New("the saved Claude sign-in of " + user + " is unreadable")
-		}
-		if !force && claudeFresh(c) {
-			return c.OAuth.AccessToken, "", nil
-		}
-		if err := claudeRefresh(ctx, &c); err != nil {
-			return "", "", savedRefreshFailed(agent, user, err)
-		}
-		tok = c.OAuth.AccessToken
-		if auth, err = c.marshal(); err != nil {
-			return "", "", err
-		}
 	case "codex":
 		var raw map[string]any
 		var a codexAuth

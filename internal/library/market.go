@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // The market is where the page finds MCP servers and skills to add in one
@@ -61,8 +63,12 @@ type MarketServer struct {
 	OptIn  bool    `json:"optIn,omitempty"`
 	Inputs []Input `json:"inputs"`
 	// Have is the library's server that is this one
-	Have   string `json:"have,omitempty"`
+	Have string `json:"have,omitempty"`
+	// Match is one found at the address searched for: its repository, page,
+	// endpoint or package is it
+	Match  bool `json:"match,omitempty"`
 	server Server
+	addrs  []string // where it is, normalised (normAddr): matched by an address
 }
 
 func gh(owner string) string { return "https://github.com/" + owner + ".png?size=96" }
@@ -149,13 +155,17 @@ var featured = []MarketServer{
 // command, which InstallServer puts in when it is added.
 const magpieCommand = "magpie"
 
+// selfServerName is the name magpie's own image generation server is written
+// under, in every agent's config.
+const selfServerName = "magpie-image"
+
 // selfServer is magpie's own image generation server: generate_image makes
 // an image with the model Settings → Images → Image generation names, saved
 // in the project. It costs what the model does, so it is given only to the
 // agents picked for it.
 func selfServer() MarketServer {
-	m := localServer("magpie-image", "Magpie Image", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
-		"Generate and edit images with the image model set in Magpie (Settings → Images), saved in the project.", magpieCommand, []string{"mcp", "image"})
+	m := localServer(selfServerName, "Magpie Image", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
+		"Generate and edit images with the image model set in Magpie (Settings → Images), and make short videos with a Grok subscription, saved in the project.", magpieCommand, []string{"mcp", "image"})
 	m.OptIn = true
 	return m
 }
@@ -208,6 +218,7 @@ func init() {
 		if m.Inputs == nil {
 			m.Inputs = []Input{}
 		}
+		m.addrs = addrsOf(m.Homepage, m.server.URL, packageOf(&m.server))
 	}
 }
 
@@ -222,19 +233,31 @@ var seenServers = struct {
 }{m: map[string]MarketServer{}}
 
 // MarketServers is what the market shows for a search: the featured servers
-// that match it, then the registry's.
+// that match it, then the registry's. A search that is an address — a
+// repository, a page, an endpoint, a package — finds the ones at it.
 func MarketServers(q string) ([]MarketServer, error) {
 	q = strings.ToLower(strings.TrimSpace(q))
+	addr := address(q)
 	var out []MarketServer
 	for _, m := range featured {
-		if q == "" || strings.Contains(strings.ToLower(m.Title+" "+m.ID+" "+m.Publisher+" "+m.Description), q) {
+		switch {
+		case addr != "":
+			if addrScore(addr, m.addrs) > 0 {
+				m.Match = true
+				out = append(out, m)
+			}
+		case q == "" || strings.Contains(strings.ToLower(m.Title+" "+m.ID+" "+m.Publisher+" "+m.Description+" "+packageOf(&m.server)), q):
 			out = append(out, m)
 		}
 	}
 	var err error
 	if q != "" {
 		var found []MarketServer
-		found, err = searchRegistry(q)
+		if addr != "" {
+			found, err = searchRegistryAt(addr)
+		} else {
+			found, err = searchRegistry(q)
+		}
 		for _, f := range found {
 			if !slices.ContainsFunc(out, func(m MarketServer) bool { return serverKey(&m.server) == serverKey(&f.server) }) {
 				out = append(out, f)
@@ -326,7 +349,16 @@ type registryVar struct {
 
 var placeholderRe = regexp.MustCompile(`\{[^{}]*\}`)
 
-func searchRegistry(q string) ([]MarketServer, error) {
+// listed is an active server the registry lists, as the market
+// offers it.
+type listed struct {
+	m MarketServer
+	r registryServer
+}
+
+// fetchRegistry is what the registry lists for a search, which it matches
+// against servers' names; the same server once.
+func fetchRegistry(q string) ([]listed, error) {
 	u := registryURL + "?" + url.Values{"search": {q}, "limit": {"100"}, "version": {"latest"}}.Encode()
 	var body struct {
 		Servers []struct {
@@ -339,11 +371,7 @@ func searchRegistry(q string) ([]MarketServer, error) {
 	if err := getJSON(u, &body); err != nil {
 		return nil, fmt.Errorf("couldn't search the MCP Registry: %w", err)
 	}
-	type scored struct {
-		m     MarketServer
-		score int
-	}
-	var list []scored
+	var list []listed
 	seen := map[string]bool{}
 	for _, e := range body.Servers {
 		if st := e.Meta["io.modelcontextprotocol.registry/official"].Status; st != "" && st != "active" {
@@ -354,8 +382,68 @@ func searchRegistry(q string) ([]MarketServer, error) {
 			continue
 		}
 		seen[serverKey(&m.server)] = true
-		list = append(list, scored{m, rank(&e.Server, m, q)})
+		list = append(list, listed{m, e.Server})
 	}
+	return list, nil
+}
+
+type scored struct {
+	m     MarketServer
+	score int
+}
+
+func searchRegistry(q string) ([]MarketServer, error) {
+	found, err := fetchRegistry(q)
+	if err != nil {
+		return nil, err
+	}
+	var list []scored
+	for _, e := range found {
+		list = append(list, scored{e.m, rank(&e.r, e.m, q)})
+	}
+	return offer(list), nil
+}
+
+// searchRegistryAt finds the registry's servers at an address. The registry
+// searches names only, so it's asked for the names the address suggests (a
+// repository's, its owner's), and what it lists is kept when its repository,
+// page, endpoint or package is the address. When none is, what it lists for
+// the first name is offered, as a search for that name would.
+func searchRegistryAt(addr string) ([]MarketServer, error) {
+	var matched, byName []scored
+	seen := map[string]bool{}
+	for i, term := range addrTerms(addr) {
+		found, err := fetchRegistry(term)
+		if err != nil {
+			if i == 0 {
+				return nil, err
+			}
+			break
+		}
+		for _, e := range found {
+			if i == 0 {
+				byName = append(byName, scored{e.m, rank(&e.r, e.m, term)})
+			}
+			k := serverKey(&e.m.server)
+			if seen[k] {
+				continue
+			}
+			if sc := addrScore(addr, e.m.addrs); sc > 0 {
+				seen[k] = true
+				e.m.Match = true
+				matched = append(matched, scored{e.m, sc*1000 + rank(&e.r, e.m, term)})
+			}
+		}
+	}
+	if len(matched) > 0 {
+		return offer(matched), nil
+	}
+	return offer(byName), nil
+}
+
+// offer is the best of a search's servers, best first, kept for one to be
+// installed by its id.
+func offer(list []scored) []MarketServer {
 	sort.SliceStable(list, func(i, j int) bool { return list[i].score > list[j].score })
 	out := []MarketServer{}
 	seenServers.Lock()
@@ -370,7 +458,7 @@ func searchRegistry(q string) ([]MarketServer, error) {
 		seenServers.m[s.m.ID] = s.m
 		out = append(out, s.m)
 	}
-	return out, nil
+	return out
 }
 
 // rank puts first what's called what was searched for, then what says it
@@ -406,6 +494,13 @@ func rank(r *registryServer, m MarketServer, q string) int {
 // when it has one, else the package it's published as.
 func fromRegistry(r *registryServer) (MarketServer, bool) {
 	m := MarketServer{ID: r.Name, Name: shortName(r.Name), Title: r.Title, Description: r.Description, Homepage: r.WebsiteURL, Inputs: []Input{}}
+	m.addrs = addrsOf(r.Name, r.WebsiteURL, r.Repository.URL)
+	for _, rm := range r.Remotes {
+		m.addrs = append(m.addrs, addrsOf(rm.URL)...)
+	}
+	for _, p := range r.Packages {
+		m.addrs = append(m.addrs, addrsOf(p.Identifier)...)
+	}
 	if m.Title == "" {
 		m.Title = m.Name
 	}
@@ -681,11 +776,21 @@ type MarketSkill struct {
 	Name     string `json:"name"`
 	Installs int    `json:"installs"`
 	Official bool   `json:"official,omitempty"`
+	// Featured is magpie's own, not one skills.sh lists
+	Featured bool   `json:"featured,omitempty"`
 	Icon     string `json:"icon"`
 	// Description is known once it has been fetched
 	Description string `json:"description,omitempty"`
 	Have        string `json:"have,omitempty"`
 }
+
+// featuredSkills are magpie's own skills, first in the market: in
+// magpie-community/plugins, beside its plugins (ttmouse on X: an official
+// skill for an agent to read what magpie quota tells).
+var featuredSkills = []MarketSkill{{
+	Source: "magpie-community/plugins", SkillID: "magpie-quota", Name: "magpie-quota", Official: true, Featured: true,
+	Description: "Check how much is left of the user's AI subscriptions, coding plans and API key balances through magpie: each usage window's percent used and when it resets, each key's balance, and wait until a subscription has allowance again.",
+}}
 
 type skillsShEntry struct {
 	Source   string `json:"source"`
@@ -710,11 +815,11 @@ var popular = struct {
 }{}
 
 func marketCache(name string) string {
-	d, err := os.UserCacheDir()
+	d, err := appdir.SystemCache()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(d, "magpie", "market", name)
+	return filepath.Join(d, "market", name)
 }
 
 // popularSkills are skills.sh's most installed, read off its front page,
@@ -772,8 +877,9 @@ func searchSkillsSh(q string) ([]skillsShEntry, error) {
 	return slices.DeleteFunc(body.Skills, func(e skillsShEntry) bool { return !repoRe.MatchString(e.Source) || e.SkillID == "" }), nil
 }
 
-// MarketSkills is what the market shows for a search: the most installed
-// skills that match it, then what skills.sh finds for it.
+// MarketSkills is what the market shows for a search: magpie's own skills
+// that match it, the most installed skills that do, then what skills.sh
+// finds for it.
 func MarketSkills(q string) ([]MarketSkill, error) {
 	q = strings.ToLower(strings.TrimSpace(q))
 	var list []skillsShEntry
@@ -804,6 +910,26 @@ func MarketSkills(q string) ([]MarketSkill, error) {
 	about := cachedAbout()
 	l, _ := loadLocked()
 	out := []MarketSkill{}
+	for _, f := range featuredSkills {
+		if q != "" && !strings.Contains(strings.ToLower(f.Name+" "+f.Source+" "+f.Description), q) {
+			continue
+		}
+		owner, _, _ := strings.Cut(f.Source, "/")
+		f.ID, f.Icon = f.Source+"/"+f.SkillID, gh(owner)
+		if l != nil {
+			f.Have = l.haveSkill(f.Source, f.SkillID, f.Name)
+		}
+		// once skills.sh lists it too, its count of installs is told, and
+		// it isn't shown twice
+		list = slices.DeleteFunc(list, func(e skillsShEntry) bool {
+			if e.Source == f.Source && e.SkillID == f.SkillID {
+				f.Installs = e.Installs
+				return true
+			}
+			return false
+		})
+		out = append(out, f)
+	}
 	for _, e := range list {
 		owner, _, _ := strings.Cut(e.Source, "/")
 		ms := MarketSkill{ID: e.Source + "/" + e.SkillID, Source: e.Source, SkillID: e.SkillID, Name: e.Name, Installs: e.Installs,
@@ -821,6 +947,14 @@ func (l *Library) haveSkill(source, id, name string) string {
 	for _, s := range l.Skills {
 		if s.Source != nil && s.Source.Kind == "github" && strings.EqualFold(s.Source.Repo, source) &&
 			(s.Name == id || s.Name == name || lastPart(s.Source.Path) == id) {
+			return s.Name
+		}
+	}
+	// one taken in from an agent's folder (npx skills puts them in
+	// ~/.agents/skills) has no source to match, and adding is turned away
+	// by name all the same (InstallMarketSkill): it's had by its name
+	for _, n := range []string{id, name} {
+		if s := l.skill(n); s != nil {
 			return s.Name
 		}
 	}
@@ -916,9 +1050,6 @@ func InstallMarketSkill(source, id string, agents []string) (*Result, error) {
 	if i < 0 {
 		return nil, fmt.Errorf("%s has no skill %s any more", source, id)
 	}
-	if p.Candidates[i].Have {
-		return nil, fmt.Errorf("the library already has a skill called %s", p.Candidates[i].Name)
-	}
 	if agents == nil {
 		for _, t := range Targets() {
 			if t.Skills != "" {
@@ -926,7 +1057,10 @@ func InstallMarketSkill(source, id string, agents []string) (*Result, error) {
 			}
 		}
 	}
-	return InstallSkills(source, []string{p.Candidates[i].Path}, agents)
+	// the market showed this one skill: the repository's others are
+	// offered as new by a check, beside it
+	path := p.Candidates[i].Path
+	return installChange(func(l *Library, in *installed) error { return installFrom(l, p, []string{path}, agents, false, in) })
 }
 
 // ---- icons ------------------------------------------------------------------

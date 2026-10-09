@@ -14,6 +14,7 @@ import (
 	"github.com/tidwall/jsonc"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/edit"
 )
 
@@ -84,7 +85,7 @@ var piGlobalRoots = func() []string {
 		}
 	}
 	if runtime.GOOS == "windows" {
-		if d := os.Getenv("APPDATA"); d != "" {
+		if d := appdir.Getenv("APPDATA"); d != "" {
 			out = append(out, filepath.Join(d, "npm", "node_modules"))
 		}
 		return out
@@ -217,7 +218,13 @@ func piMCP(h, d, version string) (*mcpFile, string) {
 	if p.ext && !p.adapter {
 		via = "pi-mcp-extension"
 	}
-	return piFiles(h, d, p), via
+	f := piFiles(h, d, p)
+	// pi-mcp-extension sends its config as written ("no env var
+	// interpolation — WYSIWYG config", src/config.ts), and with it there
+	// the servers reach its file too; pi-mcp-adapter 5 reads ${NAME} in
+	// headers and env (utils.ts interpolateEnvVars, docs/servers.md)
+	f.Literal = p.ext
+	return f, via
 }
 
 // piFiles is the file an extension reads Pi's MCP servers from:
@@ -266,8 +273,8 @@ var piKey = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // piMove moves what pi-mcp-adapter read from mcp.json into
 // mcp-adapter.json: the whole file when there is none yet, as the adapter's
-// own warning says; into one there, each server and setting it hasn't got
-// (the file backed up first). A server or setting the two have
+// own warning says; into one there, each server and setting it hasn't got.
+// Either way the files are backed up first. A server or setting the two have
 // differently stays in mcp.json for the user to merge, as does anything
 // the adapter never read; mcp.json goes once nothing is left in it.
 //
@@ -284,7 +291,11 @@ func piMove(from, to string, serversOnly bool) {
 		return
 	}
 	if !serversOnly && !exists(to) {
-		os.Rename(from, to)
+		// the user's mcp.json is copied aside before it is moved, as it is
+		// before a merge (#1097); one that can't be kept stays where it is
+		if newBackups().keep("pi", from) == nil {
+			os.Rename(from, to)
+		}
 		return
 	}
 	var have map[string]json.RawMessage
@@ -364,7 +375,7 @@ func piMove(from, to string, serversOnly bool) {
 				delete(doc, key)
 			}
 		}
-		if len(doc) == 0 {
+		if len(doc) == 0 && !edit.IsLink(from) { // a linked one stays, emptied
 			os.Remove(from)
 		}
 	}

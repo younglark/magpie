@@ -1,5 +1,14 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): ZCode ("zcode") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-zcode-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/zcode) and raise the
+// mover's min in internal/provider/migrate_zcode.go.
+
 // A ZCode subscription is Z.ai's GLM Coding Plan, which ZCode (Zhipu's
 // desktop app) signs in to. The plan is served on an Anthropic-compatible
 // endpoint to a plain API key, `<id>.<secret>`, that ZCode mints for the
@@ -39,7 +48,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -77,6 +88,9 @@ type zcodeKey struct {
 	Token   string `json:"token,omitempty"`
 	Org     string `json:"org,omitempty"`
 	Project string `json:"project,omitempty"`
+	// UID is the account's user id, as ZCode's sign-in names it: with the
+	// site, which account this is (zcodeSame).
+	UID string `json:"uid,omitempty"`
 }
 
 // ---- ZCode's own account ------------------------------------------------------
@@ -192,6 +206,7 @@ func zcodeOwn() (who string, k zcodeKey, ok bool) {
 			}
 		}
 	}
+	k.UID = strings.TrimSpace(info.ID)
 	return zcodeWho(info.Email, info.Name, info.ID), k, true
 }
 
@@ -312,19 +327,37 @@ func zcodeProvider(who, plan string, k zcodeKey) Provider {
 			if zcodeJWTExpired(k.JWT) {
 				return errZCodeExpired
 			}
-			key = k.JWT
-			zcodeSourceHeaders(req)
+			zcodeStartRequest(req, k.Base, body)
+			// the token as a Bearer only, no x-api-key, as a client the
+			// Start Plan still serves sends it
+			req.Header.Del("x-api-key")
+			req.Header.Set("Authorization", "Bearer "+k.JWT)
+			return nil
 		}
 		req.Header.Del("Authorization")
 		req.Header.Set("x-api-key", key)
 		req.Header.Set("Authorization", "Bearer "+key)
 		return nil
 	}
+	acct.clientFor = zcodeStartClientFor
+	acct.explain = func(status int, body []byte) string {
+		if zcodeOnStartAs(nil, k, plan) {
+			return zcodeStartExplain(status, body)
+		}
+		return ""
+	}
 	acct.models = func() []catalog.Model {
-		if zcodeOnStart(nil, k) {
+		if zcodeOnStartAs(nil, k, plan) {
 			return zcodeStartModels
 		}
 		return zcodeModels
+	}
+	// on the Start Plan, a model only the Coding Plan has (GLM-5.3) is
+	// neither listed nor picked, though the list fetched last (another
+	// account's, or this one's before its plan was found) has it
+	startServes := sync.OnceValue(zcodeStartServes)
+	acct.unusable = func(model string) bool {
+		return zcodeOnStartAs(nil, k, plan) && !startServes()(model)
 	}
 	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
 		b := base(zcodeOnStart(ctx, k))
@@ -334,7 +367,7 @@ func zcodeProvider(who, plan string, k zcodeKey) Provider {
 		}
 		return ms, catalog.SaveLive("zcode", b, ms)
 	}
-	return Provider{ID: "zcode", Name: "ZCode", Icon: "zcode", Anthropic: base(zcodeOnStart(nil, k)), Website: "https://zcode.z.ai", Account: acct}
+	return Provider{ID: "zcode", Name: "ZCode", Icon: "zcode", Anthropic: base(zcodeOnStartAs(nil, k, plan)), Website: "https://zcode.z.ai", Account: acct}
 }
 
 // ---- allowance ----------------------------------------------------------------
@@ -358,7 +391,10 @@ func zcodeQuota(ctx context.Context, l Login, k zcodeKey) SubscriptionQuota {
 		q.Plan = "GLM Coding " + strings.ToUpper(data.Level[:1]) + data.Level[1:]
 	}
 	q.Windows = data.windows()
+	resets := make(chan *ResetCredits, 1)
+	go func() { resets <- zhipuPersonalResets(ctx, zcodeRoot(k.Base), k.Key) }()
 	q.Until, q.Renew = zhipuTerm(ctx, zcodeRoot(k.Base), k.Key)
+	q.Resets = <-resets
 	return q
 }
 
@@ -381,14 +417,23 @@ type zhipuLimits struct {
 
 // windows are the limits as windows: what is used of the whole when both
 // are told (the whole less what remains, or the current value), else the
-// percentage the vendor gives.
+// percentage the vendor gives. TIME_LIMIT is the month's MCP tool calls,
+// which ZCode shows but never stops the models on, so it is set aside, as
+// is a limit whose whole is told as 0: no cap (an older plan's), which
+// the vendor may still give as 100% used.
 func (d zhipuLimits) windows() []QuotaWindow {
 	out := []QuotaWindow{}
 	for _, x := range d.Limits {
 		span := zcodeSpan(x.Unit, x.Number)
 		w := QuotaWindow{Name: zcodeWindowName(span), Span: span}
+		if strings.EqualFold(x.Type, "TIME_LIMIT") {
+			w.Name, w.Aside = "MCP · Month", true
+		}
 		if x.Percent != nil {
 			w.Used = *x.Percent
+		}
+		if x.Usage != nil && *x.Usage == 0 {
+			w.Used, w.Aside = 0, true
 		}
 		if x.Usage != nil && *x.Usage > 0 {
 			total := *x.Usage
@@ -566,6 +611,7 @@ func zcodeCallH(ctx context.Context, method, u, auth string, hdr map[string]stri
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "ZCode/"+zcodeAppVersion)
+	zcodeDeviceHeader(req)
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
@@ -582,6 +628,9 @@ func zcodeCallH(ctx context.Context, method, u, auth string, hdr map[string]stri
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		if json.Unmarshal(b, &env) == nil && env.Msg != "" {
+			if c := strings.Trim(string(env.Code), `"`); c != "" && c != "null" && c != "0" {
+				return fmt.Errorf("%s (%d, code %s)", env.Msg, res.StatusCode, c)
+			}
 			return fmt.Errorf("%s (%d)", env.Msg, res.StatusCode)
 		}
 		return &accountStatusError{status: res.StatusCode}
@@ -601,6 +650,57 @@ func zcodeCallH(ctx context.Context, method, u, auth string, hdr map[string]stri
 // zcodeGet asks with a coding plan's key, which goes bare in Authorization.
 func zcodeGet(ctx context.Context, u, key string, dst any) error {
 	return zcodeCall(ctx, http.MethodGet, u, key, nil, dst)
+}
+
+// zcodeSite is the site a key's account is on: "bigmodel" or "zai".
+func zcodeSite(k zcodeKey) string {
+	if k.Base == ZCodeBigModelBase || strings.HasSuffix(hostOf(k.Base), "bigmodel.cn") {
+		return "bigmodel"
+	}
+	return "zai"
+}
+
+// zcodeSame says two keys are the same account: on the same site, with the
+// same user id; one kept before magpie kept ids is told by its key's id,
+// and taken for the same when it has none, as it was before.
+func zcodeSame(a, b zcodeKey) bool {
+	if zcodeSite(a) != zcodeSite(b) {
+		return false
+	}
+	if a.UID != "" && b.UID != "" {
+		return a.UID == b.UID
+	}
+	ia, _, _ := strings.Cut(a.Key, ".")
+	ib, _, _ := strings.Cut(b.Key, ".")
+	return ia == "" || ib == "" || ia == ib
+}
+
+// zcodeName is the name an account signed in is kept under: who, as ZCode
+// names it, unless another account is kept under that name, then who and
+// its site, numbered when that is taken too. Accounts are kept by name, so
+// a Z.ai and a BigModel account on the same phone number, or two ZCode
+// names alike, took each other's place (Bandit on Discord). The same
+// account signed in again keeps its name and is updated in place.
+func zcodeName(who, site string, k zcodeKey, have []zcodeLoginKey) string {
+	if k.UID != "" {
+		for _, l := range have {
+			if l.key.UID == k.UID && zcodeSite(l.key) == site {
+				return l.User
+			}
+		}
+	}
+	for n := 1; ; n++ {
+		name := who
+		if n == 2 {
+			name = who + " (" + zcodeSiteName(site) + ")"
+		} else if n > 2 {
+			name = fmt.Sprintf("%s (%s %d)", who, zcodeSiteName(site), n-1)
+		}
+		i := slices.IndexFunc(have, func(l zcodeLoginKey) bool { return strings.EqualFold(l.User, name) })
+		if i < 0 || zcodeSame(have[i].key, k) {
+			return name
+		}
+	}
 }
 
 // ---- signing in ---------------------------------------------------------------
@@ -704,17 +804,22 @@ func startZCodeSignIn(s *signInFlow, site string) error {
 				fail("ZCode sign-in: unexpected answer " + got.Status)
 				return
 			}
-			who := zcodeWho(got.User.Email, got.User.Name, got.User.ID)
 			k, plan, err := zcodeSignedIn(ctx, site, token, strings.TrimSpace(got.Token))
 			if err != nil {
 				fail(err.Error())
 				return
 			}
-			auth, _ := json.Marshal(k)
-			ownUser, _, ok := zcodeOwn()
+			k.UID = strings.TrimSpace(got.User.ID)
+			ownUser, own, ok := zcodeOwn()
 			if !ok {
 				ownUser = ""
 			}
+			have := zcodeLogins()
+			if ok && !slices.ContainsFunc(have, func(l zcodeLoginKey) bool { return strings.EqualFold(l.User, ownUser) }) {
+				have = append(have, zcodeLoginKey{Login{User: ownUser}, own}) // removed in magpie, still ZCode's
+			}
+			who := zcodeName(zcodeWho(got.User.Email, got.User.Name, got.User.ID), site, k, have)
+			auth, _ := json.Marshal(k)
 			if err := addSideLogin(savedLogin{Agent: "zcode", User: who, Plan: plan, Auth: auth}, ownUser, func(savedLogin) {}); err != nil {
 				fail(err.Error())
 				return
@@ -759,8 +864,12 @@ func zcodeSignedIn(ctx context.Context, site, token, jwt string) (zcodeKey, stri
 			}
 		}
 	}
+	// the Start Plan's balance not read is said as it is, not taken for
+	// the account having none (#282: a 400 "parameter error" read as that)
+	var berr error
 	if jwt != "" {
-		if b, berr := zcodeStartBalance(ctx, jwt); berr == nil {
+		var b zcodeBalance
+		if b, berr = zcodeStartBalance(ctx, jwt); berr == nil {
 			if name, _, ok := b.active(); ok {
 				if err != nil || k.Key == "" { // no key made: the Start Plan alone
 					k = zcodeKey{Base: zcodeSiteBase(site)}
@@ -770,11 +879,17 @@ func zcodeSignedIn(ctx context.Context, site, token, jwt string) (zcodeKey, stri
 			}
 		}
 	}
-	if team != "" {
+	switch {
+	case team != "" && berr != nil:
+		return zcodeKey{}, "", fmt.Errorf("%s; ZCode's Start Plan: %v", team, berr)
+	case team != "":
 		return zcodeKey{}, "", errors.New(string(team))
-	}
-	if err != nil {
+	case err != nil && berr != nil:
+		return zcodeKey{}, "", fmt.Errorf("%w; ZCode's Start Plan: %v", err, berr)
+	case err != nil:
 		return zcodeKey{}, "", err
+	case berr != nil:
+		return zcodeKey{}, "", fmt.Errorf("this %s account has no GLM Coding Plan, of its own or a team's, and ZCode's Start Plan could not be read: %v", zcodeSiteName(site), berr)
 	}
 	return zcodeKey{}, "", fmt.Errorf("this %s account has no GLM Coding Plan, of its own or a team's, and ZCode's Start Plan has ended or was never started — subscribe at %s, then add it again", zcodeSiteName(site), zcodeSubscribeAt(site))
 }

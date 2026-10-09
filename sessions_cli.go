@@ -104,7 +104,12 @@ func sessionsTo(w io.Writer, args []string, now time.Time) error {
 	if o.days >= 0 {
 		return sessionStats(w, o, sessions.StatsAt(o.days, now), now)
 	}
-	return sessionList(w, o, sessions.List(0), now)
+	// the list reads every session, as the "%d more" foot and a model or
+	// folder picked among them are counted over the whole set: sessions.Limit
+	// cut it to 200 whatever --limit said, so --limit 500 could never show
+	// more than 200 and the foot was counted off that truncated list. Only
+	// o.limit rows are printed, so reading the rest costs a parse, not output
+	return sessionList(w, o, sessions.List(sessions.All), now)
 }
 
 // resolve finds what was typed among what there is: the same, then the
@@ -377,9 +382,11 @@ func rollupCost(c float64, unpriced []string) string {
 	return cost(stats.Totals{Cost: c, Unpriced: len(unpriced)})
 }
 
-// hitRate is how much of the prompts came from the cache.
+// hitRate is how much of the prompts came from the cache: of all they
+// came to, what was read, written to the cache and neither (Input, which
+// leaves out both).
 func hitRate(t sessions.Tokens) string {
-	if p := t.Input + t.CacheRead; t.CacheRead > 0 && p > 0 {
+	if p := t.Input + t.CacheRead + t.CacheWrite; t.CacheRead > 0 && p > 0 {
 		return muted.Render(fmt.Sprintf(" (%d%% hit)", 100*t.CacheRead/p))
 	}
 	return ""

@@ -43,7 +43,11 @@ type sessFilterMsg struct {
 
 func (m *model) reloadSessions() {
 	m.sstats = sessions.StatsFor(sessRanges[m.srange].days)
-	m.slist = sessions.List(0)
+	// the whole set, as the page's count beside it is taken from: the list
+	// head says how many there are, and the range filter narrows what is
+	// shown of them. sessions.Limit is the window gateway attribution is
+	// judged over, not a listing's length, so this asks for sessions.All
+	m.slist = sessions.List(sessions.All)
 	m.ssel = clamp(m.ssel, len(m.sessShown()))
 }
 
@@ -324,7 +328,9 @@ func sessLines(st sessions.Stats, rng int, model, folder string, byCost bool, wi
 		c = sOK.Render(fmtCost(usage.Totals{Cost: r.Cost, Unpriced: len(r.Unpriced)}))
 	}
 	hit := ""
-	if p := r.Input + r.CacheRead; r.CacheRead > 0 && p > 0 {
+	// of all the prompts came to: Input leaves out what was read from the
+	// cache and what was written to it
+	if p := r.Input + r.CacheRead + r.CacheWrite; r.CacheRead > 0 && p > 0 {
 		hit = sMuted.Render(fmt.Sprintf(" (%d%% hit)", 100*r.CacheRead/p))
 	}
 	active := sessions.Duration(r.Active)

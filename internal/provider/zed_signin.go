@@ -1,5 +1,14 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Zed ("zed") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-zed-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/zed) and raise the mover's
+// min in internal/provider/migrate_zed.go.
+
 // Zed's sign-in, run by magpie as the editor runs it: a key is made, the
 // browser opens zed.dev's sign-in page with its public half and the port
 // magpie listens on, and comes back there with the account's id and its
@@ -42,6 +51,11 @@ func startZedSignIn(s *signInFlow) error {
 			http.NotFound(w, r)
 			return
 		}
+		if !s.claim() {
+			// its address was pasted too, and that one is being finished
+			signInPage(w, false, "This sign-in is already finishing", "magpie shows the account when it's done.")
+			return
+		}
 		select {
 		case got <- callback{uid, tok}:
 		default:
@@ -53,6 +67,9 @@ func startZedSignIn(s *signInFlow) error {
 	s.mu.Lock()
 	s.st.URL = zed.SignInURL(zedSite, port, pub, systemID)
 	s.srv, s.stop = srv, cancel
+	s.redirect = fmt.Sprintf("http://127.0.0.1:%d", port)
+	// a browser that can't reach the port finishes it with its address
+	s.st.PasteCallback = true
 	s.mu.Unlock()
 	go func() { _ = srv.Serve(ln) }()
 

@@ -9,12 +9,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // twoProviders: "plan" (the one agents pick) falls back to "spare".
@@ -164,11 +166,89 @@ func TestSeveralKeysOnTakeOverFromEachOther(t *testing.T) {
 	}
 }
 
+// #1235: two SenseNova keys, whose plan doesn't have deepseek-v4.1-flash.
+// An agent kept asking for it, every try refused with SenseNova's 403 "model
+// is not available in the current token plan", and each refusal rested the
+// whole key, longer each time, till both keys sat out for every model. Only
+// the model rests: the keys serve deepseek-v4-flash first in their order,
+// and no key's rest grows.
+func TestModelNotInPlanRestsTheModelNotTheKey(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	restingUntil.Lock()
+	restingUntil.m, restingUntil.note = map[string]time.Time{}, map[string]Rest{}
+	restingUntil.Unlock()
+	routed.Lock()
+	routed.failures = map[string]int{}
+	routed.Unlock()
+	var seen []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		seen = append(seen, key+":"+req.Model)
+		w.Header().Set("Content-Type", "application/json")
+		if req.Model == "deepseek-v4.1-flash" {
+			w.WriteHeader(403)
+			io.WriteString(w, `{"error": {"code": 7,"message": "model is not available in the current token plan"}}`)
+			return
+		}
+		io.WriteString(w, `{"id":"from-`+key+`","choices":[]}`)
+	}))
+	defer up.Close()
+	p := provider.Provider{ID: "sensenova", Name: "sensenova", Chat: up.URL + "/v1",
+		Models: []string{"deepseek-v4-flash", "deepseek-v4.1-flash"},
+		Key:    "k-one", KeyName: "One", Keys: []provider.KeyAccount{{Name: "Two", Key: "k-two"}}}
+	if err := provider.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := provider.Find("sensenova")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	send := func(model string) (int, string) {
+		rec := httptest.NewRecorder()
+		body := `{"model":"sensenova/` + model + `","messages":[{"role":"user","content":"hi"}]}`
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		return rec.Code, rec.Body.String()
+	}
+	for range 4 {
+		if code, body := send("deepseek-v4.1-flash"); code != 403 || !strings.Contains(body, "not available in the current token plan") {
+			t.Fatalf("v4.1: %d %s", code, body)
+		}
+	}
+	for _, k := range saved.KeyList() {
+		if r, ok := RestOf(saved.RestKey(k)); ok {
+			t.Errorf("key %s rests for a model its plan lacks: %+v", k.Name, r)
+		}
+	}
+	// the model itself rests on each key, as the failure it is
+	for _, k := range saved.KeyList() {
+		r, ok := RestOf(saved.RestKey(k) + "/deepseek-v4.1-flash")
+		if !ok {
+			t.Errorf("key %s: deepseek-v4.1-flash doesn't rest", k.Name)
+		} else if r.Why != failOther || r.Status != 403 {
+			t.Errorf("key %s: rest %+v", k.Name, r)
+		}
+	}
+	seen = nil
+	if code, body := send("deepseek-v4-flash"); code != 200 || !strings.Contains(body, "from-k-one") {
+		t.Fatalf("v4: %d %s", code, body)
+	}
+	if strings.Join(seen, ",") != "k-one:deepseek-v4-flash" {
+		t.Fatalf("v4 tried %v; want the first key, straight", seen)
+	}
+}
+
 // Two ChatGPT accounts ticked: the one Codex is signed in to is out of
 // quota, so the request goes to the saved one, signed with its own tokens.
 func TestSubscriptionAccountsTakeOver(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	restingUntil.Lock()
@@ -231,8 +311,12 @@ func TestSubscriptionAccountsTakeOver(t *testing.T) {
 // token and no email: the account is still named from ~/.claude.json, so it
 // is the saved me@example.com, not a "Claude Max" served beside it.
 func TestClaudeAccountsTakeOver(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script stands in for Claude Code")
+	}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	far := time.Now().Add(24 * time.Hour).UnixMilli()
@@ -253,9 +337,10 @@ func TestClaudeAccountsTakeOver(t *testing.T) {
 	// out of quota, the CLI says so in a result and waits on its next input
 	script := `#!/bin/sh
 if [ "$1" = auth ]; then echo '{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}'; exit 0; fi
-echo "${CLAUDE_CODE_OAUTH_TOKEN:-own}" >> ` + log + `
+TOK=; [ -n "$CLAUDE_CONFIG_DIR" ] && TOK=$(sed -n 's/.*"accessToken": *"\([^"]*\)".*/\1/p' "$CLAUDE_CONFIG_DIR/.credentials.json")
+echo "${TOK:-own}" >> ` + log + `
 while read -r line; do
-  if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] || [ "$CLAUDE_CODE_OAUTH_TOKEN" = tok-me ]; then
+  if [ -z "$TOK" ] || [ "$TOK" = tok-me ]; then
     echo '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1790700000}}'
     echo '{"type":"assistant","message":{"id":"x","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You'"'"'ve hit your limit · resets 3am"}]},"error":"rate_limit"}'
     echo '{"type":"result","subtype":"success","is_error":true,"result":"You'"'"'ve hit your limit · resets 3am"}'
@@ -268,7 +353,7 @@ while read -r line; do
   fi
 done
 `
-	os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755)
+	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	provider.ForgetAccounts()
 	t.Cleanup(provider.ForgetAccounts)

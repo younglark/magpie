@@ -87,6 +87,7 @@ function serve(lang, seen, ctl = {}) {
     }
     if (url.pathname === "/api/sessions/one") { seen.push("one " + q.get("key")); return json(full(q.get("key"))); }
     if (url.pathname === "/api/groups") return json({ groups: [] });
+    if (url.pathname === "/api/usage/quotas") return json([]); // an array, as the Go side writes it
     if (url.pathname.startsWith("/api/")) return json({});
     const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
     const contentType = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)];
@@ -96,8 +97,8 @@ function serve(lang, seen, ctl = {}) {
 }
 
 const want = {
-  en: { median: "median 120K · p90 880K", share: /\d+% in alpha/, busiest: /^Busiest at \S+ 09:00$/, detail: "Time", none: "Active time isn't kept by model." },
-  zh: { median: "中位 120K · p90 880K", share: /alpha 占 \d+%/, busiest: /^最忙：\S+ 09:00$/, detail: "时间", none: "活跃时长不按模型统计。" },
+  en: { median: "median 120K · p90 880K", share: /\d+% in alpha/, busiest: /^Busiest at \S+ 09:00$/, detail: "Time", idLine: "Session ID", none: "Active time isn't kept by model." },
+  zh: { median: "中位 120K · p90 880K", share: /alpha 占 \d+%/, busiest: /^最忙：\S+ 09:00$/, detail: "时间", idLine: "会话 ID", none: "活跃时长不按模型统计。" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -234,6 +235,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#sessTop .sess-detail .sess-line").first().waitFor();
         assert(seen.includes("one claude:s0"));
         assert.equal(await page.locator("#sessTop .sess-detail .sess-line .k").first().innerText(), want[lang].detail);
+        assert((await page.locator("#sessTop .sess-detail .sess-line .k").allInnerTexts()).includes(want[lang].idLine), "the id's line is named for it (#465)");
         assert.equal((await page.locator("#sessTop .sess-top").first().boundingBox()).y, y);
         await page.locator("#sessTop .sess-top").first().click();
         assert.equal(await page.locator("#sessTop .sess-detail").count(), 0);
@@ -248,9 +250,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const y = (await bar.boundingBox()).y;
         await bar.click();
         await page.waitForFunction(() => document.querySelector("#sessProjects .sess-bar.on"));
+        // the bars are drawn again once the folder's overview is in: the bar
+        // is measured where that left it, not as it is taken off for it
+        await page.waitForFunction(() => document.querySelector("#sessStats .kpi b")?.textContent === "7");
         assert.equal((await page.locator("#sessProjects .sess-bar.on").boundingBox()).y, y);
         assert.match(await page.locator("#sessFolder").innerText(), /beta/);
-        await page.waitForFunction(() => document.querySelector("#sessStats .kpi b")?.textContent === "7");
         assert(seen.some((s) => s.includes("cwd=%2Fwork%2Fbeta")), seen.join("\n"));
         assert.equal(await page.locator("#sessProjects .sess-bar").count(), 2);
         await page.locator("#sessProjects .sess-bar.on").click();

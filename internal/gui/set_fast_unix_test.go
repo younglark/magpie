@@ -15,6 +15,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // Picking Claude Code's model answers at once, although /api/set answers
@@ -28,6 +29,7 @@ import (
 func TestSetAnswersWhileDevinAndProvidersHang(t *testing.T) {
 	h := t.TempDir()
 	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(h, ".local", "share"))
@@ -38,7 +40,7 @@ func TestSetAnswersWhileDevinAndProvidersHang(t *testing.T) {
 
 	// a devin CLI that takes 4s over every answer
 	devin := filepath.Join(bin, "devin")
-	os.WriteFile(devin, []byte("#!/bin/sh\nexec sleep 4\n"), 0o755)
+	testenv.Program(t, devin, "#!/bin/sh\nexec sleep 4\n")
 	old := provider.DevinExecutable
 	provider.DevinExecutable = func() string { return devin }
 	t.Cleanup(func() { provider.DevinExecutable = old })

@@ -1,13 +1,16 @@
 package gui
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -41,6 +44,16 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 	warmSessions()
 	mux.HandleFunc("GET /api/sessions", func(rw http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		// The page draws a session count taken from every session
+		// (statsFor's Overview) beside this list, so the list is read as
+		// long as the count: at sessions.Limit the page said "238 sessions"
+		// over a list that stopped at 200, and the agents whose sessions
+		// were oldest fell off it whole — Codex had 121 and the list showed
+		// 7. Only a caller that asks for a number of its own gets one. The
+		// page draws this many rows in pages of its own (renderSessions).
+		if n <= 0 {
+			n = sessions.All
+		}
 		agents := map[string]*agent.Agent{}
 		for _, a := range agent.Clients() {
 			agents[a.ID] = a
@@ -63,6 +76,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			if a := agents[s.Agent]; a != nil {
 				j.Name, j.Icon = a.Name, a.Icon
 			}
+			j.Name = wslName(j.Name, s)
 			j.Path = tilde(j.Path)
 			out.Sessions = append(out.Sessions, j)
 		}
@@ -121,6 +135,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 				j.Name, j.Icon = a.Name, a.Icon
 			}
 		}
+		j.Name = wslName(j.Name, s)
 		since := s.Start
 		if since.IsZero() {
 			since = s.Last
@@ -129,10 +144,57 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		j.Path = tilde(j.Path)
 		writeJSON(rw, j)
 	})
-	// terminal opens Terminal on a session's resume command. The command is
+	// transcript is what was said in a session, read from the agent's own
+	// file (found from the session as listed, never a path from the page),
+	// which is only read.
+	mux.HandleFunc("GET /api/sessions/transcript", func(rw http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		s, ok := sessions.Find(q.Get("agent"), q.Get("id"))
+		if !ok {
+			fail(rw, errors.New("no such session"))
+			return
+		}
+		t, err := sessions.TranscriptOf(s)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, t)
+	})
+	// markdown is a session's whole conversation as a Markdown file (#1276),
+	// read from the agent's own file as transcript is: to the browser that
+	// asks (magpie web), which saves it itself, and, in the app, to
+	// Downloads.
+	mux.HandleFunc("GET /api/sessions/markdown", func(rw http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		stem, md, err := sessionMarkdown(q.Get("agent"), q.Get("id"))
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		rw.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		rw.Header().Set("Content-Disposition", `attachment; filename="`+stem+`.md"`)
+		rw.Write(md)
+	})
+	mux.HandleFunc("POST /api/sessions/export", func(rw http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		stem, md, err := sessionMarkdown(q.Get("agent"), q.Get("id"))
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		path, err := saveDownload(downloads(), stem, ".md", bytes.NewReader(md))
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, map[string]any{"path": tilde(path)})
+	})
+	// terminal opens Terminal on a session's resume command, or, with In, on
+	// the command that carries it on in that other agent. The command is
 	// made here from the session as listed, never taken from the page.
 	mux.HandleFunc("POST /api/sessions/terminal", func(rw http.ResponseWriter, r *http.Request) {
-		var in struct{ Agent, ID string }
+		var in struct{ Agent, ID, In string }
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			fail(rw, err)
 			return
@@ -142,16 +204,66 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			return
 		}
 		s, ok := sessions.Find(in.Agent, in.ID)
-		if !ok || s.Resume == "" {
+		run := s.Resume
+		if in.In != "" {
+			run = ""
+			for _, c := range s.Carry {
+				if c.Agent == in.In {
+					run = c.Command
+				}
+			}
+		}
+		if !ok || run == "" {
 			fail(rw, errors.New("no such session"))
 			return
 		}
-		if err := openTerminal(s.Resume, settings.Load().SessionTerminal); err != nil {
+		if err := openTerminal(run, settings.Load().SessionTerminal); err != nil {
 			fail(rw, err)
 			return
 		}
 		rw.WriteHeader(http.StatusNoContent)
 	})
+}
+
+// sessionMarkdown is a session's conversation as Markdown, and the name its
+// file is saved under: the session found as listed, never a path from the
+// page. It is made whole before any of it is sent, so a file that can't be
+// read is an error and not half a download.
+func sessionMarkdown(agentID, id string) (stem string, md []byte, err error) {
+	s, ok := sessions.Find(agentID, id)
+	if !ok {
+		return "", nil, errors.New("no such session")
+	}
+	name := s.Agent
+	for _, a := range agent.Clients() {
+		if a.ID == s.Agent {
+			name = a.Name
+		}
+	}
+	var b bytes.Buffer
+	if err := sessions.WriteMarkdown(&b, s, wslName(name, s)); err != nil {
+		return "", nil, err
+	}
+	short := []rune(s.ID)
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	safe := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, s.Agent+"-"+string(short))
+	return "magpie-session-" + safe, b.Bytes(), nil
+}
+
+// wslName is an agent's name for a session it ran in a WSL distro, as the
+// agent there is named (Claude Code · WSL Ubuntu); its own name otherwise.
+func wslName(name string, s sessions.Session) string {
+	if s.WSL == "" {
+		return name
+	}
+	return name + " · WSL " + s.WSL
 }
 
 // statsFor is sessions.StatsFor for a range, kept: the page asks for the
@@ -200,16 +312,34 @@ func statsFor(days int) sessions.Stats {
 }
 
 // warmSessions reads every session file once magpie is up, so the Sessions
-// page opens on the kept index and not on a first read of them all.
+// page opens on the kept index and not on a first read of them all. Usage ›
+// Requests' whole history is read after it, not beside it on the disk: a
+// first All parsing 12k sessions kept that page a skeleton for 40 s.
 func warmSessions() {
 	if testing.Testing() {
 		return
 	}
 	go func() {
 		time.Sleep(3 * time.Second)
-		statsFor(0)
-		statsFor(30)
+		warmUp(
+			func() { statsFor(0) },
+			func() { statsFor(30) },
+			func() { usage.QueryPage(usage.All, usage.Filter{}, 0, 50) },
+		)
 	}()
+}
+
+// warmUp runs the warm-up's reads, then hands what they threw away back to
+// the system at once. Reading a long history allocates many times what it
+// keeps (a 13k-session Codex and Claude Code history: ~830 MB allocated to
+// keep ~80 MB of indexes), and Go's scavenger returns those pages only over
+// the next minutes: a magpie that had just started read ~470 MB for its
+// first two minutes at rest.
+func warmUp(steps ...func()) {
+	for _, step := range steps {
+		step()
+	}
+	debug.FreeOSMemory()
 }
 
 // openTerminal runs a command in the chosen Mac terminal through a .command

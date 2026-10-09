@@ -2,11 +2,16 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/yetone/magpie/internal/agentenv"
 )
 
 func TestBalanceReaders(t *testing.T) {
@@ -18,6 +23,8 @@ func TestBalanceReaders(t *testing.T) {
 	}{
 		{"deepseek", readDeepSeek, `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"110.00","granted_balance":"10.00"}]}`, "¥110.00"},
 		{"deepseek two", readDeepSeek, `{"balance_infos":[{"currency":"CNY","total_balance":"1"},{"currency":"USD","total_balance":"2.5"}]}`, "¥1.00 · $2.50"},
+		{"deepseek two, USD first", readDeepSeek, `{"balance_infos":[{"currency":"USD","total_balance":"2.5"},{"currency":"CNY","total_balance":"1"}]}`, "¥1.00 · $2.50"},
+		{"deepseek, the CNY spent", readDeepSeek, `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"-0.05","granted_balance":"0.00","topped_up_balance":"-0.05"},{"currency":"USD","total_balance":"11.12","granted_balance":"0.00","topped_up_balance":"11.12"}]}`, "$11.12 · ¥-0.05"},
 		{"kimi", readMoonshot("¥"), `{"code":0,"data":{"available_balance":49.58894,"voucher_balance":46.5,"cash_balance":3.0},"status":true}`, "¥49.59"},
 		{"openrouter", readOpenRouter, `{"data":{"total_credits":20,"total_usage":3.5}}`, "$16.50"},
 		{"commandcode", readCommandCode, `{"credits":{"monthlyCredits":12.3,"purchasedCredits":2,"freeCredits":0},"windowLimits":{"limited":true,"fiveHour":{"used":4.2,"cap":10},"weekly":{"used":9,"cap":50}}}`, "$14.30"},
@@ -105,10 +112,11 @@ func TestKeyBalances(t *testing.T) {
 	isolate(t)
 	h := t.TempDir()
 	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
 	t.Setenv("PATH", h)
-	for _, v := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME"} {
+	for _, v := range agentenv.Vars {
 		t.Setenv(v, "")
 	}
 	keyBalanceCache.data = nil
@@ -148,6 +156,17 @@ func TestKeyBalances(t *testing.T) {
 	}
 	if got[0].Windows == nil {
 		t.Fatal("windows is null in the JSON")
+	}
+	// each key's balance is kept over time, a failed one not
+	bh := readBalanceHist()
+	if pts := bh[quotaHistKey("relay", "main")]; len(pts) != 1 || pts[0].Amount != 2 {
+		t.Fatalf("main's balance history = %+v", pts)
+	}
+	if pts := bh[quotaHistKey("relay", "spare")]; len(pts) != 1 || pts[0].Amount != 0.5 {
+		t.Fatalf("spare's balance history = %+v", pts)
+	}
+	if len(bh) != 2 {
+		t.Fatalf("balance history = %+v", bh)
 	}
 }
 
@@ -309,6 +328,160 @@ func TestNewAPIUserRefusal(t *testing.T) {
 		}
 		if !strings.Contains(c.body, "New-Api-User") && strings.Contains(err.Error(), "add the header") {
 			t.Errorf("%s: told to add the header: %v", c.body, err)
+		}
+	}
+}
+
+// A vendor that takes the key in the Balance URL's query, or in a header of
+// its own, is asked with each key in its place, so every key's card tells
+// its own balance, not the one a key pasted into the URL has (#266).
+func TestBalanceURLNamesTheKey(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+	keyBalanceCache.data = nil
+	t.Cleanup(func() { keyBalanceCache.data = nil })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Key") != r.URL.Query().Get("apikey") {
+			t.Errorf("header %q, query %q", r.Header.Get("X-Key"), r.URL.Query().Get("apikey"))
+		}
+		switch r.URL.Query().Get("apikey") {
+		case "sk-one":
+			w.Write([]byte(`{"balance":3}`))
+		case "sk-two+/=":
+			w.Write([]byte(`{"balance":7}`))
+		default:
+			http.Error(w, `{"message":"no such key"}`, http.StatusUnauthorized)
+		}
+	}))
+	defer srv.Close()
+	if err := Save(Provider{ID: "relay", Name: "Relay", Chat: srv.URL + "/v1", Key: "sk-one", KeyName: "main",
+		Keys:       []KeyAccount{{Name: "spare", Key: "sk-two+/="}},
+		Headers:    map[string]string{"X-Key": "{apiKey}"},
+		BalanceURL: srv.URL + "/query?apikey={key}", BalancePath: "$balance"}); err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, q := range KeyBalances(context.Background()) {
+		lines = append(lines, q.User+"|"+q.Balance+"|"+q.Error)
+	}
+	if want := "main|$3.00|,spare|$7.00|"; strings.Join(lines, ",") != want {
+		t.Fatalf("balances:\n%s\nwant\n%s", strings.Join(lines, ","), want)
+	}
+	// a URL that can't be asked doesn't show the key in what it says
+	_, _, err := Balance(context.Background(), Provider{Chat: "http://127.0.0.1:1/v1", Key: "sk-secret-123456",
+		BalanceURL: "http://127.0.0.1:1/q?key={key}", BalancePath: "balance"})
+	if err == nil || strings.Contains(err.Error(), "sk-secret-123456") {
+		t.Fatalf("error: %v", err)
+	}
+}
+
+// A known balance query read with its field left empty (#881): new-api's
+// for a key and for the account, OpenAI's old credit grants, a sub2api
+// panel's profile and its query for a key; a query magpie doesn't know
+// still asks for the field.
+func TestKnownBalanceFieldLeftEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/usage/token", "/api/usage/token/":
+			w.Write([]byte(`{"code":true,"message":"ok","data":{"object":"token_usage","total_granted":2000000,"total_used":500000,"total_available":1500000,"unlimited_quota":false}}`))
+		case "/api/user/self":
+			w.Write([]byte(`{"success":true,"data":{"quota":1000000}}`))
+		case "/v1/dashboard/billing/credit_grants", "/dashboard/billing/credit_grants":
+			w.Write([]byte(`{"object":"credit_summary","total_granted":20,"total_used":7.5,"total_available":12.5}`))
+		case "/api/v1/user/profile":
+			w.Write([]byte(`{"code":0,"data":{"balance":4.2}}`))
+		case "/v1/usage":
+			// sub2api's reply for a key on the wallet, its key alone asked
+			if r.Header.Get("Authorization") != "Bearer sk-one" {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"error":{"type":"authentication_error","message":"Invalid API key"}}`))
+				return
+			}
+			w.Write([]byte(`{"mode":"unrestricted","isValid":true,"planName":"钱包余额","remaining":7.25,"unit":"USD","balance":7.25}`))
+		default:
+			w.Write([]byte(`{"left":1}`))
+		}
+	}))
+	defer srv.Close()
+	for _, c := range []struct{ path, token, want string }{
+		{"/api/usage/token", "", "$3.00"},
+		{"/api/usage/token/", "", "$3.00"},
+		{"/api/user/self", "tok", "$2.00"},
+		{"/v1/dashboard/billing/credit_grants", "", "$12.50"},
+		{"/dashboard/billing/credit_grants", "", "$12.50"},
+		{"/api/v1/user/profile", "eyJ.a.b", "$4.20"},
+		{"/v1/usage", "", "$7.25"},
+	} {
+		p := Provider{ID: "relay", Chat: srv.URL + "/v1", Key: "sk-one", BalanceURL: srv.URL + c.path, BalanceToken: c.token}
+		if got, ok, err := Balance(context.Background(), p); err != nil || !ok || got != c.want {
+			t.Errorf("%s: %q %v %v, want %q", c.path, got, ok, err, c.want)
+		}
+	}
+	// a field the user gave still wins
+	p := Provider{ID: "relay", Chat: srv.URL + "/v1", Key: "sk-one", BalanceURL: srv.URL + "/api/usage/token", BalancePath: "data.total_used"}
+	if got, _, err := Balance(context.Background(), p); err != nil || got != "500000.00" && got != "500000" {
+		t.Errorf("own field: %q %v", got, err)
+	}
+	p = Provider{ID: "relay", Chat: srv.URL + "/v1", Key: "sk-one", BalanceURL: srv.URL + "/other"}
+	if _, _, err := Balance(context.Background(), p); err == nil || !strings.Contains(err.Error(), "no balance path") {
+		t.Errorf("unknown query: %v", err)
+	}
+}
+
+// SiliconFlow retired /v1/user/info (#1094): its 410, as the reporter's card
+// showed it, says the query is gone and where the balance and vouchers are
+// read now, not the raw reply; a key it refuses still says so as it came.
+func TestSiliconFlowRetiredBalanceQuery(t *testing.T) {
+	var status int
+	var body string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/user/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+	old := http.DefaultClient.Transport
+	http.DefaultClient.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	t.Cleanup(func() { http.DefaultClient.Transport = old })
+
+	for _, c := range []struct {
+		base, console string
+	}{
+		{"https://api.siliconflow.cn/v1", "https://cloud.siliconflow.cn"},
+		{"https://api.siliconflow.com/v1", "https://cloud.siliconflow.com"},
+	} {
+		p := Provider{ID: "siliconflow", Chat: c.base, Key: "sk-test"}
+		status, body = http.StatusGone, `{"code":20092,"message":"This endpoint is deprecated and is no longer available.","data":null}`
+		_, ok, err := Balance(context.Background(), p)
+		if !ok || err == nil || !strings.Contains(err.Error(), "retired") || !strings.Contains(err.Error(), c.console) || strings.Contains(err.Error(), "410 Gone") {
+			t.Errorf("%s 410: %v %v, want it retired and %s named", c.base, ok, err, c.console)
+		}
+		status, body = http.StatusUnauthorized, `{"code":30014,"data":null,"message":"Token is invalid."}`
+		if _, _, err := Balance(context.Background(), p); err == nil || !strings.Contains(err.Error(), "Token is invalid.") || strings.Contains(err.Error(), "retired") {
+			t.Errorf("%s 401: %v, want the refusal as it came", c.base, err)
+		}
+		status, body = http.StatusOK, `{"code":20000,"message":"OK","status":true,"data":{"id":"userid","balance":"0.88","chargeBalance":"88.00","totalBalance":"88.88"}}`
+		if got, _, err := Balance(context.Background(), p); err != nil || !strings.HasSuffix(got, "88.88") {
+			t.Errorf("%s 200: %q %v", c.base, got, err)
 		}
 	}
 }

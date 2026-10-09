@@ -1,5 +1,14 @@
 package gateway
 
+// PLUGIN-SERVED (see AGENTS.md): Kiro ("kiro") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-kiro-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/kiro) and raise the mover's
+// min in internal/provider/migrate_kiro.go.
+
 // A Kiro subscription is served through Kiro's own API, the one kiro-cli
 // talks to (after github.com/mikeyobrien/pi-provider-kiro): each request
 // is sent whole as a conversation — the earlier turns as its history, the
@@ -39,10 +48,12 @@ func (s *Server) serveKiro(w http.ResponseWriter, r *http.Request, from provider
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
 	ask := s.askKiro(p, model)
 	if req.WebSearch && !searching(r.Context()) {
-		if _, _, ok := searcher(); ok {
+		if canSearch() {
 			return s.searchReply(w, r, from, "Kiro", req, usage, ask)
 		}
 	}
@@ -52,7 +63,7 @@ func (s *Server) serveKiro(w http.ResponseWriter, r *http.Request, from provider
 	if events == nil {
 		return writeError(w, from, status, msg), msg
 	}
-	return relay(w, r, from, "Kiro", req, events, usage, cancel, func(string, string, bool) {})
+	return relay(w, r, from, "Kiro", req, events, usage, cancel, nil, func(string, string, bool) {})
 }
 
 // askKiro is a round for Kiro's API.
@@ -88,7 +99,7 @@ func (s *Server) askKiro(p provider.Provider, model string) round {
 		events := make(chan Event, 16)
 		go func() {
 			defer res.Body.Close()
-			decodeKiro(ctx, res.Body, events, model, window, thinking)
+			decodeKiro(ctx, res.Body, events, model, window, thinking, kiroNames(req))
 		}()
 		return events, 0, ""
 	}
@@ -113,7 +124,11 @@ func (s *Server) sendKiro(ctx context.Context, auth provider.KiroAuth, body []by
 	} {
 		req.Header.Set(k, v)
 	}
-	return s.client.Do(req)
+	res, err := s.client.Do(req)
+	if err != nil {
+		return res, err
+	}
+	return notAnAPIReply(res, ""), nil // a web page served 200 (#1012)
 }
 
 // kiroFailure is the status and message for an error Kiro answered with:
@@ -245,6 +260,47 @@ func kiroToolID(id string) string {
 	return "t_" + base64.RawURLEncoding.EncodeToString(sum[:])[:32]
 }
 
+var (
+	kiroToolNameRe  = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+	kiroToolNameBad = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+)
+
+// kiroToolName is a tool's name as Kiro takes one: a longer one (an MCP
+// server's, prefixed) is rejected once the history holds a call, so it is
+// cut and told apart by a hash, the same each time; kiroNames maps it back.
+func kiroToolName(name string) string {
+	if kiroToolNameRe.MatchString(name) {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	short := kiroToolNameBad.ReplaceAllString(name, "_")
+	if len(short) > 55 {
+		short = short[:55]
+	}
+	return short + "_" + fmt.Sprintf("%x", sum[:4])
+}
+
+// kiroNames is the caller's name for each name kiroToolName changed.
+func kiroNames(r *Request) map[string]string {
+	names := map[string]string{}
+	add := func(n string) {
+		if k := kiroToolName(n); k != n {
+			names[k] = n
+		}
+	}
+	for _, t := range r.Tools {
+		add(t.Name)
+	}
+	for _, m := range r.Messages {
+		for _, p := range m.Parts {
+			if p.Kind == ToolCall {
+				add(p.Name)
+			}
+		}
+	}
+	return names
+}
+
 // buildKiro is the body of a generateAssistantResponse call.
 func buildKiro(r *Request, model, profile string, thinking bool) []byte {
 	var entries []kiroEntry
@@ -264,7 +320,7 @@ func buildKiro(r *Request, model, profile string, thinking bool) []byte {
 					if !bytes.HasPrefix(bytes.TrimSpace(args), []byte("{")) {
 						args = json.RawMessage("{}")
 					}
-					a.ToolUses = append(a.ToolUses, kiroToolUse{Name: p.Name, ToolUseID: kiroToolID(p.ID), Input: args})
+					a.ToolUses = append(a.ToolUses, kiroToolUse{Name: kiroToolName(p.Name), ToolUseID: kiroToolID(p.ID), Input: args})
 				}
 			}
 			a.Content = strings.Join(texts, "\n\n")
@@ -309,6 +365,15 @@ func buildKiro(r *Request, model, profile string, thinking bool) []byte {
 					status = "error"
 				}
 				results = append(results, kiroToolResult{ToolUseID: kiroToolID(p.CallID), Status: status, Content: []kiroText{{Text: out}}})
+				// a tool's images (a screenshot, a file read) go with the
+				// message, as Kiro's tool results carry text alone
+				for _, im := range p.Images {
+					if im.Data != "" {
+						img := kiroImage{Format: kiroImageFormat(im.MediaType)}
+						img.Source.Bytes = im.Data
+						u.Images = append(u.Images, img)
+					}
+				}
 			}
 		}
 		u.Content = strings.Join(texts, "\n\n")
@@ -414,7 +479,7 @@ func buildKiro(r *Request, model, profile string, thinking bool) []byte {
 	offered := map[string]bool{}
 	for _, t := range r.Tools {
 		kt := kiroTool{}
-		kt.Spec.Name, kt.Spec.Description = t.Name, t.Description
+		kt.Spec.Name, kt.Spec.Description = kiroToolName(t.Name), t.Description
 		if kt.Spec.Description == "" {
 			kt.Spec.Description = t.Name
 		}
@@ -422,7 +487,7 @@ func buildKiro(r *Request, model, profile string, thinking bool) []byte {
 		if len(bytes.TrimSpace(t.Schema)) == 0 || string(bytes.TrimSpace(t.Schema)) == "null" {
 			kt.Spec.InputSchema.JSON = json.RawMessage(`{"type":"object","properties":{}}`)
 		}
-		offered[t.Name] = true
+		offered[kt.Spec.Name] = true
 		tools = append(tools, kt)
 	}
 	for _, e := range entries {
@@ -576,7 +641,7 @@ func readKiroFrame(r *bufio.Reader) (kiroFrame, error) {
 }
 
 // decodeKiro turns Kiro's reply into events.
-func decodeKiro(ctx context.Context, body io.Reader, out chan<- Event, model string, window int, thinking bool) {
+func decodeKiro(ctx context.Context, body io.Reader, out chan<- Event, model string, window int, thinking bool, names map[string]string) {
 	defer close(out)
 	send := func(ev Event) bool {
 		select {
@@ -589,7 +654,7 @@ func decodeKiro(ctx context.Context, body io.Reader, out chan<- Event, model str
 	if !send(Event{Kind: KStart, MsgID: "msg_" + randomToken()[:24], Model: model}) {
 		return
 	}
-	d := kiroDecoder{thinking: thinking}
+	d := kiroDecoder{thinking: thinking, names: names}
 	br := bufio.NewReaderSize(body, 64<<10)
 	var failed string
 	for {
@@ -647,6 +712,7 @@ func decodeKiro(ctx context.Context, body io.Reader, out chan<- Event, model str
 type kiroDecoder struct {
 	thinking bool
 	think    kiroThinkParser
+	names    map[string]string // the caller's name for a tool kiroToolName cut
 
 	tool       string // the id of the call being streamed
 	tools      int
@@ -694,6 +760,9 @@ func (d *kiroDecoder) frame(f kiroFrame) (evs []Event, failed string) {
 		}
 	case "toolUseEvent":
 		id, name := str("toolUseId"), str("name")
+		if n, ok := d.names[name]; ok {
+			name = n
+		}
 		if id != "" && id != d.tool {
 			// the text before a call is all said
 			evs = append(evs, d.think.end()...)

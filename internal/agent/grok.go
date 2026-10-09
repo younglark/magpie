@@ -21,9 +21,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/tidwall/gjson"
+
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/gateway"
 )
 
 // grokEfforts are the reasoning efforts Grok knows.
@@ -32,14 +33,16 @@ var grokEfforts = []string{"none", "minimal", "low", "medium", "high", "xhigh", 
 // grokModelTable is the header prefix of every table magpie writes.
 var grokModelTable = `model."` + magpieID + "/"
 
-func grokModelTables() []edit.Table {
+// grokModelTables are magpie's model tables, for a Grok that reaches the
+// gateway's /v1 at v1.
+func grokModelTables(v1 string) []edit.Table {
 	var out []edit.Table
 	for _, m := range magpieModels("grok") {
 		kvs := []edit.KV{
 			{Path: "model", Value: m.ID},
 			{Path: "name", Value: m.Name},
-			{Path: "base_url", Value: gatewayV1()},
-			{Path: "api_key", Value: gateway.Token},
+			{Path: "base_url", Value: v1},
+			{Path: "api_key", Value: keyAt(v1)},
 			{Path: "api_backend", Value: "chat_completions"},
 		}
 		if m.Context > 0 {
@@ -59,10 +62,15 @@ func grokModelTables() []edit.Table {
 	return out
 }
 
-func grok(home string) *Agent {
-	dir := os.Getenv("GROK_HOME")
+func grok(home string) *Agent { return grokIn(here(home)) }
+
+// grokIn is Grok Build at a place: this machine's home, or a WSL distro's
+// (see wsl.go), where GROK_HOME isn't read and its models name the gateway
+// as the distro reaches it.
+func grokIn(at place) *Agent {
+	dir := at.getenv("GROK_HOME")
 	if dir == "" {
-		dir = filepath.Join(home, ".grok")
+		dir = filepath.Join(at.home, ".grok")
 	}
 	path := filepath.Join(dir, "config.toml")
 	get := func(k string) (string, error) {
@@ -81,7 +89,7 @@ func grok(home string) *Agent {
 		}
 		return false, nil
 	}
-	writeMagpie := func() error { return edit.SetTOMLTables(path, []string{grokModelTable}, grokModelTables()) }
+	writeMagpie := func() error { return edit.SetTOMLTables(path, []string{grokModelTable}, grokModelTables(at.v1())) }
 	dropMagpie := func() error { return edit.SetTOMLTables(path, []string{grokModelTable}, nil) }
 	// the default model is the user's, not a campaign's
 	ownDefault := func(features map[string]string) error {
@@ -99,7 +107,7 @@ func grok(home string) *Agent {
 		return catalog.Efforts(magpieModels("grok"), ref)
 	}
 	return atomic(&Agent{
-		ID: "grok", Name: "Grok Build", Icon: "xai", Aliases: []string{"grok-build", "grok-cli"},
+		ID: "grok", Name: "Grok Build", Icon: "xai", Aliases: []string{"grok-build", "grok-cli"}, Spelled: prefixed,
 		UA:  []string{"grok-shell", "grok-pager", "xai-grok-build"}, // grok-pager: its terminal front end
 		Dir: dir, Path: path,
 		Sync: func() error {
@@ -144,7 +152,7 @@ func grok(home string) *Agent {
 				return "Grok Build's [model." + strconv.Quote(v) + "] (config.toml) is gone, so it no longer reaches magpie"
 			}
 			return wiringOff("Grok Build", path, func(k string) (string, bool) { v, ok := t[k]; return v, ok },
-				"base_url", gatewayV1(), "api_key", gateway.Token)
+				"base_url", at.v1(), "api_key", at.gwKey())
 		},
 		Fields: []Field{
 			{
@@ -188,7 +196,14 @@ func grok(home string) *Agent {
 					return edit.SetTOMLKey(path, "models", "default", v)
 				},
 				Options: func(cur map[string]string) []Option {
-					return append(grokOwnOptions(cur["model"]), viaMagpie("grok", magpieID+"/")...)
+					// magpie's rows for the account Grok Build is signed in
+					// to are its own models a second time: they fold into
+					// one row (Fate on Discord: grokbuild 在登录态下会加载重复的模型)
+					opts := viaMagpie("grok", magpieID+"/")
+					for i := range opts {
+						opts[i].Same = opts[i].own
+					}
+					return append(grokOwnOptions(dir, path, cur["model"]), opts...)
 				},
 			},
 			{
@@ -213,18 +228,59 @@ func grok(home string) *Agent {
 	}, path)
 }
 
-// grokOwnOptions are the models Grok Build offers its signed-in account, as
-// magpie last listed them for a Grok subscription, and the current one.
-func grokOwnOptions(cur string) []Option {
-	ms, _, _ := catalog.Live("grok")
+// grokOwnOptions are the models Grok Build offers its signed-in account: as
+// it last listed them itself (models_cache.json in its home), and as magpie
+// last listed them for a Grok subscription; then the models of the user's
+// own config.toml tables, and the current one. Grok asks for them itself,
+// on its sign-in or their own key, so each says so (Direct): a row not
+// connected listed nothing of Grok's own, only magpie's, unless a Grok
+// subscription was signed in in magpie (EZN7L2C3, #834).
+func grokOwnOptions(dir, path, cur string) []Option {
 	seen := map[string]bool{}
 	var out []Option
+	add := func(id, name, direct string) {
+		if id == "" || seen[id] || strings.HasPrefix(id, magpieID+"/") {
+			return
+		}
+		seen[id] = true
+		o := Option{Value: id, Icon: "xai", Direct: direct}
+		if name != "" && name != id {
+			o.Label = name
+		}
+		out = append(out, o)
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, "models_cache.json")); err == nil {
+		gjson.GetBytes(raw, "models").ForEach(func(k, v gjson.Result) bool {
+			if !v.Get("info.hidden").Bool() {
+				add(k.String(), v.Get("info.name").String(), "xAI")
+			}
+			return true
+		})
+	}
+	ms, _, _ := catalog.Live("grok")
 	for _, m := range ms {
-		seen[m.ID] = true
-		out = append(out, Option{Value: m.ID, Icon: "xai"})
+		add(m.ID, "", "xAI")
+	}
+	// the user's own [model."<id>"] tables, each on its own endpoint
+	if tables, err := edit.TOMLTables(path); err == nil {
+		for _, t := range tables {
+			id, ok := strings.CutPrefix(t, "model.")
+			if !ok {
+				continue
+			}
+			if u, err := strconv.Unquote(id); err == nil {
+				id = u
+			}
+			kv, _ := edit.GetTOMLTable(path, t)
+			direct := "xAI"
+			if h := hostOf(kv["base_url"]); h != "" {
+				direct = h
+			}
+			add(id, kv["name"], direct)
+		}
 	}
 	if cur != "" && !seen[cur] && !strings.HasPrefix(cur, magpieID+"/") {
-		out = append([]Option{{Value: cur, Icon: modelIcon("", cur)}}, out...)
+		out = append([]Option{{Value: cur, Icon: modelIcon("", cur), Direct: "xAI"}}, out...)
 	}
 	return group("Grok Build", out)
 }

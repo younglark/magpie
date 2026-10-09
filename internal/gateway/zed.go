@@ -1,5 +1,14 @@
 package gateway
 
+// PLUGIN-SERVED (see AGENTS.md): Zed ("zed") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-zed-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/zed) and raise the mover's
+// min in internal/provider/migrate_zed.go.
+
 import (
 	"bytes"
 	"context"
@@ -36,10 +45,12 @@ func (s *Server) serveZed(w http.ResponseWriter, r *http.Request, from provider.
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
 	ask := s.askZed(p.Account.User, model)
 	if req.WebSearch && !searching(r.Context()) {
-		if _, _, ok := searcher(); ok {
+		if canSearch() {
 			return s.searchReply(w, r, from, "Zed", req, usage, ask)
 		}
 	}
@@ -67,10 +78,20 @@ func zedRequest(req *Request, vendor, model string) (json.RawMessage, provider.P
 			return nil, "", err
 		}
 		delete(m, "stream")
+		if msgs, ok := m["messages"]; ok {
+			withErr, err := zedToolResults(msgs)
+			if err != nil {
+				return nil, "", err
+			}
+			m["messages"] = withErr
+		}
 		b, err := json.Marshal(m)
 		return b, provider.Anthropic, err
 	case "responses":
-		return buildResponses(&q, model, "api.openai.com", false), provider.Responses, nil
+		// fitted to the Responses types Zed's cloud reads (a web_search
+		// tool, or include's web_search_call.action.sources, would have it
+		// turn the request away)
+		return provider.ZedBody(buildResponses(&q, model, "api.openai.com", false)), provider.Responses, nil
 	case "chat":
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(buildChat(&q, model, "api.x.ai", false), &m); err != nil {
@@ -99,6 +120,30 @@ func zedRequest(req *Request, vendor, model string) (json.RawMessage, provider.P
 		return b, provider.CodeAssist, err
 	}
 	return nil, "", fmt.Errorf("magpie can't ask Zed's %q models", vendor)
+}
+
+// zedToolResults says is_error on every tool result, false as well as true:
+// Zed's cloud refuses a tool result without it ("failed to parse Anthropic
+// request: missing field `is_error`"), which Anthropic's own API leaves out
+// when it is false, so every turn after a tool call failed.
+func zedToolResults(msgs json.RawMessage) (json.RawMessage, error) {
+	var ms []map[string]any
+	d := json.NewDecoder(bytes.NewReader(msgs))
+	d.UseNumber() // a tool's input keeps its numbers as they were
+	if err := d.Decode(&ms); err != nil {
+		return nil, err
+	}
+	for _, m := range ms {
+		parts, _ := m["content"].([]any)
+		for _, p := range parts {
+			if b, ok := p.(map[string]any); ok && b["type"] == "tool_result" {
+				if _, ok := b["is_error"]; !ok {
+					b["is_error"] = false
+				}
+			}
+		}
+	}
+	return json.Marshal(ms)
 }
 
 // askZed is a round for Zed's API.
@@ -136,6 +181,7 @@ func (s *Server) askZed(user, model string) round {
 			}
 			break
 		}
+		res = notAnAPIReply(res, "") // a web page served 200 (#1012)
 		if res.StatusCode/100 != 2 {
 			b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			res.Body.Close()

@@ -1,7 +1,9 @@
 package agent
 
-// Kimi Code, Moonshot's kimi CLI, keeps its settings in ~/.kimi/config.toml
-// ($KIMI_SHARE_DIR's): the model sessions start with as default_model, a key
+// Kimi Code, Moonshot's kimi CLI, keeps its settings in config.toml — the
+// new one's (TypeScript, 2.x) in ~/.kimi-code ($KIMI_CODE_HOME), the old
+// Python kimi-cli's in ~/.kimi ($KIMI_SHARE_DIR), in the same shape (see
+// KimiDir): the model sessions start with as default_model, a key
 // of its [models."<key>"] tables, each naming a [providers.<name>] table and
 // the model to ask it for. magpie adds itself as the provider "magpie" (the
 // gateway, spoken to as Kimi's own chat completions, so the thinking goes
@@ -13,13 +15,12 @@ package agent
 // and out the other way round.
 
 import (
-	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/gateway"
 )
 
 // kimiModelTable is the header prefix of every model table magpie writes.
@@ -29,9 +30,40 @@ var kimiModelTable = `models."` + magpieID + "/"
 // know: it has to be told one, and compacts as it nears it.
 const kimiContext = 128000
 
-func kimiModelTables() []edit.Table {
+// KimiDir is the folder Kimi Code keeps its config.toml in, and whether it is
+// the old kimi-cli's. kimi-cli (1.50 on) hands over to the new Kimi Code,
+// which reads only ~/.kimi-code: it offers to copy ~/.kimi's config over
+// when it first starts, and once that's done never reads ~/.kimi again, so a
+// model written there is one it never sees (#290). ~/.kimi is kimi-cli's only where
+// the new one isn't: no ~/.kimi-code, nor $KIMI_CODE_HOME.
+func KimiDir(home string) (dir string, legacy bool) { return kimiDir(here(home)) }
+
+// kimiDir is KimiDir at a place: in a WSL distro its variables aren't
+// read, and a stopped one's is ~/.kimi-code until it is looked at.
+func kimiDir(at place) (dir string, legacy bool) {
+	if d := at.getenv("KIMI_CODE_HOME"); d != "" {
+		return d, false
+	}
+	code := filepath.Join(at.home, ".kimi-code")
+	if at.isDir(code) {
+		return code, false
+	}
+	if d := at.getenv("KIMI_SHARE_DIR"); d != "" {
+		return d, true
+	}
+	if d := filepath.Join(at.home, ".kimi"); at.isDir(d) {
+		return d, true
+	}
+	return code, false
+}
+
+// kimiModelTables are magpie's model tables; the new Kimi Code is told of
+// tool calling too, which kimi-cli has no word for and refuses.
+func kimiModelTables(path string, legacy bool) []edit.Table {
 	var out []edit.Table
+	names, _ := edit.TOMLTables(path)
 	for _, m := range magpieModels("kimi") {
+		name := "models." + strconv.Quote(magpieID+"/"+m.ID)
 		ctx := m.Context
 		if ctx <= 0 {
 			ctx = kimiContext
@@ -48,19 +80,61 @@ func kimiModelTables() []edit.Table {
 		if m.Images {
 			caps = append(caps, strconv.Quote("image_in"))
 		}
+		if !legacy {
+			caps = append(caps, strconv.Quote("tool_use"))
+		}
 		if len(caps) > 0 {
 			kvs = append(kvs, edit.KV{Path: "capabilities", Value: edit.Raw("[" + strings.Join(caps, ", ") + "]")})
 		}
-		out = append(out, edit.Table{Name: "models." + strconv.Quote(magpieID+"/"+m.ID), KVs: kvs})
+		if !legacy {
+			// a default effort set by hand stays while the model has it
+			var was string
+			if slices.Contains(names, name) {
+				t, _ := edit.GetTOMLTable(path, name)
+				was = t["default_effort"]
+			}
+			kvs = append(kvs, kimiEfforts(m.Efforts, was)...)
+		}
+		out = append(out, edit.Table{Name: name, KVs: kvs})
 	}
 	return out
 }
 
-func kimi(home string) *Agent {
-	dir := os.Getenv("KIMI_SHARE_DIR")
-	if dir == "" {
-		dir = filepath.Join(home, ".kimi")
+// kimiEfforts are a thinking model's levels for the new Kimi Code's
+// thinking picker (#333): support_efforts, and default_effort high where
+// the model has it, as Kimi Code takes for its own models (else it starts
+// on the middle one). Without them it offers thinking on or off only and
+// asks for no level at all. none is left out: Kimi Code's own off turns
+// thinking off. kimi-cli has neither key.
+func kimiEfforts(efforts []string, was string) []edit.KV {
+	var levels, quoted []string
+	for _, e := range efforts {
+		if e != "none" {
+			levels = append(levels, e)
+			quoted = append(quoted, strconv.Quote(e))
+		}
 	}
+	if len(levels) == 0 {
+		return nil
+	}
+	kvs := []edit.KV{{Path: "support_efforts", Value: edit.Raw("[" + strings.Join(quoted, ", ") + "]")}}
+	def := ""
+	if slices.Contains(levels, "high") {
+		def = "high"
+	}
+	// one set by hand (was) stays while the model has it
+	if def = keptEffort(was, levels, def); def != "" {
+		kvs = append(kvs, edit.KV{Path: "default_effort", Value: def})
+	}
+	return kvs
+}
+
+func kimi(home string) *Agent { return kimiIn(here(home)) }
+
+// kimiIn is Kimi Code at a place: this machine's home, or a WSL distro's
+// (see wsl.go), its provider naming the gateway as it reaches it from there.
+func kimiIn(at place) *Agent {
+	dir, legacy := kimiDir(at)
 	path := filepath.Join(dir, "config.toml")
 	key := "kimi:" + path + ":default_model"
 	get := func() string { v, _ := edit.GetTOMLTop(path, "default_model"); return v }
@@ -68,12 +142,12 @@ func kimi(home string) *Agent {
 	writeMagpie := func() error {
 		if err := edit.SetTOMLTable(path, providerTable,
 			edit.KV{Path: "type", Value: "kimi"},
-			edit.KV{Path: "base_url", Value: gatewayV1()},
-			edit.KV{Path: "api_key", Value: gateway.Token},
+			edit.KV{Path: "base_url", Value: at.v1()},
+			edit.KV{Path: "api_key", Value: at.gwKey()},
 		); err != nil {
 			return err
 		}
-		return edit.SetTOMLTables(path, []string{kimiModelTable}, kimiModelTables())
+		return edit.SetTOMLTables(path, []string{kimiModelTable}, kimiModelTables(path, legacy))
 	}
 	dropMagpie := func() error {
 		if err := edit.SetTOMLTables(path, []string{kimiModelTable}, nil); err != nil {
@@ -90,11 +164,11 @@ func kimi(home string) *Agent {
 	}
 	// ownModel reports whether Kimi has a model of the user's by this key
 	ownModel := func(k string) bool {
-		t, err := edit.GetTOMLTable(path, "models."+strconv.Quote(k))
+		t, err := kimiModelTableForKey(path, k)
 		return err == nil && t != nil
 	}
 	return atomic(&Agent{
-		ID: "kimi", Name: "Kimi Code", Icon: "kimi", Aliases: []string{"kimi-code", "kimi-cli"},
+		ID: "kimi", Name: "Kimi Code", Icon: "kimi", Aliases: []string{"kimi-code", "kimi-cli"}, Spelled: prefixed,
 		UA:  []string{"kimicli"},
 		Bin: "kimi", Dir: dir, Path: path,
 		Sync: func() error {
@@ -115,7 +189,7 @@ func kimi(home string) *Agent {
 			if !usesMagpie(v) {
 				return ""
 			}
-			m, err := edit.GetTOMLTable(path, "models."+strconv.Quote(v))
+			m, err := kimiModelTableForKey(path, v)
 			if err != nil {
 				return err.Error()
 			}
@@ -130,7 +204,7 @@ func kimi(home string) *Agent {
 				return "Kimi Code's [" + providerTable + "] (config.toml) is gone, so it no longer reaches magpie"
 			}
 			return wiringOff("Kimi Code", path, func(k string) (string, bool) { v, ok := t[k]; return v, ok },
-				"base_url", gatewayV1(), "api_key", gateway.Token)
+				"base_url", at.v1(), "api_key", at.gwKey())
 		},
 		Fields: []Field{{
 			Key: "model", Label: "model",
@@ -171,14 +245,9 @@ func kimiOwnOptions(path, cur string) []Option {
 	seen := map[string]bool{}
 	var out []Option
 	for _, t := range tables {
-		k, ok := strings.CutPrefix(t, "models.")
+		k, ok := kimiModelKey(t)
 		if !ok {
 			continue
-		}
-		if u, err := strconv.Unquote(k); err == nil {
-			k = u
-		} else if strings.Contains(k, ".") {
-			continue // a table under a model's, not one
 		}
 		if seen[k] || strings.HasPrefix(k, magpieID+"/") {
 			continue
@@ -195,4 +264,33 @@ func kimiOwnOptions(path, cur string) []Option {
 		out = append([]Option{{Value: cur, Icon: modelIcon("", cur)}}, out...)
 	}
 	return group("Kimi Code", out)
+}
+
+// kimiModelKey decodes one model key, rejecting nested tables.
+func kimiModelKey(table string) (string, bool) {
+	k, ok := strings.CutPrefix(table, "models.")
+	if !ok {
+		return "", false
+	}
+	if u, err := strconv.Unquote(k); err == nil {
+		return u, true
+	}
+	if len(k) >= 2 && k[0] == '\'' && k[len(k)-1] == '\'' {
+		k = k[1 : len(k)-1]
+		return k, !strings.Contains(k, "'")
+	}
+	return k, k != "" && !strings.ContainsAny(k, ".\"'")
+}
+
+func kimiModelTableForKey(path, key string) (map[string]string, error) {
+	tables, err := edit.TOMLTables(path)
+	if err != nil {
+		return nil, err
+	}
+	for _, table := range tables {
+		if decoded, ok := kimiModelKey(table); ok && decoded == key {
+			return edit.GetTOMLTable(path, table)
+		}
+	}
+	return nil, nil
 }

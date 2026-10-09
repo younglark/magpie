@@ -13,8 +13,10 @@ import (
 // webAddr is where `magpie web` listens unless told: beside the gateway.
 const webAddr = "127.0.0.1:3430"
 
-// webCmd: magpie web [--addr host:port] [--lan] [--no-open] — the app's
-// window in a browser, for a computer that can't show the app.
+// webCmd: magpie web [--addr host:port] [--lan] [--no-open] [--gateway] —
+// the app's window in a browser, for a computer that can't show the app;
+// --gateway shows it in gateway mode (gui.WebGateway) unless Settings says
+// otherwise.
 func webCmd(args []string) error {
 	addr, lan, open := webAddr, false, true
 	for i := 0; i < len(args); i++ {
@@ -28,8 +30,10 @@ func webCmd(args []string) error {
 			lan = true
 		case a == "--no-open":
 			open = false
+		case a == "--gateway":
+			gui.WebGateway.Store(true)
 		default:
-			return fmt.Errorf("magpie web: unknown %q · magpie web [--addr host:port] [--lan] [--no-open], MAGPIE_WEB_KEY to keep one key", a)
+			return fmt.Errorf("magpie web: unknown %q · magpie web [--addr host:port] [--lan] [--no-open] [--gateway], MAGPIE_WEB_KEY to keep one key", a)
 		}
 	}
 	if lan && addr == webAddr {
@@ -45,8 +49,11 @@ func webCmd(args []string) error {
 	if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
 		_, port, _ := net.SplitHostPort(w.Addr)
 		key := w.Link[strings.Index(w.Link, "/?k="):]
-		for _, a := range gui.LANAddrs() {
-			fmt.Println(muted.Render("  on the network"), "http://"+net.JoinHostPort(a, port)+key)
+		for _, l := range gui.NetworkLinks(port, key) {
+			fmt.Println(muted.Render("  on the network"), l)
+		}
+		if gateway.ContainerAddrs() {
+			fmt.Println(muted.Render("  " + containerNote))
 		}
 		fmt.Println(amber.Render("!"), "anyone with the link can change magpie and see its keys, and the network carries it unencrypted")
 	}
@@ -54,7 +61,7 @@ func webCmd(args []string) error {
 	if os.Getenv("MAGPIE_WEB_KEY") != "" {
 		carries = "MAGPIE_WEB_KEY"
 	}
-	fmt.Println(muted.Render("  the link carries " + carries + " · gateway " + gateway.URL() + " · Ctrl-C to stop"))
+	fmt.Println(muted.Render("  the link carries " + carries + " · gateway " + advertisedURL() + " · Ctrl-C to stop"))
 	if open {
 		openInBrowser(w.Link)
 	}

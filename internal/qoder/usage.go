@@ -1,5 +1,14 @@
 package qoder
 
+// PLUGIN-SERVED (see AGENTS.md): Qoder ("qoder") and Qoder CN ("qoder-cn")
+// are deprecated built-in subscriptions served by their plugin,
+// @magpie-community/opencode-qoder-auth, each once moved onto it
+// (provider.Moved; the default for a new sign-in). A moved one's
+// sign-ins, models, requests and usage are all the plugin's, never this
+// code's (only the move, in migrate*.go, still reads its accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/qoder) and raise the
+// movers' min in internal/provider/migrate_qoder.go.
+
 import (
 	"context"
 	"encoding/json"
@@ -18,7 +27,8 @@ func (e *UsageHTTPError) Error() string {
 	return fmt.Sprintf("qoder usage: upstream HTTP %d", e.StatusCode)
 }
 
-// FetchUsage retrieves the account usage envelope using a device token.
+// FetchUsage retrieves the account usage envelope using a device token; an
+// empty baseURL is the global site's account host.
 func FetchUsage(ctx context.Context, client *http.Client, baseURL, deviceToken string) (json.RawMessage, error) {
 	if strings.TrimSpace(deviceToken) == "" {
 		return nil, fmt.Errorf("qoder usage: missing device token")
@@ -27,7 +37,7 @@ func FetchUsage(ctx context.Context, client *http.Client, baseURL, deviceToken s
 		client = &http.Client{}
 	}
 	if baseURL == "" {
-		baseURL = openAPIHost
+		baseURL = Global.OpenAPI
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+AccountUsagePath, nil)
 	if err != nil {

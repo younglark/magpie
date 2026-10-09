@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,8 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf16"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // DeepSeek Harness (dsh) keeps a session in a folder of its own, under
@@ -36,7 +38,7 @@ import (
 
 // DshDir is dsh's folder: $DSH_HOME, else ~/.dsh.
 func DshDir() string {
-	if d := os.Getenv("DSH_HOME"); d != "" {
+	if d := appdir.Getenv("DSH_HOME"); d != "" {
 		return expandHome(d)
 	}
 	home, _ := os.UserHomeDir()
@@ -125,29 +127,55 @@ func dshFiles() []file {
 	return out
 }
 
+// dshSessionDir is the folder dsh keeps a session file's session in, all
+// of it that session's own: <sessions>/<project>/<the id, escaped>/, with
+// the session's generations and its session.lock. "" when the file isn't
+// in the folder its id names, so a delete never takes another's.
+func dshSessionDir(f file) string {
+	if f.agent != "dsh" || f.sid == "" {
+		return ""
+	}
+	d := filepath.Dir(f.path)
+	if filepath.Base(d) != dshSegment(f.sid) || filepath.Dir(filepath.Dir(d)) != filepath.Join(DshDir(), "sessions") {
+		return ""
+	}
+	return d
+}
+
+// dshSegment is a session id as dsh names its folder (encodeSegment in
+// dsh-session-persistence-jsonl): A–Z, a–z, 0–9, '.', '_' and '-' kept,
+// every other UTF-16 unit ~XXXX, and "." and ".." escaped whole.
+func dshSegment(id string) string {
+	switch id {
+	case ".":
+		return "~002E"
+	case "..":
+		return "~002E~002E"
+	}
+	var b strings.Builder
+	for _, u := range utf16.Encode([]rune(id)) {
+		if u < 0x80 && (u >= 'A' && u <= 'Z' || u >= 'a' && u <= 'z' || u >= '0' && u <= '9' || u == '.' || u == '_' || u == '-') {
+			b.WriteByte(byte(u))
+		} else {
+			fmt.Fprintf(&b, "~%04X", u)
+		}
+	}
+	return b.String()
+}
+
+// dshCacheRecord is the row dsh's session listing caches of a session
+// (dsh-session-projection-cache, on dsh-storage-json's per-record layout):
+// <dsh>/storages/session_projcache/sessions/<id>.json. "" for an id that
+// layout can't hold.
+func dshCacheRecord(id string) string {
+	if !safeID.MatchString(id) {
+		return ""
+	}
+	return filepath.Join(DshDir(), "storages", "session_projcache", "sessions", id+".json")
+}
+
 // dshOpen reads a session file's lines, decompressed.
-func dshOpen(path string) (io.ReadCloser, error) {
-	f, err := os.Open(path)
-	if err != nil || !strings.HasSuffix(path, ".zstd") {
-		return f, err
-	}
-	d, err := zstd.NewReader(f, zstd.WithDecoderConcurrency(1))
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	return dshZstd{d.IOReadCloser(), f}, nil
-}
-
-type dshZstd struct {
-	io.ReadCloser
-	f *os.File
-}
-
-func (z dshZstd) Close() error {
-	z.ReadCloser.Close()
-	return z.f.Close()
-}
+func dshOpen(path string) (io.ReadCloser, error) { return openLines(path) }
 
 func dshReadHead(path string) (dshHead, bool) {
 	var h dshHead
@@ -161,6 +189,30 @@ func dshReadHead(path string) (dshHead, bool) {
 		return h, false
 	}
 	return h, true
+}
+
+// dshResponse is what the vendor's own reply named: the model and provider
+// that answered, under a streamed reply's replay state.
+type dshResponse struct {
+	Model         string `json:"model"`
+	Provider      string `json:"provider"`
+	ResponseModel string `json:"responseModel"`
+}
+
+// dshReplay is a reply's replay state, where dsh keeps what the vendor's own
+// reply named: it is the only place a swapped model shows (the provider
+// answered with another).
+type dshReplay struct {
+	Response dshResponse `json:"response"`
+}
+
+// dshSource is the source of an assistant/message: the model and provider dsh
+// was told to use, and, under ReplayState, the replay state's record of the
+// response.
+type dshSource struct {
+	Model       string    `json:"model"`
+	Provider    string    `json:"provider"`
+	ReplayState dshReplay `json:"replayState"`
 }
 
 // dshEvent is an event line: packed rows of a streamed reply's chunks carry
@@ -177,9 +229,7 @@ type dshEvent struct {
 		Title     string `json:"title"`
 		Inherited bool   `json:"inherited"`
 		Message   struct {
-			Source struct {
-				Model string `json:"model"`
-			} `json:"source"`
+			Source dshSource `json:"source"`
 		} `json:"message"`
 		Usage *struct {
 			Input      int `json:"inputTokens"`

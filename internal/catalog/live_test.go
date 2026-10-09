@@ -2,6 +2,8 @@ package catalog
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -42,6 +44,37 @@ func TestFetchContextLength(t *testing.T) {
 	}
 	if len(got) != 3 || got["claude-sonnet-5"] != 1000000 || got["kimi-k3"] != 0 || got["glm-5"] != 0 {
 		t.Errorf("contexts %v", got)
+	}
+}
+
+// Another magpie's list tells each model's native APIs, over the ones it
+// serves it on, its longest reply and its reasoning levels; a vendor's odd
+// values are only left out, never the whole list.
+func TestFetchMagpieFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Write([]byte(`{"object":"list","data":[
+		  {"id":"anthropic/claude-opus-4-8","native_endpoints":["/v1/messages"],"max_output_tokens":128000,"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},
+		  {"id":"group/fast","supported_reasoning_levels":[]},
+		  {"id":"codex/gpt-6","supported_endpoints":["/responses","/chat/completions"],"supported_reasoning_levels":["low","medium"]},
+		  {"id":"odd","max_output_tokens":"lots","supported_reasoning_levels":{"low":true}}]}`))
+	}))
+	defer srv.Close()
+	ms, _, err := FetchAt(context.Background(), srv.URL+"/v1", "k", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, m := range ms {
+		got[m.ID] = fmt.Sprint(m.APIs, m.Output, m.Efforts)
+	}
+	want := map[string]string{
+		"anthropic/claude-opus-4-8": "[anthropic] 128000 [low high]",
+		"group/fast":                "[] 0 []",
+		"codex/gpt-6":               "[responses chat] 0 [low medium]",
+		"odd":                       "[] 0 []",
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("got %v", got)
 	}
 }
 
@@ -94,5 +127,43 @@ func TestFetchAtVersionedBase(t *testing.T) {
 		if Versioned(u) != want {
 			t.Errorf("Versioned(%q) = %v", u, !want)
 		}
+	}
+}
+
+// Another magpie's list tells each model's price (magpie_price), tiers
+// and all; one no vendor could charge is not taken, and a list without
+// one leaves the model unpriced.
+func TestLiveMagpiePrice(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":[
+			{"id":"a/priced","magpie_price":{"input":3,"output":12,"cache_read":0.3,"cache_write":3.75,"tiers":[{"above":200000,"input":6,"output":18,"cache_read":0.6,"cache_write":7.5}]}},
+			{"id":"a/free","magpie_price":{"input":0,"output":0,"cache_read":0,"cache_write":0}},
+			{"id":"a/negative","magpie_price":{"input":-1,"output":12,"cache_read":0,"cache_write":0}},
+			{"id":"a/sizeless","magpie_price":{"input":1,"output":2,"cache_read":0,"cache_write":0,"tiers":[{"above":0,"input":2,"output":4}]}},
+			{"id":"a/odd","magpie_price":"cheap"},
+			{"id":"a/none"}]}`)
+	}))
+	defer srv.Close()
+	ms, err := FetchURL(context.Background(), srv.URL+"/v1/models", "", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]*Price{}
+	for _, m := range ms {
+		got[m.ID] = m.Price
+	}
+	if p := got["a/priced"]; p == nil || p.Input != 3 || p.CacheWrite != 3.75 || len(p.Tiers) != 1 || p.Tiers[0].Above != 200000 || p.Tiers[0].Output != 18 {
+		t.Errorf("priced: %+v", p)
+	}
+	if p := got["a/free"]; p == nil || p.Input != 0 || p.Output != 0 {
+		t.Errorf("a price of nothing, set, is a price: %+v", p)
+	}
+	for _, id := range []string{"a/negative", "a/none"} {
+		if p := got[id]; p != nil {
+			t.Errorf("%s: %+v", id, p)
+		}
+	}
+	if len(ms) != 6 {
+		t.Errorf("an odd price lost a model: %d of 6", len(ms))
 	}
 }

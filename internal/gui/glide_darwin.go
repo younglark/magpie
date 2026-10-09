@@ -108,10 +108,27 @@ static void setDock(int on, int front) {
 		if (front) [NSApp activateIgnoringOtherApps:YES];
 	});
 }
+
+// A full-screen window's title bar, buttons and all, comes down from the top
+// of the screen only with the menu bar, and an app out of the Dock has none.
+// It joins the Dock as the window starts going full screen: once the window
+// is full screen, joining brings neither back. Wails' window events reach Go
+// later than that, so this is the notification's own observer.
+static void dockOnFullscreen(void) {
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillEnterFullScreenNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+			[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+		}];
+	});
+}
 */
 import "C"
 
-import "github.com/wailsapp/wails/v3/pkg/application"
+import (
+	"unsafe"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
+)
 
 // glidePanel moves the shown panel to height, its top edge held under the
 // menu bar. It says false when it can't, for the caller to size it plainly.
@@ -127,7 +144,16 @@ func (h *host) glidePanel(height int, g Glide) bool {
 
 // TintPanel paints the panel's tint under the page, fading to it over ms.
 func (h *host) TintPanel(c [4]uint8, ms int) bool {
-	w := h.panel.NativeWindow()
+	// tintPanel waits for the main thread, so it can't run on it; winMu
+	// keeps lightweight mode from letting the panel go meanwhile
+	h.winMu.Lock()
+	defer h.winMu.Unlock()
+	w := application.InvokeSyncWithResult(func() unsafe.Pointer {
+		if h.panel == nil {
+			return nil
+		}
+		return h.panel.NativeWindow()
+	})
 	if w == nil {
 		return false
 	}
@@ -144,6 +170,10 @@ func dockPolicy(on bool) application.ActivationPolicy {
 // setDock shows magpie in the Dock or takes it out, at once, bringing it to
 // the front after when front.
 func setDock(on, front bool) { C.setDock(C.int(boolInt(on)), C.int(boolInt(front))) }
+
+// dockOnFullscreen puts magpie in the Dock whenever a window goes full
+// screen; leaving it, the window puts magpie back as the settings say.
+func dockOnFullscreen() { C.dockOnFullscreen() }
 
 func boolInt(b bool) int {
 	if b {

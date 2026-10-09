@@ -2,11 +2,12 @@ package provider
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // an ask that couldn't tell leaves the account served, on disk too, where
@@ -76,6 +77,7 @@ func TestAskCursorStatus(t *testing.T) {
 	}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	exe := filepath.Join(home, "cursor-agent")
 	wasExe, wasOut := CursorExecutable, cursorSignedOut
 	t.Cleanup(func() { CursorExecutable, cursorSignedOut = wasExe, wasOut })
@@ -96,9 +98,7 @@ func TestAskCursorStatus(t *testing.T) {
 		{"prints no JSON", `echo 'Something went wrong'`, false, "", false},
 		{"fails, token gone", `exit 1`, true, "", true},
 	} {
-		if err := os.WriteFile(exe, []byte("#!/bin/sh\n"+c.script+"\n"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		testenv.Program(t, exe, "#!/bin/sh\n"+c.script+"\n")
 		signedOut = c.out
 		u, _, ok, err := askCursorStatus()
 		if u != c.user || ok != (c.user != "") || (err == nil) != c.sure {

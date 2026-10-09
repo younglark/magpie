@@ -1,5 +1,14 @@
 package gateway
 
+// PLUGIN-SERVED (see AGENTS.md): Devin ("devin") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-devin-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/devin) and raise the
+// mover's min in internal/provider/migrate_side.go.
+
 // A Devin subscription is served through the API the devin CLI talks to —
 // Windsurf's GetChatMessage, a Connect RPC in protobuf — the way a Kiro one
 // is (kiro.go): each request goes whole, the conversation with the caller's
@@ -41,10 +50,12 @@ func (s *Server) serveDevin(w http.ResponseWriter, r *http.Request, from provide
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
 	ask := s.askDevin(home, model)
 	if req.WebSearch && !searching(r.Context()) {
-		if _, _, ok := searcher(); ok {
+		if canSearch() {
 			return s.searchReply(w, r, from, "Devin", req, usage, ask)
 		}
 	}
@@ -54,7 +65,7 @@ func (s *Server) serveDevin(w http.ResponseWriter, r *http.Request, from provide
 	if events == nil {
 		return writeError(w, from, status, msg), msg
 	}
-	return relay(w, r, from, "Devin", req, events, usage, cancel, func(string, string, bool) {})
+	return relay(w, r, from, "Devin", req, events, usage, cancel, nil, func(string, string, bool) {})
 }
 
 // askDevin is a round for Devin's API.
@@ -77,6 +88,7 @@ func (s *Server) askDevin(home, model string) round {
 		if err != nil {
 			return nil, 502, "Devin: " + err.Error()
 		}
+		res = notAnAPIReply(res, "") // a web page served 200 (#1012)
 		if res.StatusCode/100 != 2 {
 			b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			res.Body.Close()
@@ -286,6 +298,28 @@ type devinMsg struct {
 	thinking []Part // with Devin's own signatures
 }
 
+// inlineImages is the images that carry their bytes: Devin takes no URL.
+func inlineImages(ims []Part) []Part {
+	var out []Part
+	for _, im := range ims {
+		if im.Data != "" {
+			out = append(out, im)
+		}
+	}
+	return out
+}
+
+// Devin names a call after its tool and turn (Bash:0#a65b6a5e…), and
+// Claude Code takes a tool_use id only of [A-Za-z0-9_-]: it drops a call
+// whose id has the ':' or '#', and the turn fails "could not be parsed"
+// (#1304). Such an id goes out as "dv_" and its base64url, and comes back
+// to Devin as it was, so its result still answers its call. An id that is
+// already safe goes out as it came, unless it begins "dv_". The Devin
+// plugin (packages/devin, outID and inID) maps the same way.
+func devinOutID(id string) string { return safeCallID("dv_", id) }
+
+func devinInID(id string) string { return rawCallID("dv_", id) }
+
 // buildDevin is the GetChatMessage request for r, to the model uid.
 func buildDevin(r *Request, uid, key string) []byte {
 	var msgs []devinMsg
@@ -296,7 +330,7 @@ func buildDevin(r *Request, uid, key string) []byte {
 		}
 		pending = nil
 	}
-	for _, m := range r.Messages {
+	for _, m := range joinSplitCalls(r.Messages) {
 		if m.Role == "assistant" {
 			a := devinMsg{role: devinAssistant}
 			var texts []string
@@ -307,6 +341,7 @@ func buildDevin(r *Request, uid, key string) []byte {
 						texts = append(texts, p.Text)
 					}
 				case ToolCall:
+					p.ID = devinInID(p.ID)
 					a.calls = append(a.calls, p)
 				case Thinking:
 					if strings.HasPrefix(p.Signature, "sealed.") {
@@ -340,7 +375,7 @@ func buildDevin(r *Request, uid, key string) []byte {
 			case ToolResult:
 				// only a call just made is answered, and only once
 				for i, c := range pending {
-					if c.ID != p.CallID {
+					if c.ID != devinInID(p.CallID) {
 						continue
 					}
 					out := p.Text
@@ -350,7 +385,7 @@ func buildDevin(r *Request, uid, key string) []byte {
 					if p.IsError {
 						out = "Error: " + out
 					}
-					msgs = append(msgs, devinMsg{role: devinTool, callID: c.ID, text: out})
+					msgs = append(msgs, devinMsg{role: devinTool, callID: c.ID, text: out, images: inlineImages(p.Images)})
 					pending = append(pending[:i:i], pending[i+1:]...)
 					break
 				}
@@ -370,14 +405,27 @@ func buildDevin(r *Request, uid, key string) []byte {
 
 	// the instructions go at the head of the first message, as Kiro's do:
 	// Devin turns away some agents' own in its system field (Claude Code's
-	// "You are a Claude agent, built on Anthropic's Claude Agent SDK")
-	if r.System != "" {
+	// "You are a Claude agent, built on Anthropic's Claude Agent SDK"). The
+	// tools' descriptions go there too, each tool sent with only a pointer
+	// to its own: Devin answers "an internal error occurred" to some agents'
+	// tools as they describe themselves (WorkBuddy's Read, "Reads a file
+	// from the local filesystem. You can access any file directly by using
+	// this tool."), and the same words in a message go through
+	tools := r.Tools
+	if r.ToolChoice == "none" {
+		tools = nil
+	}
+	instructions := r.System
+	if described := devinToolDescriptions(tools); described != "" {
+		instructions = joinNonEmpty(instructions, described)
+	}
+	if instructions != "" {
 		at := slices.IndexFunc(msgs, func(m devinMsg) bool { return m.role == devinUser })
 		if at < 0 {
 			msgs = slices.Insert(msgs, 0, devinMsg{role: devinUser})
 			at = 0
 		}
-		msgs[at].text = joinNonEmpty(r.System, msgs[at].text)
+		msgs[at].text = joinNonEmpty(instructions, msgs[at].text)
 	}
 
 	meta := pb{}.str(1, "devin-cli").str(2, devinCLIVersion).str(3, key).str(4, "en").
@@ -391,13 +439,22 @@ func buildDevin(r *Request, uid, key string) []byte {
 	if max <= 0 {
 		max = 128000 // the server holds it to the model's own
 	}
+	// Devin answers "an internal error occurred" to a temperature or top_p
+	// of exactly 0, on every model, where 1e-6 goes through: a 0 is sent
+	// as that, as near greedy as Devin takes (plugins #50)
+	above0 := func(v float64) float64 {
+		if v == 0 {
+			return 1e-6
+		}
+		return v
+	}
 	topP := 0.95
 	if r.TopP != nil {
-		topP = *r.TopP
+		topP = above0(*r.TopP)
 	}
 	temp := 1.0
 	if r.Temp != nil {
-		temp = *r.Temp
+		temp = above0(*r.Temp)
 	}
 	out = out.bytes(8, pb{}.varint(1, 1).varint(2, uint64(max)).varint(3, 400).double(5, temp).varint(7, 40).double(8, topP))
 
@@ -412,12 +469,18 @@ func buildDevin(r *Request, uid, key string) []byte {
 			desc = name
 		}
 		offered[name] = true
-		out = out.bytes(10, pb{}.str(1, name).str(2, desc).bytes(3, schema))
+		// Devin's Claude models answer 502 "There is an issue with this
+		// request" to a tool whose parameters have a root anyOf, oneOf or
+		// allOf (#1196: Codex desktop's automation_update), as Anthropic
+		// does behind Factory (#646)
+		out = out.bytes(10, pb{}.str(1, name).str(2, desc).bytes(3, objectSchema(schema)))
 	}
-	if r.ToolChoice != "none" {
-		for _, t := range r.Tools {
-			tool(t.Name, t.Description, t.Schema)
+	for _, t := range tools {
+		desc := t.Description
+		if desc != "" {
+			desc = "Described under <tool name=\"" + t.Name + "\"> in <tool_descriptions>, in the instructions."
 		}
+		tool(t.Name, desc, t.Schema)
 	}
 	for _, m := range msgs {
 		for _, c := range m.calls {
@@ -427,6 +490,25 @@ func buildDevin(r *Request, uid, key string) []byte {
 		}
 	}
 	return out.str(21, uid)
+}
+
+// devinToolDescriptions is what each tool says of itself, for the
+// instructions.
+func devinToolDescriptions(tools []Tool) string {
+	var b strings.Builder
+	for _, t := range tools {
+		if t.Description == "" {
+			continue
+		}
+		if b.Len() == 0 {
+			b.WriteString("<tool_descriptions>\n")
+		}
+		b.WriteString("<tool name=\"" + t.Name + "\">\n" + strings.TrimSpace(t.Description) + "\n</tool>\n")
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return b.String() + "</tool_descriptions>"
 }
 
 func encodeDevinMsg(m devinMsg) []byte {
@@ -547,7 +629,7 @@ func (d *devinDecoder) frame(b []byte) []Event {
 				if id == "" {
 					id = "call_" + randomToken()[:24]
 				}
-				evs = append(evs, Event{Kind: KToolStart, ID: id, Name: name})
+				evs = append(evs, Event{Kind: KToolStart, ID: devinOutID(id), Name: name})
 			}
 			if args != "" {
 				evs = append(evs, Event{Kind: KToolArgs, Text: args})

@@ -1,5 +1,14 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Kiro ("kiro") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-kiro-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/kiro) and raise the mover's
+// min in internal/provider/migrate_kiro.go.
+
 // Signing in to Kiro from magpie, the way the Kiro IDE does: Kiro's sign-in
 // page (app.kiro.dev) offers Google, GitHub, AWS Builder ID and IAM
 // Identity Center, and sends the browser back to a port on this machine.
@@ -73,7 +82,7 @@ func readKiroFile(path string) (kiroCred, bool) {
 		return kiroCred{}, false
 	}
 	c := kiroCred{access: t.AccessToken, refresh: t.RefreshToken, region: t.Region, profile: t.ProfileArn,
-		clientID: t.ClientID, clientSecret: t.ClientSecret, idePath: path}
+		clientID: t.ClientID, clientSecret: t.ClientSecret, idePath: path, builderID: strings.EqualFold(t.Provider, "BuilderId")}
 	c.expires, _ = time.Parse(time.RFC3339Nano, t.ExpiresAt)
 	if c.region == "" {
 		c.region = "us-east-1"
@@ -158,6 +167,10 @@ func (s *signInFlow) kiroCallback(w http.ResponseWriter, r *http.Request) {
 			fail("AWS sent back no code")
 			return
 		}
+		if !s.claim() {
+			kiroFinishing(w)
+			return
+		}
 		var tok struct {
 			AccessToken  string `json:"accessToken"`
 			RefreshToken string `json:"refreshToken"`
@@ -181,6 +194,10 @@ func (s *signInFlow) kiroCallback(w http.ResponseWriter, r *http.Request) {
 	default:
 		switch opt := q.Get("login_option"); opt {
 		case "google", "github":
+			if !s.claim() {
+				kiroFinishing(w)
+				return
+			}
 			var tok struct {
 				AccessToken  string `json:"accessToken"`
 				RefreshToken string `json:"refreshToken"`
@@ -222,7 +239,9 @@ func (s *signInFlow) kiroCallback(w http.ResponseWriter, r *http.Request) {
 			}
 			k.region, k.clientID, k.clientSecret = region, reg.ClientID, reg.ClientSecret
 			k.provider = map[string]string{"builderid": "BuilderId", "awsidc": "Enterprise", "internal": "Internal"}[opt]
+			s.mu.Lock()
 			k.state, k.verifier = randomToken(24), randomToken(48)
+			s.mu.Unlock()
 			sum := sha256.Sum256([]byte(k.verifier))
 			a := url.Values{}
 			a.Set("response_type", "code")
@@ -269,6 +288,12 @@ func (s *signInFlow) kiroCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	s.finish(SignInState{State: "done", User: user, Plan: plan, Using: using})
 	signInPage(w, true, "You're signed in", fmt.Sprintf("%s is added to magpie. You can close this tab.", user))
+}
+
+// kiroFinishing answers a second callback while the first is traded for
+// the account: the browser's own, or its address pasted into magpie.
+func kiroFinishing(w http.ResponseWriter) {
+	signInPage(w, false, "This sign-in is already finishing", "magpie shows the account when it's done.")
 }
 
 // awsRedirect is where AWS sends the browser back.

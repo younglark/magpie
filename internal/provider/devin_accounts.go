@@ -1,5 +1,14 @@
 package provider
 
+// PLUGIN-SERVED (see AGENTS.md): Devin ("devin") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-devin-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/devin) and raise the
+// mover's min in internal/provider/migrate_side.go.
+
 // Several Devin subscriptions. The devin CLI keeps one account, in its
 // credentials.toml; magpie signs the CLI in when it has none, and reads it
 // after. Each further account gets a home of magpie's own, laid out as the
@@ -63,7 +72,7 @@ type devinLogin struct {
 // devinLogins lists the Devin accounts that are signed in, the first in
 // use first, then the rest as they were added.
 func devinLogins() []devinLogin {
-	own, _, ok := devinIdentity()
+	own, plan, ok := devinIdentity()
 	if !ok {
 		own = ""
 	}
@@ -72,6 +81,9 @@ func devinLogins() []devinLogin {
 		_, _, err := DevinAuthAt(l.Home)
 		return l.Home != "" && err == nil
 	}) {
+		if l.saved.own() && l.Plan == "" {
+			l.Plan = plan // the CLI's own, by the tier `devin auth status` says, as the plugin names it
+		}
 		out = append(out, devinLogin{l.Login, l.saved.Home})
 	}
 	return out

@@ -1,5 +1,14 @@
 package qoder
 
+// PLUGIN-SERVED (see AGENTS.md): Qoder ("qoder") and Qoder CN ("qoder-cn")
+// are deprecated built-in subscriptions served by their plugin,
+// @magpie-community/opencode-qoder-auth, each once moved onto it
+// (provider.Moved; the default for a new sign-in). A moved one's
+// sign-ins, models, requests and usage are all the plugin's, never this
+// code's (only the move, in migrate*.go, still reads its accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/qoder) and raise the
+// movers' min in internal/provider/migrate_qoder.go.
+
 import (
 	"context"
 	"encoding/json"
@@ -26,17 +35,20 @@ type UserInfo struct {
 	HighestTier bool   `json:"is_highest_tier"`
 }
 
-// FetchUserInfo asks the account endpoint with a device token. The device
-// token is short-lived but outlasts the sign-in that just made it, so this
-// runs during the flow while it is fresh.
-func FetchUserInfo(ctx context.Context, client *http.Client, deviceToken string) (*UserInfo, error) {
+// FetchUserInfo asks site's account endpoint (nil is the global one) with a
+// device token. The device token is short-lived but outlasts the sign-in that
+// just made it, so this runs during the flow while it is fresh.
+func FetchUserInfo(ctx context.Context, client *http.Client, site *Site, deviceToken string) (*UserInfo, error) {
 	if strings.TrimSpace(deviceToken) == "" {
 		return nil, fmt.Errorf("qoder userinfo: missing device token")
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 20 * time.Second}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, openAPIHost+UserInfoPath, nil)
+	if site == nil {
+		site = Global
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, site.OpenAPI+UserInfoPath, nil)
 	if err != nil {
 		return nil, fmt.Errorf("qoder userinfo: create request: %w", err)
 	}

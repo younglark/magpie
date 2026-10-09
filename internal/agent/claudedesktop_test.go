@@ -9,7 +9,9 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/yetone/magpie/internal/desktopdir"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // desktopSandbox is a home of its own with nothing of this machine's in
@@ -305,5 +307,89 @@ func TestClaudeDesktopRefusesOddFiles(t *testing.T) {
 	desktopWrite(t, p.meta, `{"entries":{}}`)
 	if err := claudeDesktop(home).Field("provider").Set("magpie"); err == nil {
 		t.Fatal("entries that aren't a list were taken")
+	}
+}
+
+// each of Claude Code's tiers in Desktop's Code tab can have a model of its
+// own (WilianWeng): offered once Desktop is on magpie, set by the catalog id
+// or by the id Desktop is shown, and taken away with ""
+func TestClaudeDesktopTiers(t *testing.T) {
+	home, _ := desktopSandbox(t)
+	if err := provider.Save(provider.Provider{ID: "v", Name: "V", Chat: "http://127.0.0.1:1/v1", Key: "k", Models: []string{"a", "b"}}); err != nil {
+		t.Fatal(err)
+	}
+	a := claudeDesktop(home)
+	f := a.Field("sonnet")
+	if f == nil || !f.Quiet {
+		t.Fatal("no quiet sonnet field")
+	}
+	if len(f.Options(nil)) != 0 {
+		t.Fatal("tiers offered before Desktop is on magpie")
+	}
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Options(nil)) != 2 {
+		t.Fatalf("options: %+v", f.Options(nil))
+	}
+	if err := f.Set("v/a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Field("haiku").Set(gateway.DesktopID(provider.Entry{ID: "v/b"})); err != nil {
+		t.Fatal(err)
+	}
+	if f.Get() != "v/a" || a.Field("haiku").Get() != "v/b" || a.Field("opus").Get() != "" {
+		t.Fatalf("tiers: %v", gateway.DesktopTiers())
+	}
+	if err := f.Set("nope/x"); err == nil {
+		t.Fatal("a model magpie doesn't serve was taken")
+	}
+	if err := f.Set(""); err != nil || f.Get() != "" {
+		t.Fatalf("unset: %v %q", err, f.Get())
+	}
+}
+
+// Kilig on Discord: Claude Desktop from its setup.exe on Windows 10 LTSC
+// runs as an MSIX package, its data in
+// %LOCALAPPDATA%\Packages\Claude_<publisher>\LocalCache\Roaming\Claude and
+// nothing in %APPDATA%\Claude. It is detected, and magpie's switch writes
+// the package's folders, which the packaged app reads, not the usual ones
+// it doesn't see.
+func TestClaudeDesktopMSIX(t *testing.T) {
+	home, _ := desktopSandbox(t)
+	old := desktopdir.OS
+	desktopdir.OS = "windows"
+	t.Cleanup(func() { desktopdir.OS = old })
+	local, roaming := filepath.Join(home, "AppData", "Local"), filepath.Join(home, "AppData", "Roaming")
+	os.MkdirAll(roaming, 0o755)
+	pkg := filepath.Join(local, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache")
+	data := filepath.Join(pkg, "Roaming", "Claude")
+	for _, d := range []string{"claude-code-sessions", "local-agent-mode-sessions", "Local Storage", "IndexedDB", "logs"} {
+		os.MkdirAll(filepath.Join(data, d), 0o755)
+	}
+	os.WriteFile(filepath.Join(data, "Local State"), []byte(`{}`), 0o644)
+	os.MkdirAll(filepath.Join(pkg, "Local", "Claude", "logs"), 0o755)
+
+	a := claudeDesktop(home)
+	if !a.Detected() {
+		t.Fatal("an MSIX Claude Desktop isn't detected")
+	}
+	if want := filepath.Join(pkg, "Local", "Claude", "claude_desktop_config.json"); a.Path != want {
+		t.Errorf("path %s, want %s", a.Path, want)
+	}
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	p := desktopPathsOf(filepath.Join(pkg, "Local", "Claude"), filepath.Join(pkg, "Local", "Claude-3p"))
+	if !desktopWired(p) || a.Field("provider").Get() != magpieID {
+		t.Fatalf("not wired in the package's folders: %v", desktopTree(t, p))
+	}
+	if m := desktopJSON(t, p.config3p); m["deploymentMode"] != "3p" {
+		t.Errorf("Claude-3p: %v", m)
+	}
+	for _, d := range []string{filepath.Join(roaming, "Claude"), filepath.Join(local, "Claude"), filepath.Join(local, "Claude-3p")} {
+		if _, err := os.Stat(d); err == nil {
+			t.Errorf("%s written, which the packaged Desktop doesn't read", d)
+		}
 	}
 }

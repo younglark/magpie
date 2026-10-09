@@ -29,7 +29,6 @@ package agent
 
 import (
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"slices"
 
@@ -58,10 +57,20 @@ var (
 		aliases: []string{"qoderclicn", "qodercn", "qodercn-cli"}, procs: []string{`(^|/)qoderclicn( |$)`, `(^|/)qodercn( |$)`}}
 )
 
-func qoderSite(home string, b qoderBuild) *Agent {
-	dir := os.Getenv(b.env)
+// qoderIn and qoderCNIn are Qoder's two builds in a WSL distro (see
+// wsl.go): at their default folders, as the distro's variables aren't read.
+func qoderIn(at place) *Agent   { return qoderAt(at, qoderGlobal) }
+func qoderCNIn(at place) *Agent { return qoderAt(at, qoderChina) }
+
+func qoderSite(home string, b qoderBuild) *Agent { return qoderAt(here(home), b) }
+
+// qoderAt is a build of Qoder at a place, its provider naming the gateway
+// as it reaches it from there.
+func qoderAt(at place, b qoderBuild) *Agent {
+	qoderProvider := func(agent, model string) map[string]any { return qoderProviderAt(agent, model, at.v1()) }
+	dir := at.getenv(b.env)
 	if dir == "" {
-		dir = filepath.Join(home, b.dir)
+		dir = filepath.Join(at.home, b.dir)
 	}
 	path := filepath.Join(dir, "settings.json")
 	key := b.id + ":" + path + ":"
@@ -104,7 +113,7 @@ func qoderSite(home string, b qoderBuild) *Agent {
 		return ok && qoderKeyed(get(slot+".apiKey"), b.id)
 	}
 	return &Agent{
-		ID: b.id, Name: b.name, Icon: "qoder", Aliases: b.aliases,
+		ID: b.id, Name: b.name, Icon: "qoder", Aliases: b.aliases, Spelled: prefixed,
 		Bin: b.bin, Dir: dir, Path: path,
 		Sync: func() error {
 			ref, ok := cutMagpie(get("model.name"))
@@ -124,7 +133,7 @@ func qoderSite(home string, b qoderBuild) *Agent {
 				return ""
 			}
 			return wiringOff(b.name, path, func(k string) (string, bool) { return edit.GetJSON(path, slot+"."+k) },
-				"baseUrl", gatewayV1())
+				"baseUrl", at.v1())
 		},
 		Fields: []Field{{
 			Key: "model", Label: "model",
@@ -250,6 +259,12 @@ var qoderLevels = []string{"low", "medium", "high", "xhigh", "max"}
 // qoderProvider is magpie's entry in Qoder's providers, every magpie model
 // in it, model the one it starts on.
 func qoderProvider(agent, model string) map[string]any {
+	return qoderProviderAt(agent, model, gatewayV1())
+}
+
+// qoderProviderAt is qoderProvider for a Qoder reaching the gateway's /v1
+// at v1.
+func qoderProviderAt(agent, model, v1 string) map[string]any {
 	var ms []map[string]any
 	for _, m := range magpieModels(agent) {
 		caps := map[string]any{"tools": true, "vision": m.Images}
@@ -268,18 +283,19 @@ func qoderProvider(agent, model string) map[string]any {
 			e["contextWindow"] = m.Context
 		}
 		if m.Output > 0 {
-			e["maxOutputTokens"] = m.Output
+			e["maxOutputTokens"] = maxTokens(m)
 		}
 		ms = append(ms, e)
 	}
-	return map[string]any{"displayName": "magpie", "protocol": "openai", "baseUrl": gatewayV1(),
-		"apiKey": gateway.TokenFor(agent), "model": model, "models": ms}
+	return map[string]any{"displayName": "magpie", "protocol": "openai", "baseUrl": v1,
+		"apiKey": agentKeyAt(agent, v1), "model": model, "models": ms}
 }
 
 // qoderKeyed: key is one magpie gives Qoder's provider — its own,
 // gateway.TokenFor, since Qoder's requests carry Bun's User-Agent and
-// nothing of Qoder's, or gateway.Token, which it was given before; a sync
-// gives it the new one.
+// nothing of Qoder's, gateway.Token, which it was given before, or the LAN
+// sharing key one in a WSL distro is given (agentKeyAt); a sync gives it
+// the new one.
 func qoderKeyed(key, agent string) bool {
-	return key == gateway.TokenFor(agent) || key == gateway.Token
+	return key == gateway.TokenFor(agent) || ourKey(key)
 }

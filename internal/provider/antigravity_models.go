@@ -39,6 +39,14 @@ func splitAntigravityID(id string) (family, effort string) {
 	return id, ""
 }
 
+// EffortFamily is the model an id with an effort word after it is a level
+// of ("gemini-3.8-flash-medium" is gemini-3.8-flash), and the id itself
+// when it has none.
+func EffortFamily(id string) string {
+	f, _ := splitAntigravityID(id)
+	return f
+}
+
 // antigravityNameEffort is the level a name's last words in brackets say
 // ("Gemini 3.7 Flash (High)" is high), and the name without them.
 func antigravityNameEffort(name string) (string, string) {
@@ -160,7 +168,12 @@ func antigravityFamilies(raw []catalog.Model) []*antigravityFamily {
 }
 
 // collapseAntigravityModels is Antigravity's list with each family one
-// model; a family of one keeps Antigravity's id and name.
+// model; a family of one keeps Antigravity's id and name. Antigravity
+// names no -tiered id (gemini-3.7-flash-tiered: one id that thinks at the
+// level the request asks), so an agent's list showed it as its bare id,
+// magpie/antigravity/gemini-3.7-flash-tiered (EZN7L2C3, #955): it is
+// named for the model it is a tier of, "Gemini 3.7 Flash (Tiered)", and
+// any other model Antigravity leaves unnamed by its id.
 func collapseAntigravityModels(raw []catalog.Model) []catalog.Model {
 	var out []catalog.Model
 	for _, f := range antigravityFamilies(raw) {
@@ -169,6 +182,19 @@ func collapseAntigravityModels(raw []catalog.Model) []catalog.Model {
 			continue
 		}
 		out = append(out, f.model())
+	}
+	names := map[string]string{}
+	for _, m := range out {
+		names[m.ID] = m.Name
+	}
+	for i, m := range out {
+		if m.Name != "" {
+			continue
+		}
+		out[i].Name = m.ID
+		if b, ok := strings.CutSuffix(m.ID, "-tiered"); ok && names[b] != "" && names[b] != b {
+			out[i].Name = names[b] + " (Tiered)"
+		}
 	}
 	return out
 }

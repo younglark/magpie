@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -73,15 +74,31 @@ func TestRefusalFailsOverToTheNextMember(t *testing.T) {
 	fresh(t)
 	a := &scripted{replies: []reply{{200, "text/event-stream", anthropicRefusal}}}
 	b := &scripted{replies: []reply{{200, "text/event-stream", anthropicAnswer}}}
-	scriptedOn(t, "a", provider.Anthropic, a)
-	scriptedOn(t, "b", provider.Anthropic, b)
+	for id, script := range map[string]*scripted{"a": a, "b": b} {
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Request-Id", "req-"+id)
+			script.ServeHTTP(w, r)
+		}))
+		t.Cleanup(up.Close)
+		if err := provider.Save(provider.Provider{ID: id, Name: id, Key: "k", Models: []string{"m"}, Anthropic: up.URL}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	refusalGroup(t, "a/m", "b/m")
 	s := New()
-	code, body := sendTo(s, "/v1/responses", codexAsk)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(codexAsk))
+	req.Header.Set(SessionHeader, "override-session")
+	req.Header.Set("Session_id", "native-session")
+	s.Handler().ServeHTTP(rec, req)
+	code, body := rec.Code, rec.Body.String()
 	if code != 200 || !strings.Contains(body, "from b") || strings.Contains(body, "content_filter") || a.n != 1 || b.n != 1 {
 		t.Fatalf("%d %s (a %d, b %d)", code, body, a.n, b.n)
 	}
 	r := s.trace.routes[len(s.trace.routes)-1]
+	if len(r.Usage) != 2 || r.Usage[0].Provider != "a" || r.Usage[0].CacheRead != 237000 || r.Usage[0].CacheWrite != 47000 || r.Usage[0].Output != 2 || r.Usage[1].Provider != "b" || r.Usage[1].Output != 4 {
+		t.Fatalf("refusal and answer accounting: %+v", r.Usage)
+	}
 	if len(r.Tries) != 2 || r.Tries[0].Fail != failRefused || r.Tries[0].Rest != nil || r.Tries[0].Status != 400 || r.Status != 200 {
 		t.Fatalf("tries: %+v", r.Tries)
 	}
@@ -92,6 +109,26 @@ func TestRefusalFailsOverToTheNextMember(t *testing.T) {
 	if len(recs) != 2 || recs[0].Provider != "a" || recs[0].Status != 400 || recs[0].CacheRead != 237000 || recs[0].Output != 2 ||
 		recs[1].Provider != "b" || recs[1].Status != 200 {
 		t.Fatalf("usage: %+v", recs)
+	}
+
+	if recs[0].Error == "" || recs[0].Error != keepMsg(r.Tries[0].Error) || recs[1].Error != "" {
+		t.Fatalf("refusal reason missing or leaked into the successful attempt: %+v", recs)
+	}
+
+	for i, r := range recs {
+		if r.Session != "override-session" || r.NativeSession != "native-session" || r.RequestID != []string{"req-a", "req-b"}[i] || r.Endpoint != "/v1/responses → /v1/messages" {
+			t.Fatalf("attempt %d lost request identity: %+v", i, r)
+		}
+	}
+
+	if recs[0].ResponseID != "" || recs[1].ResponseID != "resp_m2" {
+		t.Fatalf("only the delivered reply has a client response ID: %+v", recs)
+	}
+
+	for _, rec := range recs {
+		if rec.RouteID != r.ID || rec.RouteID == 0 {
+			t.Fatalf("usage route %d, want %d", rec.RouteID, r.ID)
+		}
 	}
 
 	// and on an Anthropic client's own API, relayed as it came
@@ -247,6 +284,35 @@ func TestRefusalAfterContentPassesThrough(t *testing.T) {
 	}
 }
 
+// A safety filter's refusal that arrives once the reply has begun goes to
+// the agent as it came — nobody else is asked, the reply already reached
+// it — and it is the vendor refusing the turn, as one before anything was
+// said is: nobody rests for it, and the account is asked again as any
+// other (#248).
+func TestRefusalMidReplyRestsNobody(t *testing.T) {
+	fresh(t)
+	late := sse(`data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"half"}}]}`,
+		`data: {"error":{"code":"content_filter","message":"The response was filtered"}}`,
+		`data: [DONE]`)
+	a := &scripted{replies: []reply{{200, "text/event-stream", late}}}
+	b := &scripted{replies: []reply{{200, "", chatOK}}}
+	scriptedOn(t, "a", provider.Chat, a)
+	scriptedOn(t, "b", provider.Chat, b)
+	refusalGroup(t, "a/m", "b/m")
+	s := New()
+	code, body := sendTo(s, "/v1/chat/completions", `{"model":"group/g","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if code != 200 || !strings.Contains(body, "half") || !strings.Contains(body, "content_filter") || b.n != 0 {
+		t.Fatalf("chat: %d %s (b %d)", code, body, b.n)
+	}
+	r := s.trace.routes[len(s.trace.routes)-1]
+	if len(r.Tries) != 1 || r.Tries[0].Fail != failRefused || r.Tries[0].Rest != nil || r.Tries[0].Status != 200 {
+		t.Fatalf("tries: %+v", r.Tries)
+	}
+	if s.resting("a") {
+		t.Fatal("a refusal after content set the member aside")
+	}
+}
+
 func TestStreamEventRefusals(t *testing.T) {
 	for _, x := range []struct {
 		ev   string
@@ -254,20 +320,24 @@ func TestStreamEventRefusals(t *testing.T) {
 	}{
 		{`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`, eventLead},
 		{`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"x","input":{}}}`, eventContent},
-		{`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`, eventLead},
+		{`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`, eventThinking},
 		{`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s"}}`, eventLead},
-		{`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}`, eventContent},
+		{`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}`, eventThinking},
 		{`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`, eventContent},
 		{`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"refusal"}}`, eventRefusal},
 		{`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`, eventContent},
 		{`data: {"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}`, eventRefusal},
 		{`data: {"id":"c","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"content_filter"}]}`, eventContent},
 		{`data: {"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`, eventContent},
-		{`data: {"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`, eventLead},
+		{`data: {"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`, eventThinking},
+		{`data: {"type":"response.reasoning_summary_text.delta","delta":"**Plan**"}`, eventThinking},
+		{`data: {"id":"c","choices":[{"index":0,"delta":{"reasoning_content":"hm"}}]}`, eventThinking},
+		{`data: {"id":"c","choices":[{"index":0,"delta":{"reasoning_content":"hm"},"finish_reason":"content_filter"}]}`, eventRefusal},
+		{`data: {"candidates":[{"content":{"parts":[{"text":"hm","thought":true}]}}]}`, eventThinking},
 		{`data: {"type":"response.output_item.added","item":{"type":"function_call","name":"x"}}`, eventContent},
 		{`data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"hi"}]}}`, eventContent},
 		{`data: {"type":"response.output_text.delta","delta":""}`, eventLead},
-		{`data: {"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`, eventLead},
+		{`data: {"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`, eventThinking},
 		{`data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}`, eventRefusal},
 		{`data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`, eventContent},
 		{`data: {"type":"response.completed","response":{"status":"completed"}}`, eventContent},

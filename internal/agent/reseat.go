@@ -21,10 +21,16 @@ type Move struct {
 	Field string `json:"field"` // model, or a tier (Claude Code's haiku …)
 	From  string `json:"from"`  // the catalog model it was on
 	To    string `json:"to"`    // the one it is on now; "" its own default
+	// Error is why the agent couldn't be moved (its file unwritable, say):
+	// it stays on From, which magpie no longer serves
+	Error string `json:"error,omitempty"`
 }
 
 // String is the move as the CLI and the TUI say it.
 func (m Move) String() string {
+	if m.Error != "" {
+		return m.Agent + " " + m.Field + ": still on " + m.From + ", not moved: " + m.Error
+	}
 	to := m.To
 	if to == "" {
 		to = "its default"
@@ -52,8 +58,13 @@ func picks() []pick {
 			if v == "" || f.Options == nil {
 				continue
 			}
+			// a list of models is the user's own, left as it is
+			model, _, one := a.split(v)
+			if !one {
+				continue
+			}
 			for _, o := range f.Options(vals) {
-				if o.Value == v && o.Ref != "" {
+				if o.Value == model && o.Ref != "" {
 					out = append(out, pick{a, f.Key, v, o.Ref})
 					break
 				}
@@ -66,6 +77,11 @@ func picks() []pick {
 // Reseat makes a change to the providers (change) and moves every agent
 // whose model it stopped serving: to that model from another provider
 // that serves it, else to the agent's own default. It answers the moves.
+// Its error is the change's alone: once the change is made, an agent that
+// can't be moved is a move with its Error and the others are still moved.
+// An error then would say the change failed when it was made — the panel,
+// told so, kept a removed provider's editor open and listed, and a second
+// Remove said there was no such provider.
 func Reseat(change func() error) ([]Move, error) {
 	before := picks()
 	if err := change(); err != nil {
@@ -89,10 +105,17 @@ func Reseat(change func() error) ([]Move, error) {
 		if f.Options != nil {
 			to = sameModel(f.Options(vals), p.ref)
 		}
-		if err := p.a.Apply(p.key, to.Value); err != nil {
-			return moves, err
+		m := Move{Agent: p.a.Name, Field: f.Label, From: p.ref, To: to.Ref}
+		// the same model elsewhere keeps the agent's suffix after it (omp's
+		// thinking level); the agent's own default has none
+		if to.Value != "" {
+			_, suffix, _ := p.a.split(p.val)
+			to.Value += suffix
 		}
-		moves = append(moves, Move{Agent: p.a.Name, Field: f.Label, From: p.ref, To: to.Ref})
+		if err := p.a.Apply(p.key, to.Value); err != nil {
+			m.To, m.Error = "", err.Error()
+		}
+		moves = append(moves, m)
 	}
 	slices.Reverse(moves)
 	return moves, nil
@@ -106,9 +129,27 @@ func served(ref string) bool {
 
 // sameModel is the option for ref's model from another provider still
 // serving it: the same id, else one that differs only in how it is spelt
-// (claude-sonnet-4.5 and claude-sonnet-4-5-20250929). None for a routing
-// group, which is nobody else's.
+// (claude-sonnet-4.5 and claude-sonnet-4-5-20250929). For a group magpie
+// found (group/auto-…), gone as found groups are turned off or its model is
+// down to one provider, it is that model from the first provider still
+// serving it; none for any other routing group, which is nobody else's.
 func sameModel(opts []Option, ref string) Option {
+	// a group's id carries Claude Code's [1m] mark as a model's does, and
+	// this ref comes from the agent's own settings
+	if gid, ok := provider.GroupIDOf(ref); ok {
+		if !strings.HasPrefix(gid, "auto-") {
+			return Option{}
+		}
+		for _, o := range opts {
+			if o.Ref == "" || strings.HasPrefix(o.Ref, provider.GroupPrefix) || !served(o.Ref) {
+				continue
+			}
+			if pid, m, _ := strings.Cut(o.Ref, "/"); provider.AutoGroupOf(pid, m) == gid {
+				return o
+			}
+		}
+		return Option{}
+	}
 	pid, model, ok := strings.Cut(ref, "/")
 	if !ok || pid+"/" == provider.GroupPrefix {
 		return Option{}

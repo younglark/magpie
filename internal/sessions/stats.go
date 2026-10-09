@@ -36,7 +36,7 @@ type Summary struct {
 	Models []string `json:"models"` // the models it used in the range, the most used first
 	Days   []int    `json:"days"`   // the dates it was at work on, as days after From
 	// Prompts and Replies are the messages each way, ToolCalls the tools
-	// it called, in the range (Claude Code's and Codex's sessions alone)
+	// it called, in the range (Claude Code's, Codex's, Pi's and omp's sessions)
 	Prompts   int `json:"prompts"`
 	Replies   int `json:"replies"`
 	ToolCalls int `json:"tool_calls"`
@@ -67,7 +67,7 @@ type Usage struct {
 	Cwd   string `json:"cwd"`
 	Model string `json:"model"`
 	Tokens
-	Cost   float64 `json:"cost"` // USD at list price, when priced
+	Cost   float64 `json:"cost"` // USD at the effective price, when priced
 	Priced bool    `json:"priced"`
 }
 
@@ -103,6 +103,8 @@ func statsAt(days int, now time.Time) Stats {
 	}
 	out := Stats{From: from, To: today.Format(time.DateOnly), Days: []Day{}, Sessions: []Summary{}}
 
+	dbReadMu.Lock()
+	defer dbReadMu.Unlock()
 	mu.Lock()
 	defer mu.Unlock()
 	loadCache()
@@ -234,7 +236,7 @@ func statsAt(days int, now time.Time) Stats {
 	for k, t := range use {
 		u := Usage{Agent: k.agent, Cwd: k.cwd, Model: k.model, Tokens: t}
 		if p := price(k.model); p != nil {
-			u.Cost, u.Priced = p.Cost(t.Input, t.Output, t.CacheRead, t.CacheWrite), true
+			u.Cost, u.Priced = p.At(0).CostSplit(t.Input, t.Output, t.CacheRead, t.CacheWrite, t.CacheWrite1h), true
 		}
 		byDate[k.date].Usage = append(byDate[k.date].Usage, u)
 	}
@@ -307,7 +309,7 @@ func statsAt(days int, now time.Time) Stats {
 			sum.Tokens.add(t)
 			sum.Models = append(sum.Models, model)
 			if p := price(model); p != nil {
-				sum.Cost += p.Cost(t.Input, t.Output, t.CacheRead, t.CacheWrite)
+				sum.Cost += p.At(0).CostSplit(t.Input, t.Output, t.CacheRead, t.CacheWrite, t.CacheWrite1h)
 			} else {
 				sum.Priced = false
 			}
@@ -620,17 +622,17 @@ func skillUse(in []Summary, n int) SkillUse {
 // Tool (an MCP server's) or Other.
 func ToolCategory(name string) string {
 	switch name {
-	case "Bash", "BashOutput", "KillShell", "KillBash", "exec_command", "shell", "shell_command", "local_shell_call", "write_stdin", "unified_exec":
+	case "Bash", "BashOutput", "KillShell", "KillBash", "exec_command", "shell", "shell_command", "local_shell_call", "write_stdin", "unified_exec", "bash", "powershell":
 		return "Bash"
 	case "Edit", "MultiEdit", "NotebookEdit", "apply_patch", "edit", "str_replace":
 		return "Edit"
-	case "Read", "NotebookRead", "view_image", "read_file", "view":
+	case "Read", "NotebookRead", "view_image", "read_file", "view", "read":
 		return "Read"
-	case "Write", "write_file", "create":
+	case "Write", "write_file", "create", "write":
 		return "Write"
-	case "Glob", "LS", "list_dir", "glob":
+	case "Glob", "LS", "list_dir", "glob", "find", "ls", "fffind":
 		return "Glob"
-	case "Grep", "grep", "grep_files", "search":
+	case "Grep", "grep", "grep_files", "search", "ffgrep":
 		return "Grep"
 	case "Task", "Agent", "TodoWrite", "update_plan", "spawn_agent", "send_input", "wait", "close_agent", "Workflow":
 		return "Task"

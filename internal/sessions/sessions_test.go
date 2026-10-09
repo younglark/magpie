@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/agentenv"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // copyTree copies the fixtures somewhere the test may change them.
@@ -39,23 +41,25 @@ func setup(t *testing.T) (claude, codex string) {
 	claude, codex = filepath.Join(dir, "claude"), filepath.Join(dir, "codex")
 	copyTree(t, "testdata/claude", claude)
 	copyTree(t, "testdata/codex", codex)
+	for _, env := range agentenv.Vars {
+		t.Setenv(env, "")
+	}
 	t.Setenv("CLAUDE_CONFIG_DIR", claude)
 	t.Setenv("CODEX_HOME", codex)
+	t.Setenv("HERMES_HOME", filepath.Join(dir, "hermes"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
 	// OpenCode and Pi keep nothing here unless a test puts it there
 	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
 	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(dir, "pi"))
-	t.Setenv("OPENCODE_DB", "")
-	t.Setenv("PI_CODING_AGENT_SESSION_DIR", "")
-	// ZCode, dsh, Cline, Qoder, Grok Build and WorkBuddy keep theirs in the
-	// home folder: never the real one's
+	// Cursor's CLI keeps its chats under $XDG_CONFIG_HOME/cursor when set
+	t.Setenv("XDG_CONFIG_HOME", "")
+	// ZCode, dsh, Cline, Qoder, Grok Build, WorkBuddy and omp keep theirs in
+	// the home folder: never the real one's
 	t.Setenv("HOME", filepath.Join(dir, "home"))
 	t.Setenv("USERPROFILE", filepath.Join(dir, "home"))
-	for _, env := range []string{"DSH_HOME", "CLINE_DIR", "CLINE_DATA_DIR", "CLINE_SESSION_DATA_DIR", "QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR",
-		"GROK_HOME", "WORKBUDDY_CONFIG_DIR"} {
-		t.Setenv(env, "")
-	}
-	PriceOf = func(m string) (catalog.Price, bool) {
+	// Alma keeps its chats in the user's config folder: %APPDATA% on Windows
+	t.Setenv("APPDATA", filepath.Join(dir, "appdata"))
+	PriceOf = func(_ settings.Settings, m string) (catalog.Price, bool) {
 		switch m {
 		case "claude-opus-5-5":
 			return catalog.Price{Input: 4, Output: 20, CacheRead: 0.2, CacheWrite: 5}, true
@@ -92,13 +96,13 @@ func TestList(t *testing.T) {
 	}
 
 	// Claude Code: a message's blocks counted once, the subagent's calls in
-	if cc.ID != "11111111-2222-3333-4444-555555555555" || cc.Cwd != "/work/app" || cc.Title != "Fix the login bug in auth.go" {
+	if cc.ID != "11111111-2222-3333-4444-555555555555" || cc.Cwd != "/work/app" || cc.Title != "Fix login bug" {
 		t.Fatalf("claude: %+v", cc)
 	}
-	if o := model(cc, "claude-opus-5-5"); o.Tokens != (Tokens{100, 50, 5000, 1000}) || !o.Priced {
+	if o := model(cc, "claude-opus-5-5"); o.Tokens != (Tokens{100, 50, 5000, 1000, 0}) || !o.Priced {
 		t.Fatalf("opus: %+v", o)
 	}
-	if h := model(cc, "claude-haiku-4-5-20251001"); h.Tokens != (Tokens{1010, 120, 200, 0}) || h.Priced {
+	if h := model(cc, "claude-haiku-4-5-20251001"); h.Tokens != (Tokens{1010, 120, 200, 0, 0}) || h.Priced {
 		t.Fatalf("haiku: %+v", h)
 	}
 	if want := (100*4 + 50*20 + 5000*0.2 + 1000*5) / 1e6; !near(cc.Cost, want) || cc.Unpriced != 1 {
@@ -113,10 +117,10 @@ func TestList(t *testing.T) {
 	if cx.ID != "01a0bdc9-b5fd-7e63-9658-68bc8dce5ecd" || cx.Cwd != "/work/it's" || cx.Title != "Add a README" {
 		t.Fatalf("codex: %+v", cx)
 	}
-	if a := model(cx, "gpt-6-astra"); a.Tokens != (Tokens{8000, 400, 10000, 0}) {
+	if a := model(cx, "gpt-6-astra"); a.Tokens != (Tokens{8000, 400, 10000, 0, 0}) {
 		t.Fatalf("astra: %+v", a)
 	}
-	if l := model(cx, "gpt-6-luna"); l.Tokens != (Tokens{2000, 200, 10000, 0}) {
+	if l := model(cx, "gpt-6-luna"); l.Tokens != (Tokens{2000, 200, 10000, 0, 0}) {
 		t.Fatalf("luna: %+v", l)
 	}
 	if cx.Input != 10000 || cx.Output != 600 || cx.CacheRead != 20000 || cx.Unpriced != 1 {

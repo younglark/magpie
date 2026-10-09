@@ -3,6 +3,11 @@ package proc
 import (
 	"os"
 	"path/filepath"
+	"strings"
+
+	"golang.org/x/sys/windows/registry"
+
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // UserPath has nothing to do on Windows: an app started from the Start menu
@@ -15,11 +20,11 @@ func UserPath() {}
 func UserBinDirs() []string {
 	home, _ := os.UserHomeDir()
 	known := []string{
-		filepath.Join(os.Getenv("APPDATA"), "npm"),
+		filepath.Join(appdir.Getenv("APPDATA"), "npm"),
 		filepath.Join(home, ".local", "bin"),
 		filepath.Join(home, ".bun", "bin"),
-		filepath.Join(os.Getenv("LOCALAPPDATA"), "Volta", "bin"),
-		filepath.Join(os.Getenv("LOCALAPPDATA"), "pnpm"),
+		filepath.Join(appdir.Getenv("LOCALAPPDATA"), "Volta", "bin"),
+		filepath.Join(appdir.Getenv("LOCALAPPDATA"), "pnpm"),
 	}
 	var have []string
 	for _, d := range known {
@@ -29,3 +34,40 @@ func UserBinDirs() []string {
 	}
 	return have
 }
+
+// LoginPath is the PATH the registry has now, the machine's then the
+// user's: what a terminal opened now gets, and what a magpie started
+// before a CLI was installed doesn't.
+func LoginPath() []string {
+	var dirs []string
+	for _, k := range []struct {
+		root registry.Key
+		path string
+	}{
+		{registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`},
+		{registry.CURRENT_USER, `Environment`},
+	} {
+		key, err := registry.OpenKey(k.root, k.path, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		if v, _, err := key.GetStringValue("Path"); err == nil {
+			// %SystemRoot%\system32 as Windows expands it: os.ExpandEnv of
+			// $SystemRoot$\system32 made C:\Windows$\system32
+			if x, err := registry.ExpandString(v); err == nil {
+				v = x
+			}
+			for _, d := range strings.Split(v, ";") {
+				if d = strings.TrimSpace(d); d != "" {
+					dirs = append(dirs, d)
+				}
+			}
+		}
+		key.Close()
+	}
+	return dirs
+}
+
+// ShellPath is LoginPath on Windows: PowerShell and cmd both take the
+// registry's PATH.
+func ShellPath(string) []string { return LoginPath() }

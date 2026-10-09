@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,8 +15,10 @@ import (
 func groupsHome(t *testing.T) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir()) // no agent signed in
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("DSH_HOME", "") // a dsh profile is found through it, not through HOME
 	for _, p := range []provider.Provider{
 		{ID: "a", Name: "A", Key: "ka", Models: []string{"m", "only-a", "claude-opus-5-5"}, Chat: "http://127.0.0.1:1/v1"},
 		{ID: "b", Name: "B", Key: "kb", Models: []string{"vendor/m", "gpt-5.5"}, Chat: "http://127.0.0.1:1/v1"},
@@ -27,6 +30,36 @@ func groupsHome(t *testing.T) {
 }
 
 // storedGroups: the groups as the file keeps them.
+// A group an agent is on carries Claude Code's [1m] mark in the agent's
+// own settings, as a model's does: `magpie group` lists "← agent" beside a
+// group by its id, so the mark has to come off the id before it is looked
+// up. Claude Code on group/auto-gpt-5[1m] was on no row at all.
+func TestGroupUsesTakesTheOneMMarkOff(t *testing.T) {
+	groupsHome(t)
+	if err := provider.SaveGroup(provider.Group{ID: "auto-gpt-5", Name: "GPT 5", Members: []string{"a/gpt-5"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Claude Code's settings.json, as the reporter's reads
+	if err := os.MkdirAll(filepath.Join(os.Getenv("HOME"), ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(os.Getenv("HOME"), ".claude/settings.json"),
+		[]byte(`{"model":"group/auto-gpt-5[1m]"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	uses := groupUses()
+	if got := uses["auto-gpt-5"]; len(got) != 1 || !strings.Contains(got[0], "Claude") {
+		t.Errorf("the group's agents: %q, all uses %q", got, uses)
+	}
+	if _, marked := uses["auto-gpt-5[1m]"]; marked {
+		t.Errorf("the marked id got its own row: %q", uses)
+	}
+}
+
+// sameGroup compares two values of a field, one of them read back from the
+// agent's own settings where the [1m] mark rides on the group's id: the
+// marked one is the group magpie set, not another group. (internal/agent's
+// own, tested there.)
 func storedGroups(t *testing.T) []map[string]any {
 	t.Helper()
 	b, err := os.ReadFile(provider.Path())
@@ -85,7 +118,15 @@ func TestApplyGroupPairs(t *testing.T) {
 	if err := applyGroupPairs(&g, []string{"models-=x"}, resolve, false); err != nil || strings.Join(g.Members, " ") != "b/y" {
 		t.Fatalf("drop by bare id: %v %v", err, g.Members)
 	}
-	for _, bad := range [][]string{{"models"}, {"colour=red"}, {"id=x"}, {"models=nope"}, {"routing=fast"}, {"models-=a/m"}} {
+	for _, c := range []struct {
+		v    string
+		want int
+	}{{"272k", 272000}, {"smallest", provider.ContextSmallest}, {"largest", 0}, {"1m", 1000000}, {"", 0}} {
+		if err := applyGroupPairs(&g, []string{"context=" + c.v}, resolve, false); err != nil || g.Context != c.want {
+			t.Errorf("context=%s: %d %v", c.v, g.Context, err)
+		}
+	}
+	for _, bad := range [][]string{{"models"}, {"colour=red"}, {"id=x"}, {"models=nope"}, {"routing=fast"}, {"models-=a/m"}, {"context=lots"}} {
 		h := g
 		if err := applyGroupPairs(&h, bad, resolve, false); err == nil {
 			t.Errorf("%v: no error", bad)
@@ -244,5 +285,21 @@ func TestGroupSetID(t *testing.T) {
 	}
 	if _, err := setGroup("m", []string{"id=other"}); err == nil {
 		t.Fatal("renamed onto another group")
+	}
+}
+
+// magpie group set <id> name=… says the id stays, and what agents ask for,
+// so a renamed group isn't taken for one with a new id (MOMO on Discord).
+func TestGroupRenameSaysTheIDStays(t *testing.T) {
+	groupsHome(t)
+	if err := provider.SaveGroup(provider.Group{ID: "fast", Name: "Fast", Members: []string{"a/m"}}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := stdoutOf(t, func() error { return groupCmd([]string{"group", "set", "fast", "name=DS Flash"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "its id stays fast") || !strings.Contains(out, "group/fast") {
+		t.Fatalf("rename said %q; want that the id stays fast", out)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/yetone/magpie/internal/edit"
@@ -31,9 +32,28 @@ type Library struct {
 	// Icons are the icons of the servers added from the market, by what
 	// each runs, for the page to show them by
 	Icons map[string]string `json:"icons,omitempty"`
+	// SkillGroups are the groups the user made of some skills on the
+	// page, each shown as a group of its own (#791)
+	SkillGroups []*SkillGroup `json:"skillGroups,omitempty"`
+	// CopySkills gives the agents copies of their skills rather than links
+	// to the library's, and SkillHow is an agent's own way over it, link or
+	// copy (#896, skill_how.go)
+	CopySkills bool              `json:"copySkills,omitempty"`
+	SkillHow   map[string]string `json:"skillHow,omitempty"`
+	// SeenSkills are, by repository and ref ("owner/repo@ref"), the
+	// folders of skills there the page has offered: picked or not at
+	// install, or set aside after a check. A check offers only the others
+	// as new (skillnew.go).
+	SeenSkills map[string][]string `json:"seenSkills,omitempty"`
 	// kept is where a change put what it kept aside before the sync, for
 	// the sync to keep the agents' files beside it
 	kept *backups
+	// hashes are the library's skills' hashes as this change read them
+	// (libHash); one taken from an agent's edit is read again
+	hashes map[string]string
+	// untouched are the agents' copies takeEdits found unchanged since
+	// magpie made them, for the sync not to look through them again
+	untouched map[string]bool
 }
 
 // Instructions are one shared text, and for each agent whether it gets it
@@ -93,6 +113,15 @@ func (l *Library) save() error {
 		sort.Strings(a.MCP)
 		sort.Strings(a.Skills)
 	}
+	// a skill or server on no agent is on none, [] not null: a list sorted
+	// with slices.Sorted, or cloned, from an empty one is nil (#1217)
+	for _, s := range l.Skills {
+		s.Agents = orNone(s.Agents)
+	}
+	for _, s := range l.MCP {
+		s.Agents = orNone(s.Agents)
+	}
+	l.Instructions.Agents = orNone(l.Instructions.Agents)
 	b, err := json.MarshalIndent(l, "", "  ")
 	if err != nil {
 		return err
@@ -137,6 +166,24 @@ func checkName(kind, name string) error {
 	}
 	return nil
 }
+
+// agentRe is an agent's id: a name, or one in a WSL distro's
+// (codex@wsl:Ubuntu-24.04).
+var agentRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}(@wsl:[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$`)
+
+func checkAgent(id string) error {
+	if !agentRe.MatchString(id) {
+		return fmt.Errorf("agent %q: not an agent's id", id)
+	}
+	return nil
+}
+
+// fileName is an agent's id as the name of a file or folder of its:
+// Windows has no colon in one, so a WSL agent's is codex@wsl.Ubuntu.
+func fileName(id string) string { return strings.Replace(id, "@wsl:", "@wsl.", 1) }
+
+// agentOfFile is the agent's id a fileName is of.
+func agentOfFile(name string) string { return strings.Replace(name, "@wsl.", "@wsl:", 1) }
 
 // set turns id on or off in a list of agent ids, which stays sorted.
 func set(list []string, id string, on bool) []string {

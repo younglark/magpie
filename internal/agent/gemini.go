@@ -2,12 +2,12 @@ package agent
 
 import (
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -20,15 +20,27 @@ import (
 // points GOOGLE_GEMINI_BASE_URL at it, uses the gateway token as the API
 // key and names the catalog model in model.name.
 
-func gemini(home string) *Agent {
-	dir := filepath.Join(home, ".gemini")
+func gemini(home string) *Agent { return geminiIn(here(home)) }
+
+// geminiIn is Gemini CLI at a place: this machine's home, or a WSL
+// distro's (see wsl.go), whose .env names the gateway as the distro
+// reaches it, with the key it takes from there.
+func geminiIn(at place) *Agent {
+	dir := filepath.Join(at.home, ".gemini")
 	path := filepath.Join(dir, "settings.json")
 	envPath := filepath.Join(dir, ".env")
 	auth := jsonGet(path, "security.auth.selectedType")
 	model := jsonGet(path, "model.name")
 	base := func() string { v, _ := edit.GetEnvFile(envPath, "GOOGLE_GEMINI_BASE_URL"); return v }
 	envKey := func() string { v, _ := edit.GetEnvFile(envPath, "GEMINI_API_KEY"); return v }
-	routed := func() bool { return base() == gateway.URL() }
+	// routed: the .env names the gateway, or names it at an address it
+	// no longer has (a WSL distro's under NAT changes as WSL restarts) with
+	// magpie's key: either way what is there is magpie's, never stashed as
+	// the user's own
+	routed := func() bool {
+		b, k := base(), envKey()
+		return b == at.gw() || b != "" && (ourKey(k) || k == at.gwKey())
+	}
 	magpieKey := func() string {
 		for _, id := range []string{"google", "gemini"} {
 			if p, err := provider.Find(id); err == nil && p.Key != "" {
@@ -46,10 +58,10 @@ func gemini(home string) *Agent {
 			return err
 		}
 		var env []edit.KV
-		if u := unstash("gemini.base_url"); u != "" {
+		if u := unstash(at.key("gemini.base_url")); u != "" {
 			env = append(env, edit.KV{Path: "GOOGLE_GEMINI_BASE_URL", Value: u})
 		}
-		if k := unstash("gemini.api_key"); k != "" {
+		if k := unstash(at.key("gemini.api_key")); k != "" {
 			env = append(env, edit.KV{Path: "GEMINI_API_KEY", Value: k})
 		}
 		if len(env) > 0 {
@@ -57,34 +69,36 @@ func gemini(home string) *Agent {
 				return err
 			}
 		}
-		if a := unstash("gemini.auth"); a != "" {
+		if a := unstash(at.key("gemini.auth")); a != "" {
 			if err := edit.SetJSON(path, edit.KV{Path: "security.auth.selectedType", Value: a}); err != nil {
 				return err
 			}
 		} else if err := edit.DelJSON(path, "security.auth.selectedType"); err != nil {
 			return err
 		}
-		if m := unstash("gemini.model"); m != "" {
+		if m := unstash(at.key("gemini.model")); m != "" {
 			return edit.SetJSON(path, edit.KV{Path: "model.name", Value: m})
 		}
-		return edit.DelJSON(path, "model.name")
+		return delModelName(path)
 	}
 	setModel := func(v string) error {
 		if v == "" {
 			if routed() {
-				forget("gemini.base_url", "gemini.api_key", "gemini.auth", "gemini.model")
+				forget(at.key("gemini.base_url"), at.key("gemini.api_key"), at.key("gemini.auth"), at.key("gemini.model"))
 				if err := edit.DelEnvFile(envPath, "GOOGLE_GEMINI_BASE_URL", "GEMINI_API_KEY"); err != nil {
 					return err
 				}
-				return edit.DelJSON(path, "security.auth.selectedType", "model.name")
+				if err := edit.DelJSON(path, "security.auth.selectedType"); err != nil {
+					return err
+				}
 			}
-			return edit.DelJSON(path, "model.name")
+			return delModelName(path)
 		}
 		if isMagpie(v) {
 			if !routed() {
-				stash(map[string]string{"gemini.base_url": base(), "gemini.api_key": envKey(), "gemini.auth": auth(), "gemini.model": model()})
+				stash(map[string]string{at.key("gemini.base_url"): base(), at.key("gemini.api_key"): envKey(), at.key("gemini.auth"): auth(), at.key("gemini.model"): model()})
 			}
-			if err := edit.SetEnvFile(envPath, edit.KV{Path: "GOOGLE_GEMINI_BASE_URL", Value: gateway.URL()}, edit.KV{Path: "GEMINI_API_KEY", Value: gateway.Token}); err != nil {
+			if err := edit.SetEnvFile(envPath, edit.KV{Path: "GOOGLE_GEMINI_BASE_URL", Value: at.gw()}, edit.KV{Path: "GEMINI_API_KEY", Value: at.gwKey()}); err != nil {
 				return err
 			}
 			return edit.SetJSON(path, edit.KV{Path: "security.auth.selectedType", Value: "gemini-api-key"}, edit.KV{Path: "model.name", Value: v})
@@ -162,12 +176,28 @@ func gemini(home string) *Agent {
 		ID: "gemini", Name: "Gemini CLI", Icon: "geminicli-color", Aliases: []string{"gemini-cli"},
 		UA:  []string{"geminicli", "gemini-cli"},
 		Bin: "gemini", Dir: dir, Path: path,
+		// its model's default forgets what it had before magpie, its
+		// sign-in's default forgets the sign-in: this puts both back
+		Unwire: unroute,
+		// Gemini CLI is its binary. What it leaves in ~/.gemini stays when it
+		// is uninstalled (#230), and Antigravity keeps its folders there too
+		// (antigravity, antigravity-cli, config) and reads GEMINI.md (#330),
+		// so nothing there says Gemini CLI is here: a row for it would set
+		// up a CLI that can't run. The desktop app's PATH has the user's
+		// shell's (proc.UserPath).
+		detect: func() bool {
+			if Taken(dir) {
+				return false
+			}
+			_, err := exec.LookPath("gemini")
+			return err == nil
+		},
 		Check: func() string {
 			if !isMagpie(model()) {
 				return ""
 			}
 			if d := wiringOff("Gemini CLI", envPath, func(k string) (string, bool) { return edit.GetEnvFile(envPath, k) },
-				"GOOGLE_GEMINI_BASE_URL", gateway.URL(), "GEMINI_API_KEY", gateway.Token); d != "" {
+				"GOOGLE_GEMINI_BASE_URL", at.gw(), "GEMINI_API_KEY", at.gwKey()); d != "" {
 				return d
 			}
 			if a := auth(); a != "gemini-api-key" {
@@ -227,4 +257,17 @@ func gemini(home string) *Agent {
 			},
 		},
 	}
+}
+
+// delModelName takes model.name out of Gemini CLI's settings.json, and the
+// model it was in once nothing else is there: the "model": {} it would
+// leave was never the user's.
+func delModelName(path string) error {
+	if err := edit.DelJSON(path, "model.name"); err != nil {
+		return err
+	}
+	if v, _ := edit.GetJSON(path, "model"); strings.TrimSpace(strings.Trim(strings.TrimSpace(v), "{}")) == "" && strings.HasPrefix(strings.TrimSpace(v), "{") {
+		return edit.DelJSON(path, "model")
+	}
+	return nil
 }

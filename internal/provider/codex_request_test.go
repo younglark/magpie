@@ -181,8 +181,8 @@ func TestCodexPromptsSameMtime(t *testing.T) {
 	}
 }
 
-// Codex's Fast mode reaches the ChatGPT backend as service_tier "priority";
-// any other tier is dropped as before.
+// Codex's Fast mode reaches the ChatGPT backend as service_tier "priority",
+// its Ultrafast as "ultrafast"; any other tier is dropped as before.
 func TestCodexBodyServiceTier(t *testing.T) {
 	t.Setenv("CODEX_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
@@ -195,6 +195,9 @@ func TestCodexBodyServiceTier(t *testing.T) {
 	if v, _ := tier(`{"model":"gpt-6-sol","service_tier":"priority","input":"hi"}`); v != "priority" {
 		t.Errorf("priority: %v", v)
 	}
+	if v, _ := tier(`{"model":"gpt-6-sol","service_tier":"ultrafast","input":"hi"}`); v != "ultrafast" {
+		t.Errorf("ultrafast: %v", v)
+	}
 	for _, s := range []string{`"flex"`, `"auto"`, `"default"`, `"fast"`, `null`} {
 		if v, ok := tier(`{"model":"gpt-6-sol","service_tier":` + s + `,"input":"hi"}`); ok {
 			t.Errorf("%s kept as %v", s, v)
@@ -202,5 +205,27 @@ func TestCodexBodyServiceTier(t *testing.T) {
 	}
 	if v, ok := tier(`{"model":"gpt-6-sol","input":"hi"}`); ok {
 		t.Errorf("none became %v", v)
+	}
+}
+
+// Standalone notifications retain the metadata the native backend recognizes;
+// paired outputs and ID-bearing historical orphans keep their existing rules.
+func TestCodexStandaloneNotifications(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	for _, kind := range []string{"function_call_output", "custom_tool_call_output"} {
+		for _, id := range []string{"", `,"call_id":""`} {
+			body := []byte(`{"model":"gpt-5.5","input":[{"type":"` + kind + `","id":"standalone","name":"send_message_to_thread","namespace":"codex_app","output":"native notice"` + id + `}]}`)
+			var before, after struct {
+				Input []map[string]any `json:"input"`
+			}
+			json.Unmarshal(body, &before)
+			json.Unmarshal(codexBody(body), &after)
+			b, _ := json.Marshal(before.Input)
+			a, _ := json.Marshal(after.Input)
+			if string(a) != string(b) {
+				t.Fatalf("standalone changed: %s -> %s", b, a)
+			}
+		}
 	}
 }

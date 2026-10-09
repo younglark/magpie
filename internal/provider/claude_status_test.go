@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // With magpie wired into Claude Code, `claude auth status` tells of magpie's
@@ -12,9 +14,11 @@ import (
 // its saved login is, so it is the one Active and not also served beside
 // itself; the env magpie runs in is not handed to the CLI (#177).
 func TestClaudeAccountNamedAsItsLogin(t *testing.T) {
+	shellFakes(t)
 	isolate(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "magpie")
@@ -30,7 +34,7 @@ func TestClaudeAccountNamedAsItsLogin(t *testing.T) {
 	})
 	dir := t.TempDir()
 	exe, env := filepath.Join(dir, "claude"), filepath.Join(dir, "env")
-	os.WriteFile(exe, []byte("#!/bin/sh\necho \"token=$ANTHROPIC_AUTH_TOKEN\" > "+env+"\necho '{\"loggedIn\":true,\"authMethod\":\"oauth_token\",\"apiProvider\":\"firstParty\"}'\n"), 0o755)
+	testenv.Program(t, exe, "#!/bin/sh\necho \"token=$ANTHROPIC_AUTH_TOKEN\" > "+env+"\necho '{\"loggedIn\":true,\"authMethod\":\"oauth_token\",\"apiProvider\":\"firstParty\"}'\n")
 	claudeExecutable = func() string { return exe }
 	loginsMu.Lock()
 	loginsSeenAt = time.Time{}
@@ -55,10 +59,11 @@ func TestClaudeAccountNamedAsItsLogin(t *testing.T) {
 // a second look at Claude Code's sign-in serves the last answer at once and
 // asks the CLI again behind it (#123)
 func TestClaudeIdentityServedWhileAsked(t *testing.T) {
+	shellFakes(t)
 	dir := t.TempDir()
 	exe, who := filepath.Join(dir, "claude"), filepath.Join(dir, "who")
 	os.WriteFile(who, []byte("a@example.com"), 0o600)
-	os.WriteFile(exe, []byte("#!/bin/sh\nsleep 1\nprintf '{\"loggedIn\":true,\"email\":\"%s\",\"subscriptionType\":\"max\"}' \"$(cat "+who+")\"\n"), 0o755)
+	testenv.Program(t, exe, "#!/bin/sh\nsleep 1\nprintf '{\"loggedIn\":true,\"email\":\"%s\",\"subscriptionType\":\"max\"}' \"$(cat "+who+")\"\n")
 	old := claudeExecutable
 	claudeExecutable = func() string { return exe }
 	t.Cleanup(func() { claudeExecutable = old; forgetClaudeStatus() })

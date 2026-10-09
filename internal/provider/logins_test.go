@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func TestCodexLogins(t *testing.T) {
 	if strings.Join(users, ",") != "me@example.com,work@example.com" || active != "work@example.com" {
 		t.Fatalf("logins %v, active %q", users, active)
 	}
-	if fi, err := os.Stat(loginsPath()); err != nil || fi.Mode().Perm() != 0o600 {
+	if fi, err := os.Stat(loginsPath()); err != nil || runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("logins.json mode: %v %v", fi, err)
 	}
 	// the agent refreshes the active login in place; a switch keeps that
@@ -65,14 +66,12 @@ func TestCodexLogins(t *testing.T) {
 		}
 	}
 
-	if err := ForgetLogin("codex", "me@example.com"); err == nil {
-		t.Fatal("forgot the active login")
-	}
-	if err := ForgetLogin("codex", "work@example.com"); err != nil {
+	// the active one forgotten: Codex is signed in to the other first
+	if err := ForgetLogin("codex", "me@example.com"); err != nil {
 		t.Fatal(err)
 	}
-	if users, _ := loginUsers(Logins("codex")); strings.Join(users, ",") != "me@example.com" {
-		t.Fatalf("after forget: %v", users)
+	if users, active := loginUsers(Logins("codex")); strings.Join(users, ",") != "work@example.com" || active != "work@example.com" {
+		t.Fatalf("after forget: %v, active %q", users, active)
 	}
 	if err := SwitchLogin("codex", "nobody@example.com"); err == nil {
 		t.Fatal("switched to an unknown login")

@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 func TestNewerVersions(t *testing.T) {
@@ -51,9 +53,7 @@ func TestInstalledVersion(t *testing.T) {
 	}
 	p := filepath.Join(bin, "pi")
 	for _, c := range []struct{ out, want string }{{"0.98.2", "0.98.2"}, {"pi 0.99.0\n", "0.99.0"}} {
-		if err := os.WriteFile(p, []byte("#!/bin/sh\necho '"+c.out+"'\n"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		testenv.Program(t, p, "#!/bin/sh\necho '"+c.out+"'\n")
 		if v := a.InstalledVersion(); v != c.want {
 			t.Errorf("%q: %q", c.out, v)
 		}
@@ -87,7 +87,9 @@ func file(t *testing.T, path, body string) string {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+	if strings.HasPrefix(body, "#!") {
+		testenv.Program(t, path, body)
+	} else if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -134,6 +136,12 @@ func TestHowInstalled(t *testing.T) {
 	// another agent's package in the same place is not the agent's
 	if u := howInstalled(cliSpecs["codex"], gem); u != nil {
 		t.Errorf("gemini's package taken for codex: %+v", u)
+	}
+	atomcodePkg := "@atomgit.com/atomcode"
+	file(t, filepath.Join(prefix, "lib/node_modules", atomcodePkg, "bin/atomcode.js"), "")
+	atomcodeBin := link(t, "../lib/node_modules/"+atomcodePkg+"/bin/atomcode.js", filepath.Join(prefix, "bin/atomcode"))
+	if u := howInstalled(cliSpecs["atomcode"], atomcodeBin); u == nil || u.via != "npm" || !reflect.DeepEqual(u.cmd, []string{npm, "install", "-g", "--prefix", prefix, atomcodePkg + "@latest"}) {
+		t.Errorf("AtomCode npm: %+v", u)
 	}
 	// npm with no npm of its own takes the one on PATH, or none
 	prefix2 := filepath.Join(tmp, "node2")
@@ -194,6 +202,11 @@ func TestHowInstalled(t *testing.T) {
 	cc := link(t, "../Caskroom/claude-code/2.1.0/claude", filepath.Join(brewDir, "bin/claude"))
 	if u := howInstalled(cliSpecs["claude"], cc); u == nil || !u.cask || !reflect.DeepEqual(u.cmd, []string{brew, "upgrade", "--cask", "claude-code"}) {
 		t.Errorf("brew cask: %+v", u)
+	}
+	file(t, filepath.Join(brewDir, "Caskroom/atomcode/5.2.1/atomcode"), "")
+	atomcode := link(t, "../Caskroom/atomcode/5.2.1/atomcode", filepath.Join(brewDir, "bin/atomcode"))
+	if u := howInstalled(cliSpecs["atomcode"], atomcode); u == nil || !u.cask || !reflect.DeepEqual(u.cmd, []string{brew, "upgrade", "--cask", "atomcode"}) {
+		t.Errorf("AtomCode brew cask: %+v", u)
 	}
 	file(t, filepath.Join(brewDir, "Cellar/something/1.0/bin/gemini"), "")
 	if u := howInstalled(cliSpecs["gemini"], link(t, "../Cellar/something/1.0/bin/gemini", filepath.Join(brewDir, "bin/gemini"))); u != nil {

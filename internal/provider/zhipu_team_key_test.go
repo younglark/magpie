@@ -6,8 +6,11 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/agentenv"
 )
 
 // #236: a Zhipu key on a team's GLM Coding Plan, added as a key and not
@@ -18,15 +21,19 @@ func TestZhipuKeyTeamFields(t *testing.T) {
 	isolate(t)
 	h := t.TempDir()
 	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
 	t.Setenv("PATH", h)
-	for _, v := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME"} {
+	for _, v := range agentenv.Vars {
 		t.Setenv(v, "")
 	}
 	asked := map[string]http.Header{}
 	hosts := map[string][]string{} // where each key's team quota was asked
+	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		key := r.Header.Get("Authorization")
 		switch r.Header.Get("X-Host") + r.URL.Path {
 		case "open.bigmodel.cn/api/monitor/usage/quota/limit", "bigmodel.cn/api/monitor/usage/quota/limit":
@@ -88,6 +95,8 @@ func TestZhipuKeyTeamFields(t *testing.T) {
 	for _, q := range PlanQuotas(context.Background()) {
 		got[q.Provider] = q
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	q, ok := got["team"]
 	if !ok || q.Error != "" || q.Plan != "GLM Coding Team" || len(q.Windows) != 2 ||
 		q.Windows[0].Name != "5 hours" || q.Windows[0].Used != 42 || q.Windows[0].Span != 5*time.Hour ||

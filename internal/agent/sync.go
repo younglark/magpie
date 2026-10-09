@@ -1,12 +1,16 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/provider"
 	"gopkg.in/yaml.v3"
 )
 
@@ -38,11 +42,15 @@ func SyncCatalog() {
 	syncing.running = true
 	syncing.Unlock()
 	for {
+		// the catalog built once for every agent's lists, not for each
+		// look-up of each (thousands at magpie's start, with 30 providers)
+		release := provider.Hold()
 		for _, a := range All() {
 			if a.Sync != nil {
 				_ = a.Sync()
 			}
 		}
+		release()
 		syncing.Lock()
 		if !syncing.again {
 			syncing.running = false
@@ -67,6 +75,94 @@ func syncJSON(path, key string, value func() any) error {
 		return nil
 	}
 	return edit.SetJSON(path, edit.KV{Path: key, Value: v})
+}
+
+// theirsKept is value, magpie's provider block for the agent, with what
+// else the block at key of the JSON file holds kept: a key magpie doesn't
+// write there, at any depth, is the user's or another tool's (Pi's
+// providers.magpie.compat.sendSessionAffinityHeaders, which
+// pi-cache-optimizer adds, #1103) and stays. The keys named in whole (the
+// model list) are magpie's alone, so a model gone from the catalog leaves
+// the agent's list.
+func theirsKept(path, key string, value func() any, whole ...string) func() any {
+	return func() any {
+		v := value()
+		cur, ok := edit.GetJSON(path, key)
+		if !ok {
+			return v
+		}
+		var have, want map[string]json.RawMessage
+		b, err := json.Marshal(v)
+		if err != nil || json.Unmarshal([]byte(cur), &have) != nil || have == nil || json.Unmarshal(b, &want) != nil || want == nil {
+			return v
+		}
+		return mergeTheirs(have, want, whole)
+	}
+}
+
+// mergeTheirs is want with each key of have that want lacks, objects in
+// both merged alike; a key named in whole is want's as it is.
+func mergeTheirs(have, want map[string]json.RawMessage, whole []string) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(have)+len(want))
+	for k, w := range want {
+		out[k] = w
+	}
+	for k, h := range have {
+		w, ok := want[k]
+		if !ok {
+			out[k] = h
+			continue
+		}
+		if slices.Contains(whole, k) {
+			continue
+		}
+		var hm, wm map[string]json.RawMessage
+		if json.Unmarshal(h, &hm) != nil || hm == nil || json.Unmarshal(w, &wm) != nil || wm == nil {
+			continue
+		}
+		if b, err := json.Marshal(mergeTheirs(hm, wm, nil)); err == nil {
+			out[k] = b
+		}
+	}
+	return out
+}
+
+// syncJSONInOrder is syncJSON for a block whose keys' order the agent reads
+// (OpenCode lists a model's variants in theirs): one that says the same in
+// another order is rewritten too, as an older magpie wrote the variants
+// alphabetically (#713).
+func syncJSONInOrder(path, key string, value func() any) error {
+	cur, ok := edit.GetJSON(path, key)
+	if !ok {
+		return nil
+	}
+	v := value()
+	if sameJSON(cur, v) && sameOrder(cur, v) {
+		return nil
+	}
+	return edit.SetJSON(path, edit.KV{Path: key, Value: v})
+}
+
+// sameOrder reports whether raw JSON and what v marshals to read alike token
+// by token, keys in the same order; whitespace and escapes aside.
+func sameOrder(raw string, v any) bool {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return false
+	}
+	x, y := json.NewDecoder(strings.NewReader(raw)), json.NewDecoder(bytes.NewReader(b))
+	x.UseNumber()
+	y.UseNumber()
+	for {
+		a, errA := x.Token()
+		c, errC := y.Token()
+		if errA != nil || errC != nil {
+			return errA == io.EOF && errC == io.EOF
+		}
+		if a != c {
+			return false
+		}
+	}
 }
 
 // sameJSON reports whether raw JSON says what v marshals to.

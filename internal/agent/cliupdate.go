@@ -27,6 +27,7 @@ import (
 
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/source"
 )
 
 // CLI is what magpie knows of an agent's command-line program.
@@ -42,6 +43,9 @@ type CLI struct {
 	Command string `json:"command,omitempty"`
 	// Update: Latest is after Version, and magpie knows how to get it
 	Update bool `json:"update,omitempty"`
+	// App is the version of the agent's desktop app installed beside it
+	// (the Codex app, AppVersion); shown even with no CLI on PATH
+	App string `json:"app,omitempty"`
 }
 
 // cliSpec is where an agent's CLI is published.
@@ -80,12 +84,23 @@ var cliSpecs = map[string]cliSpec{
 			}
 			return nil
 		}},
-	"pi":      {npm: []string{"@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"}},
-	"omp":     {npm: []string{"@oh-my-pi/pi-coding-agent"}},
-	"copilot": {npm: []string{"@github/copilot"}, brew: []string{"copilot-cli"}},
-	"crush":   {npm: []string{"@charmland/crush"}, brew: []string{"crush"}},
-	"cline":   {npm: []string{"cline"}},
-	"goose":   {brew: []string{"block-goose-cli"}},
+	"pi":        {npm: []string{"@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"}},
+	"omp":       {npm: []string{"@oh-my-pi/pi-coding-agent"}},
+	"copilot":   {npm: []string{"@github/copilot"}, brew: []string{"copilot-cli"}},
+	"crush":     {npm: []string{"@charmland/crush"}, brew: []string{"crush"}},
+	"cline":     {npm: []string{"cline"}},
+	"dsh":       {npm: []string{"@deepseek-ai/dsh"}},
+	"codebuddy": {npm: []string{"@tencent-ai/codebuddy-code"}},
+	"goose":     {brew: []string{"block-goose-cli"}},
+	// AtomCode's installer chooses /usr/local/bin or ~/.local/bin by
+	// writability (`.local\bin\atomcode.exe` on Windows); `atomcode upgrade`
+	// exists, but its installed-binary update path is not exercised here, so
+	// only its npm package and brew cask are recognized
+	"atomcode": {npm: []string{"@atomgit.com/atomcode"}, brew: []string{"atomcode"}},
+	// omo update, however it was installed: OmO's own updater, which moves
+	// the engine it pins (senpi) with it
+	"omo": {npm: []string{"omo-ai"},
+		self: func(bin, real string) []string { return []string{bin, "update"} }},
 }
 
 // updater is how an installed CLI is brought up to date.
@@ -392,17 +407,10 @@ func installedVersion(bin string) string {
 	})
 }
 
-// runVersion runs bin --version with nothing on its stdin; a var so tests
-// can fake it.
-var runVersion = func(bin string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := proc.CommandContext(ctx, bin, "--version")
-	cmd.Stdin = nil // /dev/null: one that would ask something gets nothing
-	cmd.Env = append(os.Environ(), "NO_COLOR=1")
-	out, _ := cmd.CombinedOutput()
-	return string(out)
-}
+// runVersion is what bin says its version is (proc.Version: read from its
+// npm package, else bin --version, not run again after it failed); a var so
+// tests can fake it.
+var runVersion = proc.Version
 
 // latestVersion is the newest version where u would update from.
 func latestVersion(u *updater) string {
@@ -423,7 +431,7 @@ func npmLatest(pkg string) (string, error) {
 	req, _ := http.NewRequest("GET", npmRegistry+pkg+"/latest", nil)
 	req.Header.Set("User-Agent", "magpie")
 	req.Header.Set("Accept", "application/json")
-	resp, err := c.Do(req)
+	resp, err := source.Do(c, req)
 	if err != nil {
 		return "", err
 	}
@@ -496,11 +504,13 @@ func (a *Agent) cliBin() (string, cliSpec) {
 }
 
 // CLI is the agent's CLI: its version, the newest, and whether magpie can
-// update it. ok is false for an agent without a CLI magpie knows.
+// update it, with its desktop app's version. ok is false for an agent with
+// neither a CLI magpie knows nor its app.
 func (a *Agent) CLI() (c CLI, ok bool) {
+	c.App = a.AppVersion()
 	bin, spec := a.cliBin()
 	if bin == "" {
-		return CLI{}, false
+		return c, c.App != ""
 	}
 	c.Version = installedVersion(bin)
 	u := howInstalled(spec, bin)

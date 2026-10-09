@@ -18,8 +18,9 @@ package agent
 //	  "entries":[…,{"id":"<id>","name":"magpie"}]}
 //
 // as CC Switch writes them (claude_desktop_config.rs). The folders are in
-// ~/Library/Application Support on macOS, %LOCALAPPDATA% on Windows and
-// $XDG_CONFIG_HOME on Linux. With no inferenceModels Desktop lists the
+// ~/Library/Application Support on macOS, %LOCALAPPDATA% on Windows (the
+// MSIX package's LocalCache\Local for a packaged Desktop) and
+// $XDG_CONFIG_HOME on Linux, as internal/desktopdir finds them. With no inferenceModels Desktop lists the
 // gateway's /v1/models, which the gateway gives it by ids it keeps (see
 // gateway/desktop.go). Desktop reads all this at start-up only.
 
@@ -27,13 +28,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
-	"sort"
 	"strings"
 
+	"github.com/yetone/magpie/internal/desktopdir"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 )
@@ -59,69 +60,32 @@ func desktopPathsOf(dir, dir3p string) desktopPaths {
 	}
 }
 
-// desktopDirs are Desktop's Claude and Claude-3p folders on goos.
+// desktopDirs are Desktop's Claude and Claude-3p folders on goos: the ones
+// magpie writes deploymentMode and its profile into (desktopdir.Find).
 func desktopDirs(goos, home string, getenv func(string) string) (string, string) {
-	switch goos {
-	case "darwin":
-		d := filepath.Join(home, "Library", "Application Support")
-		return filepath.Join(d, "Claude"), filepath.Join(d, "Claude-3p")
-	case "windows":
-		d := getenv("LOCALAPPDATA")
-		if d == "" {
-			d = filepath.Join(home, "AppData", "Local")
-		}
-		return windowsDesktopDir(d, false), windowsDesktopDir(d, true)
-	}
-	d := getenv("XDG_CONFIG_HOME")
-	if d == "" || !filepath.IsAbs(d) {
-		d = filepath.Join(home, ".config")
-	}
-	return filepath.Join(d, "Claude"), filepath.Join(d, "Claude-3p")
+	d := desktopdir.Find(goos, home, getenv)
+	return d.Mode, d.ThreeP
 }
 
-// windowsDesktopDir is %LOCALAPPDATA%\Claude (or Claude-3p), else the first
-// folder there named Claude… (with -3p in it or not), as CC Switch finds it.
-func windowsDesktopDir(local string, threep bool) string {
-	name := "Claude"
-	if threep {
-		name = "Claude-3p"
-	}
-	exact := filepath.Join(local, name)
-	if _, err := os.Stat(exact); err == nil {
-		return exact
-	}
-	ents, _ := os.ReadDir(local)
-	var found []string
-	for _, e := range ents {
-		if n := e.Name(); e.IsDir() && strings.HasPrefix(n, "Claude") && strings.Contains(n, "-3p") == threep {
-			found = append(found, n)
-		}
-	}
-	if len(found) == 0 {
-		return exact
-	}
-	sort.Strings(found)
-	return filepath.Join(local, found[0])
+// DesktopConfig3p is the claude_desktop_config.json Claude Desktop reads in
+// its 3p mode: there its whole userData is Claude-3p, its MCP servers too
+// (%LOCALAPPDATA%\Claude-3p on Windows, Claude-3p beside Claude elsewhere).
+func DesktopConfig3p(home string) string {
+	_, d := desktopDirs(desktopdir.OS, home, os.Getenv)
+	return filepath.Join(d, "claude_desktop_config.json")
 }
 
 func claudeDesktop(home string) *Agent {
-	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
-	// %APPDATA%\Claude is where Desktop keeps its MCP servers on Windows
-	also := ""
-	if runtime.GOOS == "windows" {
-		if d := os.Getenv("APPDATA"); d != "" {
-			also = filepath.Join(d, "Claude")
-		}
-	}
+	dirs := desktopdir.Find(desktopdir.OS, home, os.Getenv)
+	p := desktopPathsOf(dirs.Mode, dirs.ThreeP)
 	return &Agent{
 		ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Aliases: []string{"claude-app"},
 		Dir: p.dir, Path: p.config,
 		detect: func() bool {
-			for _, d := range []string{p.dir, p.dir3p, also} {
-				if d == "" {
-					continue
-				}
-				if _, err := os.Stat(d); err == nil {
+			// its own data (%APPDATA%\Claude on Windows, or the MSIX
+			// package's), the folder magpie writes or Claude-3p
+			for _, d := range dirs.All() {
+				if isDir(d) {
 					return true
 				}
 			}
@@ -146,7 +110,7 @@ func claudeDesktop(home string) *Agent {
 			return wiringOff("Claude Desktop", p.prof, func(k string) (string, bool) { return edit.GetJSON(p.prof, k) },
 				"inferenceGatewayBaseUrl", gateway.URL(), "inferenceGatewayApiKey", gateway.TokenFor("claude-desktop"))
 		},
-		Fields: []Field{{
+		Fields: append([]Field{{
 			Key: "provider", Label: "provider",
 			Get: func() string {
 				if desktopWired(p) {
@@ -155,17 +119,53 @@ func claudeDesktop(home string) *Agent {
 				return ""
 			},
 			Set: func(v string) error {
+				on := desktopOn
 				if v == "" {
-					return desktopOff(p)
+					on = desktopOff
 				}
-				return desktopOn(p)
+				if err := on(p); err != nil {
+					return err
+				}
+				// its Code tab is Claude Code, told what Desktop's ids for
+				// magpie's models can do while that one runs on magpie
+				_ = claude(home).Sync()
+				return nil
 			},
 			Options: func(map[string]string) []Option {
 				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie",
 					Note: "Desktop's third-party gateway: Code and Cowork on magpie's models, no Anthropic sign-in (restart Desktop)"}}
 			},
-		}},
+		}}, desktopTierFields(p)...),
 	}
+}
+
+// desktopTierFields pick the model each of Claude Code's tiers runs on in
+// Desktop's Code tab, its subagents' sonnet, haiku or opus among them
+// (gateway.DesktopTiers). Unset, a Claude model magpie serves stands in for
+// its own tier, else the chat's model does. Desktop reads them from the
+// gateway's /v1/models when it starts.
+func desktopTierFields(p desktopPaths) []Field {
+	var fields []Field
+	for _, tier := range gateway.DesktopTierNames {
+		fields = append(fields, Field{
+			Key: tier, Label: tier, Quiet: true,
+			Get: func() string { return gateway.DesktopTiers()[tier] },
+			Set: func(v string) error {
+				v = gateway.DesktopCatalogID(v)
+				if v != "" && !isMagpie(v) {
+					return fmt.Errorf("%s: %q is not a model magpie serves", tier, v)
+				}
+				return gateway.SetDesktopTier(tier, v)
+			},
+			Options: func(map[string]string) []Option {
+				if !desktopWired(p) {
+					return nil
+				}
+				return viaMagpie("claude-desktop", "")
+			},
+		})
+	}
+	return fields
 }
 
 // desktopWired: _meta.json lists magpie's profile.

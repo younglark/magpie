@@ -2,6 +2,7 @@ package davsync
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -10,7 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	pathpkg "path"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // folder and file are where the backup lives under the address given.
@@ -22,6 +25,106 @@ const (
 // errChanged is a PUT the server refused because the file changed since it
 // was read: another computer synced in between.
 var errChanged = errors.New("the file on the server changed meanwhile")
+
+// errNotModified is a read sent with the version last seen that the server
+// answered 304: the file is the one read then, and wasn't sent again.
+var errNotModified = errors.New("the file on the server is unchanged")
+
+// version is how the server tells one version of the file from another:
+// its ETag, or, from a server without them, its Last-Modified — kept only
+// when it was a second or more before the server's clock at the read, so
+// that a write later in that same second can't go unseen.
+type version struct {
+	ETag     string `json:"etag,omitempty"`
+	Modified string `json:"modified,omitempty"`
+}
+
+// conditions are the headers that ask for the file only when it isn't v.
+func (v version) conditions() map[string]string {
+	switch {
+	case v.ETag != "":
+		return map[string]string{"If-None-Match": v.ETag}
+	case v.Modified != "":
+		return map[string]string{"If-Modified-Since": v.Modified}
+	}
+	return nil
+}
+
+// versionOf is the version an answer's headers tell; none when they tell
+// nothing that can be asked about again.
+func versionOf(h http.Header) version {
+	if e := h.Get("ETag"); e != "" {
+		return version{ETag: e}
+	}
+	lm := h.Get("Last-Modified")
+	t, err := http.ParseTime(lm)
+	if err != nil {
+		return version{}
+	}
+	if d, err := http.ParseTime(h.Get("Date")); err != nil || d.Sub(t) < time.Second {
+		return version{}
+	}
+	return version{Modified: lm}
+}
+
+// rateLimited is a server that answered 429 Too Many Requests or 503: it
+// is limiting how often it is reached — 坚果云 (Nutstore) counts requests
+// and downloads per account — or is busy. Run waits longer before trying
+// again: after, when the server said how long.
+type rateLimited struct {
+	kind   string // "WebDAV" or "S3"
+	status int
+	after  time.Duration
+}
+
+func (e *rateLimited) Error() string {
+	if e.status == http.StatusTooManyRequests {
+		return fmt.Sprintf("the %s server is limiting how often magpie may reach it (HTTP 429 Too Many Requests): sync waits longer before trying again", e.kind)
+	}
+	return fmt.Sprintf("the %s server is busy, or limiting how often magpie may reach it (HTTP %d): sync waits longer before trying again", e.kind, e.status)
+}
+
+// limited is the error for an answer that says the server is limiting
+// requests; nil for any other.
+func limited(kind string, status int, h http.Header) error {
+	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
+		return nil
+	}
+	return &rateLimited{kind: kind, status: status, after: retryAfter(h.Get("Retry-After"))}
+}
+
+// retryAfter is a Retry-After header's wait, in seconds or until a time;
+// 0 when it says none.
+func retryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return max(time.Until(t), 0)
+	}
+	return 0
+}
+
+// remote is where the backup is kept: a WebDAV folder, or an S3 bucket.
+type remote interface {
+	// get reads the backup and its version; nil data and no error when
+	// there is none yet. With have, the version last read, it is asked
+	// for only if it changed since: errNotModified when it didn't.
+	get(ctx context.Context, have version) (data []byte, v version, err error)
+	// put writes it over the version read (etag) — with none, only where
+	// there is none yet — and errChanged when another computer wrote in
+	// between. The version written is the one the server says, if it does.
+	put(ctx context.Context, data []byte, etag string) (version, error)
+}
+
+// newRemote is c's: an S3 bucket for an s3:// address, WebDAV for the rest.
+func newRemote(c Config) (remote, error) {
+	if c.S3() {
+		return newS3(c)
+	}
+	return newDAV(c)
+}
 
 type dav struct {
 	base       *url.URL
@@ -35,7 +138,7 @@ func newDAV(c Config) (*dav, error) {
 		return nil, fmt.Errorf("%q is not a WebDAV address (https://…)", c.URL)
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
-	return &dav{base: u, user: c.User, pass: c.Password, client: http.DefaultClient}, nil
+	return &dav{base: u, user: c.User, pass: c.Password, client: syncClient}, nil
 }
 
 func (d *dav) url(parts ...string) string {
@@ -77,6 +180,10 @@ func (d *dav) send(ctx context.Context, method, u string, body []byte, h map[str
 	if res.StatusCode == http.StatusUnauthorized {
 		res.Body.Close()
 		return nil, errLogin
+	}
+	if err := limited("WebDAV", res.StatusCode, res.Header); err != nil {
+		res.Body.Close()
+		return nil, err
 	}
 	return res, nil
 }
@@ -131,67 +238,185 @@ func (d *dav) there(ctx context.Context, u string) bool {
 	return res.StatusCode >= 200 && res.StatusCode < 300
 }
 
-// get reads the backup; nil data and no error when there is none yet.
-func (d *dav) get(ctx context.Context) (data []byte, etag string, err error) {
-	res, err := d.send(ctx, http.MethodGet, d.url(folder, file), nil, nil)
+// get reads the backup; nil data and no error when there is none yet, and
+// errNotModified when it is still have. A server that doesn't do
+// conditional reads sends the file, as it always did.
+//
+// The read asks for the file as it is, not compressed: the ETag it gives
+// back is what the write after it matches with If-Match, and a server that
+// compresses changes that ETag for the compressed copy. Apache's
+// mod_deflate — InfiniCLOUD's (TeraCloud's) WebDAV is Apache — adds
+// "-gzip" inside the quotes, and nginx and other proxies weaken it to
+// W/"…"; either never matches the file in an If-Match, so every write after
+// such a read was refused as changed meanwhile (#1362).
+func (d *dav) get(ctx context.Context, have version) (data []byte, v version, err error) {
+	cond := have.conditions()
+	h := map[string]string{"Accept-Encoding": "identity"}
+	for k, v := range cond {
+		h[k] = v
+	}
+	res, err := d.send(ctx, http.MethodGet, d.url(folder, file), nil, h)
 	if err != nil {
-		return nil, "", err
+		return nil, version{}, err
 	}
 	defer res.Body.Close()
+	if res.StatusCode == http.StatusNotModified && cond != nil {
+		return nil, have, errNotModified
+	}
 	// a Synology answers 403, not 404, for a file in a folder that isn't
 	// there: before the first sync, magpie's folder isn't
 	if res.StatusCode == http.StatusForbidden {
 		if !d.there(ctx, d.url(folder)+"/") {
-			return nil, "", nil
+			return nil, version{}, nil
 		}
-		return nil, "", d.forbidden(ctx)
+		return nil, version{}, d.forbidden(ctx)
 	}
 	switch {
 	// 409: the folder isn't there yet — how 坚果云 (Nutstore) answers a
 	// read in it, where others say 404; put makes it
 	case res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusGone || res.StatusCode == http.StatusConflict:
-		return nil, "", nil
+		return nil, version{}, nil
 	case res.StatusCode != http.StatusOK:
-		return nil, "", fmt.Errorf("reading %s from the WebDAV server: HTTP %d", file, res.StatusCode)
+		return nil, version{}, fmt.Errorf("reading %s from the WebDAV server: HTTP %d", file, res.StatusCode)
 	}
-	data, err = io.ReadAll(io.LimitReader(res.Body, 64<<20))
+	body := io.Reader(res.Body)
+	// asked for as it is, the file still came compressed: Go unpacks it
+	// only when it asked for gzip itself
+	if strings.EqualFold(strings.TrimSpace(res.Header.Get("Content-Encoding")), "gzip") {
+		zr, err := gzip.NewReader(res.Body)
+		if err != nil {
+			return nil, version{}, fmt.Errorf("reading %s from the WebDAV server: %w", file, err)
+		}
+		defer zr.Close()
+		body = zr
+	}
+	data, err = io.ReadAll(io.LimitReader(body, 64<<20))
 	if err != nil {
-		return nil, "", err
+		return nil, version{}, err
 	}
-	return data, res.Header.Get("ETag"), nil
+	return data, versionOf(res.Header), nil
 }
 
 // put writes the backup, only over the version read (etag) when there was
-// one, making the folder if the server has none.
-func (d *dav) put(ctx context.Context, data []byte, etag string) error {
+// one, making the folder if the server has none. Relays and tunnels cut
+// long writes short, and the half that lands reads back as "not a magpie
+// backup" on every sync after, so what a write kept is read back and
+// compared; a short write is tried again and told as itself in the end.
+func (d *dav) put(ctx context.Context, data []byte, etag string) (version, error) {
 	h := map[string]string{"Content-Type": "application/octet-stream"}
 	if etag != "" {
 		h["If-Match"] = etag
 	}
-	for try := 0; ; try++ {
+	for try, writes := 0, 0; ; try++ {
 		res, err := d.send(ctx, http.MethodPut, d.url(folder, file), data, h)
 		if err != nil {
-			return err
+			return version{}, err
 		}
 		res.Body.Close()
 		switch {
 		case res.StatusCode >= 200 && res.StatusCode < 300:
-			return nil
+			writes++
+			he, cerr := d.check(ctx, d.url(folder, file), file, len(data))
+			if cerr != nil {
+				if writes < 3 {
+					// the half file is a new version: the retry matches
+					// it — the ETag the PUT answered, else the one the
+					// check read; with neither, the old one goes, for it
+					// can't hold any more
+					if e := res.Header.Get("ETag"); e != "" {
+						h["If-Match"] = e
+					} else if he != "" {
+						h["If-Match"] = he
+					} else {
+						delete(h, "If-Match")
+					}
+					continue
+				}
+				return version{}, cerr
+			}
+			// an ETag said here is the version written; with none, the
+			// next sync reads the file in full, as before
+			return version{ETag: res.Header.Get("ETag")}, nil
 		case res.StatusCode == http.StatusPreconditionFailed:
-			return errChanged
+			return version{}, errChanged
 		case res.StatusCode == http.StatusForbidden && (try > 0 || d.there(ctx, d.url(folder)+"/")):
-			return d.forbidden(ctx)
+			return version{}, d.forbidden(ctx)
 		// a 403 for a folder not there (a Synology) is made as a 404 is
 		case (res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusConflict || res.StatusCode == http.StatusForbidden) && try == 0:
 			if err := d.mkcol(ctx); err != nil {
-				return err
+				return version{}, err
 			}
 			continue
 		case res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusConflict:
-			return d.nowhere(ctx, res.StatusCode)
+			return version{}, d.nowhere(ctx, res.StatusCode)
 		}
-		return fmt.Errorf("writing %s to the WebDAV server: HTTP %d", file, res.StatusCode)
+		return version{}, fmt.Errorf("writing %s to the WebDAV server: HTTP %d", file, res.StatusCode)
 	}
+}
+
+// check says so when the server kept less than what was sent: relays and
+// tunnels cut long writes short, and the half that lands reads back as
+// "not a magpie backup" on every sync after. The size is enough — a short
+// file is the whole failure — so no download rides on a write. It gives
+// back the ETag it saw, for a retry to match the file as the short write
+// left it. A HEAD that can't be done — an error, or not a 200 — leaves the
+// write unchecked: it landed either way. A HEAD that says short is asked
+// again of PROPFIND, which costs a request only then.
+func (d *dav) check(ctx context.Context, u, name string, want int) (etag string, err error) {
+	res, err := d.send(ctx, http.MethodHead, u, nil, nil)
+	if err != nil {
+		return "", nil
+	}
+	res.Body.Close()
+	// a server without a say on HEAD can't be checked; the read after it
+	// tells
+	if res.StatusCode != http.StatusOK {
+		return "", nil
+	}
+	etag = res.Header.Get("ETag")
+	n := res.ContentLength
+	if n < 0 || int(n) >= want {
+		return etag, nil
+	}
+	// a HEAD's Content-Length isn't always the file's: 坚果云 (Nutstore)
+	// answered a 6869-byte usage file's with 0 on every try (#1259). The
+	// length WebDAV keeps for a file is PROPFIND's getcontentlength, which
+	// every client of it reads, so a short HEAD is asked of that before it
+	// is believed; with no length there, the HEAD's stands
+	if m, ok := d.length(ctx, u); ok {
+		if m >= int64(want) {
+			return etag, nil
+		}
+		n = m
+	}
+	return etag, fmt.Errorf("the WebDAV server kept %d of %d bytes of %s: the write was cut short — sync again, and if it keeps happening the network to the server is dropping long uploads", n, want, name)
+}
+
+// length is the file at u's size as PROPFIND (Depth 0) says it; false when
+// it says none.
+func (d *dav) length(ctx context.Context, u string) (int64, bool) {
+	res, err := d.send(ctx, "PROPFIND", u, nil, map[string]string{"Depth": "0"})
+	if err != nil {
+		return 0, false
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusMultiStatus {
+		return 0, false
+	}
+	var ms struct {
+		Responses []struct {
+			Length string `xml:"propstat>prop>getcontentlength"`
+		} `xml:"response"`
+	}
+	if xml.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&ms) != nil {
+		return 0, false
+	}
+	for _, r := range ms.Responses {
+		if n, err := strconv.ParseInt(strings.TrimSpace(r.Length), 10, 64); err == nil && n >= 0 {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 func (d *dav) mkcol(ctx context.Context) error {

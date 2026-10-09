@@ -15,6 +15,7 @@ import (
 func TestAgy(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}}); err != nil {
@@ -77,7 +78,7 @@ func TestAgy(t *testing.T) {
 		t.Fatalf("drift: %+v", d)
 	}
 	l := a.Launch()
-	if want := "GEMINI_API_KEY=" + gateway.Token + " GOOGLE_GEMINI_BASE_URL=" + gateway.URL() + " agy --model 'magpie/deepseek/pro'"; runtime.GOOS != "windows" && l != want {
+	if want := "GEMINI_API_KEY=" + gateway.TokenFor("agy") + " GOOGLE_GEMINI_BASE_URL=" + gateway.URL() + " agy --model 'magpie/deepseek/pro'"; runtime.GOOS != "windows" && l != want {
 		t.Fatalf("launch: %q", l)
 	}
 	if n := a.Notice(); !strings.Contains(n, l) {

@@ -7,12 +7,16 @@ package agent
 //	GET  /api/providers              [{"id","name","type","baseURL","enabled","models":["<id>",…],"availableModels":[{"id","name",…}]},…]
 //	POST /api/providers              {"name","type","apiKey","baseURL","enabled"} → the provider
 //	PUT  /api/providers/:id          the fields to change
-//	PUT  /api/providers/:id/models   {"models":["<id>",…],"availableModels":[{"id","name"}]}: models, kept as
-//	                                 given, are the ones Alma offers; its capabilities it works out itself
-//	GET  /api/settings, PUT it back  the whole settings; chat.defaultModel is "<providerId>:<model>"
+//	PUT  /api/providers/:id/models   {"models":["<id>",…],"availableModels":[{"id","name","capabilityOverrides"}]}:
+//	                                 models, kept as given, are the ones Alma offers; a model's
+//	                                 capabilityOverrides, when sent, take the place of the ones it had
+//	GET  /api/settings, PUT it back  the whole settings; chat.defaultModel is "<providerId>:<model>",
+//	                                 imageGen.model the same ("" for Auto)
 //
 // magpie is one provider there, named magpie, of type openai at the
-// gateway's /v1; choosing one of its models makes it Alma's default model.
+// gateway's /v1; choosing one of its models makes it Alma's default model,
+// and the model magpie draws with Alma's image generation model when Alma
+// has none picked (almaSetImage).
 // Alma not running is no error: there is nothing to read or keep current.
 
 import (
@@ -24,12 +28,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/gateway"
 )
 
@@ -57,8 +64,42 @@ type almaProvider struct {
 	BaseURL string           `json:"baseURL"`
 	APIKey  string           `json:"apiKey"`
 	Enabled bool             `json:"enabled"`
-	Models  []string         `json:"models"`
+	Models  almaModelIDs     `json:"models"`
 	Known   []map[string]any `json:"availableModels"`
+}
+
+// almaModelIDs is a provider's models, the ids Alma offers. Alma keeps
+// them as ids or, for some providers, as the models themselves
+// ({"id","name","enabled","capabilityOverrides",…}), and reads either as
+// its id; so does magpie — one provider listing objects left every one
+// of Alma's unread ("cannot unmarshal object into Go struct field
+// almaProvider.models of type string"), and Alma showed as not set.
+type almaModelIDs []string
+
+func (ids *almaModelIDs) UnmarshalJSON(b []byte) error {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		*ids = nil
+		return nil
+	}
+	out := almaModelIDs{}
+	for _, r := range raw {
+		var id string
+		if json.Unmarshal(r, &id) != nil {
+			var m struct {
+				ID any `json:"id"`
+			}
+			if json.Unmarshal(r, &m) != nil || m.ID == nil {
+				continue
+			}
+			id = fmt.Sprint(m.ID)
+		}
+		if id != "" {
+			out = append(out, id)
+		}
+	}
+	*ids = out
+	return nil
 }
 
 // almaDo sends one request to Alma's API and decodes its reply into out.
@@ -194,18 +235,130 @@ func almaMagpie(ps []almaProvider) *almaProvider {
 }
 
 // almaModels is magpie's catalog as Alma is shown it: the ids Alma offers,
-// and each one's name.
+// and each one's name and what magpie knows it can do (almaCaps).
 func almaModels() (ids []string, known []map[string]any) {
 	ids, known = []string{}, []map[string]any{}
 	for _, m := range magpieModels("alma") {
 		ids = append(ids, m.ID)
-		known = append(known, map[string]any{"id": m.ID, "name": m.Name})
+		k := map[string]any{"id": m.ID, "name": m.Name}
+		if caps := almaCaps(m); len(caps) > 0 {
+			k["capabilityOverrides"] = caps
+		}
+		known = append(known, k)
+	}
+	// the model magpie draws with, which Alma offers for its image
+	// generation, said to make images (Settings › Image Generation lists
+	// a provider's models that make images, and shows one it doesn't list
+	// as unavailable)
+	if d := gateway.Drawer(); d != "" {
+		if i := slices.Index(ids, d); i >= 0 {
+			caps, _ := known[i]["capabilityOverrides"].(map[string]any)
+			if caps == nil {
+				caps = map[string]any{}
+				known[i]["capabilityOverrides"] = caps
+			}
+			caps["imageOutput"] = true
+		} else {
+			_, name, _ := strings.Cut(d, "/")
+			ids = append(ids, d)
+			known = append(known, map[string]any{"id": d, "name": name, "capabilityOverrides": map[string]any{"imageOutput": true}})
+		}
 	}
 	return ids, known
 }
 
+// almaLevels are the reasoning levels Alma knows, in its order: its own
+// read of a provider's /models keeps these and drops the rest.
+var almaLevels = []string{"low", "medium", "high", "xhigh", "max"}
+
+// almaCaps is what Alma is told of m, as the model's capabilityOverrides.
+// Alma works a model's capabilities out from models.dev by its id, and
+// magpie's ids (codex/gpt-5.5) aren't models.dev's, so such a model came
+// out with no reasoning and Alma offered no thinking for it (#730). A model
+// that reasons says so, with those of its levels Alma knows, and its
+// window, output limit and images when magpie knows them.
+func almaCaps(m catalog.Model) map[string]any {
+	caps := map[string]any{}
+	if m.Reasoning || len(m.Efforts) > 0 {
+		caps["reasoning"] = true
+		var levels []string
+		for _, l := range almaLevels {
+			if slices.Contains(m.Efforts, l) {
+				levels = append(levels, l)
+			}
+		}
+		if len(levels) > 0 {
+			caps["reasoningLevels"] = levels
+		}
+	}
+	if m.Images {
+		caps["vision"] = true
+	}
+	if m.Context > 0 {
+		caps["contextWindow"] = m.Context
+	}
+	if n := maxTokens(m); n > 0 {
+		caps["maxOutputTokens"] = n
+	}
+	// what a call costs, as magpie's usage pages count it: Alma prices a
+	// model by models.dev's id too, so it counted every one of magpie's at
+	// $0, "unpriced" (#919). Its pricing is USD per million tokens, as
+	// magpie's is, with one cache write price: the 5-minute one.
+	if p := m.Price; p != nil {
+		pr := map[string]any{"input": p.Input, "output": p.Output}
+		if p.CacheRead > 0 {
+			pr["cacheRead"] = p.CacheRead
+		}
+		if p.CacheWrite > 0 {
+			pr["cacheWrite"] = p.CacheWrite
+		}
+		caps["pricing"] = pr
+	}
+	return caps
+}
+
+// almaWithOverrides is known with each model's overrides laid over the ones
+// it has in Alma: the overrides sent take the place of a model's, so one
+// the user set there that magpie says nothing of (functionCalling,
+// pricing) is sent back as it was.
+func almaWithOverrides(p *almaProvider, known []map[string]any) []map[string]any {
+	had := map[string]map[string]any{}
+	for _, k := range p.Known {
+		id, _ := k["id"].(string)
+		if o, ok := k["capabilityOverrides"].(map[string]any); ok && id != "" {
+			had[id] = o
+		}
+	}
+	out := make([]map[string]any, len(known))
+	for i, k := range known {
+		id, _ := k["id"].(string)
+		o := had[id]
+		mine, ok := k["capabilityOverrides"].(map[string]any)
+		if len(o) == 0 || !ok {
+			// nothing of magpie's to say: no overrides sent, and Alma
+			// keeps the model's own
+			out[i] = k
+			continue
+		}
+		merged := map[string]any{}
+		for key, v := range o {
+			merged[key] = v
+		}
+		for key, v := range mine {
+			merged[key] = v
+		}
+		kk := map[string]any{}
+		for key, v := range k {
+			kk[key] = v
+		}
+		kk["capabilityOverrides"] = merged
+		out[i] = kk
+	}
+	return out
+}
+
 // almaSameModels reports whether Alma already offers these models, in this
-// order, each under its name.
+// order, each under its name and with what magpie says of it.
 func almaSameModels(p *almaProvider, ids []string, known []map[string]any) bool {
 	if !slices.Equal(p.Models, ids) || len(p.Known) != len(known) {
 		return false
@@ -214,8 +367,24 @@ func almaSameModels(p *almaProvider, ids []string, known []map[string]any) bool 
 		if p.Known[i]["id"] != k["id"] || p.Known[i]["name"] != k["name"] {
 			return false
 		}
+		mine, _ := k["capabilityOverrides"].(map[string]any)
+		had, _ := p.Known[i]["capabilityOverrides"].(map[string]any)
+		for key, v := range mine {
+			if !sameJSONValue(had[key], v) {
+				return false
+			}
+		}
 	}
 	return true
+}
+
+// sameJSONValue reports whether a and b read the same as JSON: a value
+// read back from Alma (float64, []any) against one magpie made (int,
+// []string).
+func sameJSONValue(a, b any) bool {
+	x, err1 := json.Marshal(a)
+	y, err2 := json.Marshal(b)
+	return err1 == nil && err2 == nil && bytes.Equal(x, y)
 }
 
 // almaSyncModels puts magpie's catalog into its provider in Alma, if it
@@ -225,7 +394,7 @@ func almaSyncModels(p *almaProvider) error {
 	if almaSameModels(p, ids, known) {
 		return nil
 	}
-	return almaDo("PUT", "/api/providers/"+p.ID+"/models", map[string]any{"models": ids, "availableModels": known}, nil)
+	return almaDo("PUT", "/api/providers/"+p.ID+"/models", map[string]any{"models": ids, "availableModels": almaWithOverrides(p, known)}, nil)
 }
 
 // almaWire makes sure Alma has magpie's provider, pointed at the gateway,
@@ -322,6 +491,60 @@ func almaSetDefault(v string) error {
 	return almaDo("PUT", "/api/settings", s, nil)
 }
 
+// almaImage is Alma's image generation model, "" for Auto.
+func almaImage(s map[string]any) string {
+	ig, _ := s["imageGen"].(map[string]any)
+	v, _ := ig["model"].(string)
+	return v
+}
+
+// almaSetImage makes the model magpie draws with Alma's image generation
+// model (Sorghum on Discord), on magpie's provider pid, when Alma has one
+// of magpie's that magpie no longer offers it (the drawer it was given
+// before, almaModels) or, with fill, none picked (Auto): fill is the user
+// choosing one of magpie's models for Alma, not Sync, which leaves an Auto
+// the user may have gone back to. One the user picked, theirs or magpie's,
+// is left as it is. Nothing when magpie draws with none.
+func almaSetImage(pid string, fill bool) error {
+	d := gateway.Drawer()
+	if d == "" {
+		return nil
+	}
+	s, err := almaSettings()
+	if err != nil {
+		return err
+	}
+	cur, want := almaImage(s), pid+":"+d
+	if cur == want {
+		return nil
+	}
+	if cur == "" && !fill {
+		return nil
+	}
+	if cur != "" {
+		ref, ours := strings.CutPrefix(cur, pid+":")
+		if !ours {
+			return nil
+		}
+		if ids, _ := almaModels(); slices.Contains(ids, ref) {
+			return nil
+		}
+	}
+	return almaPutImage(s, want)
+}
+
+// almaPutImage sets imageGen.model to v, the rest of the settings put
+// back as they were.
+func almaPutImage(s map[string]any, v string) error {
+	ig, ok := s["imageGen"].(map[string]any)
+	if !ok {
+		ig = map[string]any{}
+		s["imageGen"] = ig
+	}
+	ig["model"] = v
+	return almaDo("PUT", "/api/settings", s, nil)
+}
+
 // almaGet is Alma's default model, one of magpie's as magpie/<model>. With
 // Alma not running it is what magpie last set there, so that isn't taken
 // for something else having changed it.
@@ -366,6 +589,15 @@ func almaSet(v string) error {
 				return err
 			}
 		}
+		// an image generation model of magpie's goes back to Auto too
+		if pid, _, _ := strings.Cut(almaImage(s), ":"); pid == p.ID {
+			if s, err = almaSettings(); err != nil {
+				return err
+			}
+			if err := almaPutImage(s, ""); err != nil {
+				return err
+			}
+		}
 		return almaDo("DELETE", "/api/providers/"+p.ID, nil, nil)
 	}
 	if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok {
@@ -373,7 +605,10 @@ func almaSet(v string) error {
 		if err != nil {
 			return err
 		}
-		return almaSetDefault(id + ":" + ref)
+		if err := almaSetDefault(id + ":" + ref); err != nil {
+			return err
+		}
+		return almaSetImage(id, true)
 	}
 	if _, _, ok := strings.Cut(v, ":"); !ok {
 		return fmt.Errorf("expected providerId:model or magpie/<model>, got %q", v)
@@ -411,13 +646,45 @@ func almaOwn() []Option {
 	return out
 }
 
-func alma() *Agent {
-	// where Alma keeps its data (~/Library/Application Support/alma on a
-	// Mac): there once Alma was installed and opened
-	dir := ""
+// almaDir is where Alma keeps its data, there once Alma was installed and
+// opened: ~/Library/Application Support/alma on a Mac, the user config
+// folder elsewhere. On Linux alma-server, Alma without a desktop, keeps it
+// in ALMA_DATA_DIR, else $XDG_DATA_HOME/alma (~/.local/share/alma), and
+// answers on the same port: with only the desktop's folder looked for it
+// was never found, so its magpie provider never got Alma's key and its
+// requests read as the AI SDK's (Lutra.x on Discord). The desktop's folder
+// comes first; "" when neither is there.
+func almaDir(goos string) string {
+	var dirs []string
 	if d, err := os.UserConfigDir(); err == nil {
-		dir = filepath.Join(d, "alma")
+		dirs = append(dirs, filepath.Join(d, "alma"))
 	}
+	if goos != "darwin" && goos != "windows" {
+		if d := appdir.Getenv("ALMA_DATA_DIR"); d != "" {
+			dirs = append(dirs, d)
+		}
+		if d := appdir.Getenv("XDG_DATA_HOME"); d != "" {
+			dirs = append(dirs, filepath.Join(d, "alma"))
+		} else if h, err := os.UserHomeDir(); err == nil {
+			dirs = append(dirs, filepath.Join(h, ".local", "share", "alma"))
+		}
+	}
+	for _, d := range dirs {
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			return d
+		}
+	}
+	if len(dirs) > 0 {
+		return dirs[0]
+	}
+	return ""
+}
+
+// almaOS is the system almaDir looks for Alma's data on; a test sets it.
+var almaOS = runtime.GOOS
+
+func alma() *Agent {
+	dir := almaDir(almaOS)
 	return &Agent{
 		ID: "alma", Name: "Alma", Icon: "alma",
 		UA:  []string{"alma"},
@@ -459,7 +726,10 @@ func alma() *Agent {
 			if err := almaKeyed(p); err != nil {
 				return err
 			}
-			return almaSyncModels(p)
+			if err := almaSyncModels(p); err != nil {
+				return err
+			}
+			return almaSetImage(p.ID, false)
 		},
 		Fields: []Field{{
 			Key: "model", Label: "model",

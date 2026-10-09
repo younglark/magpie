@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +24,7 @@ import (
 // — the subscriptions magpie remembers, how much of each one's allowance is
 // used, and switching the agent between them.
 func accountsCmd(args []string) error {
-	const usage = "usage: magpie accounts [claude|codex|grok|copilot|gemini|antigravity|dimagent|zed|factory|mimo] [--json] | magpie accounts add <claude|codex|gemini|antigravity|dimagent|zed|factory|mimo> | magpie accounts refresh [--json] | magpie accounts checkin [--json] | magpie accounts switch|forget <claude|codex|gemini|antigravity|dimagent|zed|factory|mimo> <email> | magpie accounts project <gemini|antigravity> <email> <gcp-project-id>"
+	const usage = "usage: magpie accounts [claude|codex|grok|copilot|gemini|antigravity|zed|factory|mimo|<plugin>] [--json] | magpie accounts add <claude|codex|gemini|antigravity|zed|factory|mimo|<plugin>> | magpie accounts add copilot [--host <name>.ghe.com] | magpie accounts refresh [--json] | magpie accounts checkin [--json] | magpie accounts switch|forget <claude|codex|gemini|antigravity|zed|factory|mimo|<plugin>> <email> | magpie accounts switch|forget copilot <login>[@<name>.ghe.com] [--host <name>.ghe.com] | magpie accounts project <gemini|antigravity> <email> <gcp-project-id>"
 	agentID := func(s string) (string, error) {
 		switch strings.ToLower(s) {
 		case "claude", "cc":
@@ -35,16 +35,20 @@ func accountsCmd(args []string) error {
 			return "gemini", nil
 		case "antigravity", "ag":
 			return "antigravity", nil
-		case "dimagent":
-			return "dimagent", nil
 		case "zed":
 			return "zed", nil
 		case "factory", "droid":
 			return "factory", nil
 		case "mimo", "mimo-app", "xiaomi-mimo":
 			return provider.MiMoID, nil
+		case "copilot":
+			return "copilot", nil
 		}
-		return "", fmt.Errorf("%q: only Claude Code, Codex, Gemini CLI, Antigravity, DimAgent, Zed, Factory and Xiaomi MiMo accounts can be added and switched\n%s", s, usage)
+		// a plugin's subscription, by its provider's id or name, as a built-in's
+		if pp, err := pluginProvider(context.Background(), s); err == nil {
+			return provider.PluginID(pp.ID), nil
+		}
+		return "", fmt.Errorf("%q: only Claude Code, Codex, Copilot, Gemini CLI, Antigravity, Zed, Factory, Xiaomi MiMo and plugins' accounts can be added and switched\n%s", s, usage)
 	}
 	if len(args) > 1 && args[1] == "project" {
 		if len(args) != 5 {
@@ -71,6 +75,27 @@ func accountsCmd(args []string) error {
 		return checkinWorkBuddy(len(args) > 2 && args[2] == "--json")
 	}
 	if len(args) > 1 && args[1] == "add" {
+		// a Copilot account by GitHub's device code, on github.com or an
+		// enterprise's <name>.ghe.com (#723)
+		if len(args) >= 3 && strings.EqualFold(args[2], "copilot") {
+			var host string
+			switch {
+			case len(args) == 5 && args[3] == "--host":
+				host = args[4]
+			case len(args) == 4 && strings.HasPrefix(args[3], "--host="):
+				host = strings.TrimPrefix(args[3], "--host=")
+			case len(args) != 3:
+				return fmt.Errorf("usage: magpie accounts add copilot [--host <name>.ghe.com]")
+			}
+			h, err := provider.CopilotHost(host)
+			if err != nil {
+				return err
+			}
+			if h != "" {
+				return addAccount("copilot:" + h)
+			}
+			return addAccount("copilot")
+		}
 		if len(args) != 3 {
 			return fmt.Errorf("%s", usage)
 		}
@@ -81,12 +106,37 @@ func accountsCmd(args []string) error {
 		return addAccount(id)
 	}
 	if len(args) > 1 && (args[1] == "switch" || args[1] == "forget") {
+		// a Copilot account's host, for a login on more than one (#1220)
+		host, hasHost := "", false
+		for i := 2; i < len(args); i++ {
+			if v, ok := strings.CutPrefix(args[i], "--host="); ok {
+				host, hasHost = v, true
+				args = slices.Delete(slices.Clone(args), i, i+1)
+				break
+			}
+			if args[i] == "--host" && i+1 < len(args) {
+				host, hasHost = args[i+1], true
+				args = slices.Delete(slices.Clone(args), i, i+2)
+				break
+			}
+		}
 		if len(args) != 4 {
 			return fmt.Errorf("%s", usage)
 		}
 		id, err := agentID(args[2])
 		if err != nil {
 			return err
+		}
+		if hasHost {
+			if id != "copilot" {
+				return fmt.Errorf("--host names a Copilot account's host\n%s", usage)
+			}
+			h, err := provider.CopilotHost(host)
+			if err != nil {
+				return err
+			}
+			login, _, _ := strings.Cut(args[3], "@")
+			args[3] = provider.CopilotAccountName(login, h)
 		}
 		if args[3], err = accountNamed(id, args[3]); err != nil {
 			return err
@@ -103,7 +153,7 @@ func accountsCmd(args []string) error {
 		if err := provider.SwitchLogin(id, args[3]); err != nil {
 			return err
 		}
-		if id == "gemini" || id == "antigravity" {
+		if _, plug := provider.PluginOf(id); plug || id == "gemini" || id == "antigravity" || id == "copilot" {
 			fmt.Println(green.Render("✓"), "magpie now uses", args[3], "for", id)
 			return nil
 		}
@@ -146,6 +196,7 @@ func accountsCmd(args []string) error {
 	for _, r := range rows {
 		width = max(width, len(r.User))
 	}
+	now := time.Now() // one instant for every window's reset time
 	for _, r := range rows {
 		mark := "  "
 		switch {
@@ -160,16 +211,20 @@ func accountsCmd(args []string) error {
 		}
 		line := fmt.Sprintf("%s%-7s %-*s %s", mark, r.Agent, width, r.User, muted.Render(fmt.Sprintf("%-8s", plan)))
 		for _, w := range r.Windows {
-			line += "  " + quotaCell(w)
+			line += "  " + quotaCell(w, now)
+		}
+		if r.Balance != "" {
+			line += "  " + balanceCell(r.Balance, r.Agent, r.User)
 		}
 		if r.Resets != nil {
-			line += "  " + resetsCell(r.Resets)
+			line += "  " + resetsCell(r.Resets, provider.AutoResets(r.Agent, r.User))
 		}
 		if r.Lapsed != "" {
 			line += "  " + muted.Render(r.Lapsed)
 		} else if r.Error != "" {
 			line += "  " + muted.Render(r.Error)
 		}
+		line += quotaReadingCell(r.AsOf, r.ReadAt, r.Windows)
 		fmt.Println(line)
 	}
 	fmt.Println(faint.Render("  ● signed in · ○ takes over when it runs out · add one: magpie accounts add <agent> · switch: magpie accounts switch <agent> <email>"))
@@ -186,8 +241,13 @@ type accountRow struct {
 	Windows []quotaSpan `json:"windows"`
 	Error   string      `json:"error,omitempty"`
 	Lapsed  string      `json:"lapsed,omitempty"` // its sign-in has to be made again
+	AsOf    *time.Time  `json:"asOf,omitempty"`   // last reading when it couldn't be read now
+	ReadAt  *time.Time  `json:"readAt,omitempty"` // when what is shown was read, when known
 	// Resets are a Codex account's rate-limit resets, when it holds any.
 	Resets *provider.ResetCredits `json:"resets,omitempty"`
+	// Balance is what the account holds beside its windows, a ChatGPT
+	// account's credits, when the vendor tells it.
+	Balance string `json:"balance,omitempty"`
 }
 
 type quotaSpan = provider.QuotaSpan
@@ -198,13 +258,15 @@ func accountRows(ls []provider.Login, now time.Time) []accountRow {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	usage := map[string]map[string]provider.SubscriptionQuota{}
+	seen := map[string]bool{}
+	provider.AskClaudeUsage()
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, l := range ls {
-		if _, ok := usage[l.Agent]; ok {
+		if seen[l.Agent] {
 			continue
 		}
-		usage[l.Agent] = nil
+		seen[l.Agent] = true
 		wg.Add(1)
 		go func(agent string) {
 			defer wg.Done()
@@ -225,9 +287,11 @@ func accountRows(ls []provider.Login, now time.Time) []accountRow {
 			if r.Plan == "" {
 				r.Plan = q.Plan
 			}
-			r.Error, r.Resets = q.Error, q.Resets
-			for _, w := range q.Windows {
-				s := quotaSpan{Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display}
+			r.Error, r.Resets, r.AsOf, r.ReadAt, r.Balance = q.Error, q.Resets, q.AsOf, q.ReadAt, q.Balance
+			// a pool's own windows stand in for the models' drawing on it,
+			// as the usage page shows them
+			for _, w := range provider.PooledWindows(q.Windows) {
+				s := quotaSpan{Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display, Pool: w.Pool}
 				if s.ResetsAt == nil && w.ResetSecs > 0 {
 					t := now.Add(time.Duration(w.ResetSecs) * time.Second)
 					s.ResetsAt = &t
@@ -240,15 +304,37 @@ func accountRows(ls []provider.Login, now time.Time) []accountRow {
 	return rows
 }
 
-// quotaCell is one window in a line: "5h 42% ↻2h13m".
-func quotaCell(w quotaSpan) string {
+// quotaCell is one window in a line as of now: "5h 42% ↻2h13m 14:13".
+func quotaCell(w quotaSpan, now time.Time) string {
 	name := strings.NewReplacer(" hours", "h", " hour", "h", " days", "d", " day", "d", " · ", " ").Replace(w.Name)
 	cell := fmt.Sprintf("%s %.0f%%", name, w.Used)
 	if w.Display != "" {
 		cell += " (" + w.Display + ")"
 	}
 	if w.ResetsAt != nil {
-		cell += muted.Render(" ↻" + untilShort(time.Until(*w.ResetsAt)) + " " + provider.ResetClock(*w.ResetsAt, time.Now()))
+		if !w.ResetsAt.After(now) {
+			cell += muted.Render(" · reset time passed " + w.ResetsAt.Local().Format("Jan 2 15:04"))
+		} else {
+			cell += muted.Render(" ↻" + untilShort(w.ResetsAt.Sub(now)) + " " + provider.ResetClock(*w.ResetsAt, now))
+		}
+	}
+	return cell
+}
+
+// quotaReadingCell says when a line was read: "as of … (cached)" for a
+// reading kept in place of one that failed, "read 12m ago" for one a
+// cache handed back (a Claude account's waits for Claude Code to tell it
+// again), nothing for one just read.
+func quotaReadingCell(at, readAt *time.Time, ws []quotaSpan) string {
+	if at == nil {
+		if readAt != nil && time.Since(*readAt) >= 2*time.Minute {
+			return "  " + muted.Render("read "+ago(*readAt))
+		}
+		return ""
+	}
+	cell := "  " + muted.Render("as of "+at.Local().Format("Jan 2 15:04")+" (cached)")
+	if slices.ContainsFunc(ws, func(w quotaSpan) bool { return w.ResetsAt != nil && !w.ResetsAt.After(time.Now()) }) {
+		cell += muted.Render(" · expired window; current allowance unknown")
 	}
 	return cell
 }
@@ -269,14 +355,17 @@ func untilShort(d time.Duration) string {
 // addAccount signs in to one more subscription in the browser, the way the
 // window's "Add account" does.
 func addAccount(agentID string) error {
-	if agentID == "antigravity" {
-		fmt.Println(bold.Render("!"), provider.AntigravityRisk)
+	if risk := map[string]string{"antigravity": provider.AntigravityRisk, "claude": provider.ClaudeRisk}[agentID]; risk != "" {
+		fmt.Println(bold.Render("!"), risk)
 		fmt.Print("Sign in anyway? [y/N] ")
 		var yes string
 		fmt.Scanln(&yes)
 		if !strings.EqualFold(strings.TrimSpace(yes), "y") && !strings.EqualFold(strings.TrimSpace(yes), "yes") {
 			return fmt.Errorf("sign-in canceled")
 		}
+	}
+	if _, plug := provider.PluginOf(agentID); plug || provider.Moved(agentID) {
+		return pluginLogin(context.Background(), agentID, "")
 	}
 	st, err := provider.StartSignIn(agentID)
 	if err != nil {
@@ -298,10 +387,14 @@ func addAccount(agentID string) error {
 		fmt.Println("and confirm the code", st.Code)
 	}
 	openInBrowser(st.URL)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := interruptContext()
 	defer stop()
-	if st.PasteCallback {
-		fmt.Println("If the browser cannot return to magpie, paste its final callback URL here and press Enter:")
+	if st.PasteCallback || st.PasteCode {
+		if st.PasteCode {
+			fmt.Println("Paste the code the page shows here and press Enter:")
+		} else {
+			fmt.Println("If the page the browser ends on won't load (magpie on a server or in Docker), paste its whole address here and press Enter:")
+		}
 		id := st.ID
 		go func() {
 			lines := bufio.NewScanner(os.Stdin)
@@ -323,8 +416,12 @@ func addAccount(agentID string) error {
 	}
 	switch st.State {
 	case "done":
-		if st.Using {
+		if st.Again {
+			fmt.Println(green.Render("✓"), st.User, "is already listed — its sign-in was renewed")
+		} else if st.Using {
 			fmt.Println(green.Render("✓"), agentID, "is signed in as", st.User)
+		} else if strings.HasPrefix(agentID, "copilot") {
+			fmt.Println(green.Render("✓"), "added", st.User, muted.Render("· with the other Copilot accounts in magpie's window"))
 		} else {
 			fmt.Println(green.Render("✓"), "added", st.User, muted.Render("· use it: magpie accounts switch "+agentID+" "+st.User))
 		}
@@ -335,13 +432,19 @@ func addAccount(agentID string) error {
 	return fmt.Errorf("sign-in canceled")
 }
 
-func openInBrowser(url string) {
+// openInBrowser opens url in the user's browser. It is a variable so the
+// tests can have it go nowhere without starting a program (noBrowser).
+var openInBrowser = openURLInBrowser
+
+func openURLInBrowser(url string) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
 		cmd = proc.Command("open", url)
 	case "windows":
 		cmd = proc.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "android":
+		cmd = proc.Command("termux-open-url", url)
 	default:
 		cmd = proc.Command("xdg-open", url)
 	}
@@ -394,12 +497,19 @@ func refreshAccounts(asJSON bool) error {
 }
 
 // checkinWorkBuddy: `magpie accounts checkin` — WorkBuddy's daily check-in
-// (签到) for each WorkBuddy (China) account not in yet today, now, and how
-// each stands. The setting does it on its own once a day.
+// (签到) for each WorkBuddy (China) account not in yet today, and Trae CN's
+// (每日签到) for each Trae CN account, and MiniMax Code's for each MiniMax
+// Code account, and Qoder's daily credits for each Qoder account, and each
+// plugin's own check-in (auth.checkin) for its accounts, now, and how each
+// stands. The
+// settings do it on their own once a day.
 func checkinWorkBuddy(asJSON bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	rs := provider.CheckInWorkBuddy(ctx)
+	rs := append(provider.CheckInWorkBuddy(ctx), provider.CheckInTrae(ctx)...)
+	rs = append(rs, provider.CheckInMiniMax(ctx)...)
+	rs = append(rs, provider.CheckInQoder(ctx)...)
+	rs = append(rs, provider.CheckInPlugins(ctx)...)
 	if rs == nil {
 		rs = []provider.WorkBuddyCheckin{}
 	}
@@ -414,6 +524,18 @@ func checkinWorkBuddy(asJSON bool) error {
 		}
 		if asJSON {
 			continue
+		}
+		switch r.By {
+		case "trae":
+			r.User = "Trae CN " + r.User
+		case "minimax":
+			r.User = "MiniMax Code " + r.User
+		case "qoder":
+			r.User = "Qoder " + r.User
+		default:
+			if r.Vendor != "" {
+				r.User = strings.TrimSpace(r.Vendor + " " + r.User)
+			}
 		}
 		switch r.Outcome {
 		case provider.CheckinClaimed, provider.CheckinDone:
@@ -432,15 +554,17 @@ func checkinWorkBuddy(asJSON bool) error {
 			fmt.Println(muted.Render("·"), r.User, muted.Render("not eligible for the check-in"))
 		case provider.CheckinInactive:
 			fmt.Println(muted.Render("·"), r.User, muted.Render("no check-in event now"))
+		case provider.CheckinCaptcha:
+			fmt.Println(muted.Render("·"), r.User, muted.Render(strings.TrimSpace("asks for a captcha: check in in its own app "+r.Msg)))
 		default:
 			fmt.Println(muted.Render("✗"), r.User, muted.Render(r.Msg))
 		}
 	}
 	if !asJSON && len(rs) == 0 {
-		fmt.Println(muted.Render("no WorkBuddy (China) account is signed in"))
+		fmt.Println(muted.Render("no WorkBuddy (China), Trae CN, MiniMax Code or Qoder account is signed in"))
 	}
 	if failed > 0 {
-		return fmt.Errorf("%d of %d WorkBuddy accounts couldn't check in", failed, len(rs))
+		return fmt.Errorf("%d of %d accounts couldn't check in", failed, len(rs))
 	}
 	return nil
 }
@@ -450,6 +574,14 @@ func checkinWorkBuddy(asJSON bool) error {
 // the agent's accounts has it.
 func accountNamed(agent, user string) (string, error) {
 	user = strings.TrimSpace(user)
+	if agent == "copilot" {
+		// "mona@github.com" is github.com's mona, named "mona"
+		if login, host, ok := strings.Cut(user, "@"); ok {
+			if h, err := provider.CopilotHost(host); err == nil {
+				user = provider.CopilotAccountName(login, h)
+			}
+		}
+	}
 	ls := provider.Logins(agent)
 	var names, same []string
 	for _, l := range ls {
@@ -459,11 +591,17 @@ func accountNamed(agent, user string) (string, error) {
 		names = append(names, l.User)
 		if email, _, _ := strings.Cut(l.User, " · "); strings.EqualFold(strings.TrimSpace(email), user) {
 			same = append(same, l.User)
+		} else if login, _, _ := strings.Cut(l.User, "@"); agent == "copilot" && strings.EqualFold(login, user) {
+			// a Copilot login alone names its one account on an
+			// enterprise's host (#1220)
+			same = append(same, l.User)
 		}
 	}
 	switch {
 	case len(same) == 1:
 		return same[0], nil
+	case len(same) > 1 && agent == "copilot":
+		return "", fmt.Errorf("copilot has %d accounts of %s: %q — name one in full (<login>@<name>.ghe.com) or add --host <name>.ghe.com", len(same), user, same)
 	case len(same) > 1:
 		return "", fmt.Errorf("%s has %d accounts of %s: %q — name one in full", agent, len(same), user, same)
 	case len(names) == 0:

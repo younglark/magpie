@@ -5,14 +5,18 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/testenv"
+	"gopkg.in/yaml.v3"
 )
 
 // syncHome is a sandbox home with a models.dev catalog that knows glm-4.6's
@@ -21,6 +25,7 @@ func syncHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	t.Setenv("CODEX_HOME", "")
@@ -29,6 +34,12 @@ func syncHome(t *testing.T) string {
 	t.Setenv("MIMOCODE_HOME", "")
 	t.Setenv("HANA_HOME", "")
 	t.Setenv("DSH_HOME", "")
+	t.Setenv("OMO_CODING_AGENT_DIR", "")
+	t.Setenv("SENPI_CODING_AGENT_DIR", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("PI_CONFIG_DIR", "")
+	t.Setenv("OMP_PROFILE", "")
+	t.Setenv("PI_PROFILE", "")
 	noKeychain(t)
 	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
 	os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{"context":204800}}}}}`), 0o644)
@@ -49,9 +60,7 @@ func noKeychain(t *testing.T) {
 		return
 	}
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "security"), []byte("#!/bin/sh\nexit 44\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testenv.Program(t, filepath.Join(bin, "security"), "#!/bin/sh\nexit 44\n")
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
@@ -97,6 +106,99 @@ func TestPiModelsCarryMaxTokens(t *testing.T) {
 	}
 }
 
+// Crush is handed how long a reply may be beside the window it is handed
+// with it: without it Crush caps every model at 16384 tokens, one the
+// catalogue says can write far more of them included. A model whose output
+// isn't known keeps Crush's own default.
+func TestCrushModelsCarryMaxTokens(t *testing.T) {
+	syncHome(t)
+	os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{"context":204800,"output":131072}}}}}`), 0o644)
+	catalog.Reset()
+	b, _ := json.Marshal(magpieProviderJSON("crush"))
+	if !strings.Contains(string(b), `"id":"relay/glm-4.6"`) || !strings.Contains(string(b), `"context_window":204800`) ||
+		!strings.Contains(string(b), `"default_max_tokens":131072`) {
+		t.Fatalf("%s", b)
+	}
+
+	os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{"context":204800}}}}}`), 0o644)
+	catalog.Reset()
+	b, _ = json.Marshal(magpieProviderJSON("crush"))
+	if !strings.Contains(string(b), `"default_max_tokens":16384`) {
+		t.Fatalf("unknown output took Crush's default away: %s", b)
+	}
+}
+
+// An output limit above the model's window (models.dev lists deepseek-chat's
+// 384000 against 128000 of context) is cut to the window for every agent
+// magpie hands an output limit; one whose window isn't known keeps its
+// output. ZCode and WorkBuddy cap it at zcodeMaxOutput besides, Crush falls
+// back to 16384 without a known output, OpenCode is handed no limit without
+// a window, and AtomCode, told a 128000 window when the model's isn't known,
+// is cut to that.
+func TestMaxTokensWithinContextWindow(t *testing.T) {
+	home := syncHome(t)
+	check := func(limit string, want int) {
+		t.Helper()
+		os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{`+limit+`}}}}}`), 0o644)
+		catalog.Reset()
+		pi, _ := json.Marshal(magpieProviderJSON("pi"))
+		cline, _ := json.Marshal(clineModels(""))
+		omp, _ := yaml.Marshal(ompProvider())
+		dshRoute, _ := yaml.Marshal(dshRouteConfig(magpieModels("dsh"), "", gateway.URL()))
+		droid, _ := json.Marshal(droidEntries())
+		qoder, _ := json.Marshal(qoderProvider("qoder", ""))
+		hanako, _ := json.Marshal(hanakoProvider())
+		opencode, _ := json.Marshal(magpieProviderJSON("opencode"))
+		zc, _ := json.Marshal(zcodeProviderJSON(filepath.Join(home, "none.json"), true))
+		crush, _ := json.Marshal(magpieProviderJSON("crush"))
+		atomcode := filepath.Join(t.TempDir(), "config.toml")
+		if err := edit.SetTOMLTables(atomcode, nil, atomcodeTables(atomcode)); err != nil {
+			t.Fatal(err)
+		}
+		atomcodeCfg, _ := os.ReadFile(atomcode)
+		rules, wb := filepath.Join(t.TempDir(), "provider_config.json"), filepath.Join(t.TempDir(), "models.json")
+		if err := zcodeRules(rules, true, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := workbuddyWrite(wb, true); err != nil {
+			t.Fatal(err)
+		}
+		zcRules, _ := os.ReadFile(rules)
+		wbModels, _ := os.ReadFile(wb)
+		n, capped := strconv.Itoa(want), strconv.Itoa(min(want, zcodeMaxOutput))
+		told := n
+		if !strings.Contains(limit, "context") {
+			told = strconv.Itoa(min(want, atomcodeContext))
+		}
+		wants := map[string][2]string{
+			"pi":          {string(pi), `"maxTokens":` + n},
+			"cline":       {string(cline), `"maxTokens":` + n},
+			"omp":         {string(omp), "maxTokens: " + n},
+			"dsh":         {string(dshRoute), "maxTokens: " + n},
+			"droid":       {string(droid), `"maxOutputTokens":` + n},
+			"qoder":       {string(qoder), `"maxOutputTokens":` + n},
+			"hanako":      {string(hanako), `"maxOutput":` + n},
+			"zcode":       {string(zc), `"output":` + capped},
+			"crush":       {string(crush), `"default_max_tokens":` + n},
+			"zcode rules": {string(zcRules), `"max":` + capped},
+			"workbuddy":   {string(wbModels), `"maxOutputTokens": ` + capped},
+			"atomcode":    {string(atomcodeCfg), "max_tokens = " + told},
+		}
+		if strings.Contains(limit, "context") {
+			wants["opencode"] = [2]string{string(opencode), `"output":` + n}
+		}
+		for agent, w := range wants {
+			if !strings.Contains(w[0], w[1]) {
+				t.Errorf("%s: want %s in %s", agent, w[1], w[0])
+			}
+		}
+	}
+	check(`"context":128000,"output":384000`, 128000)
+	check(`"output":384000`, 384000)
+	check(`"context":204800,"output":131072`, 131072)
+	check(`"context":64000,"output":384000`, 64000)
+}
+
 // A provider added after a magpie model was picked reaches the lists agents
 // keep of magpie's models; a file magpie wrote nothing into stays as it is.
 func TestSyncCatalogRewritesAgentLists(t *testing.T) {
@@ -108,7 +210,7 @@ func TestSyncCatalogRewritesAgentLists(t *testing.T) {
 	writeFile(t, crushCfg, crushBody)
 	codexDir := filepath.Join(home, ".codex")
 	codexCat := filepath.Join(codexDir, "magpie-models.json")
-	writeFile(t, filepath.Join(codexDir, "config.toml"), "model = \"relay/glm-4.6\"\nmodel_provider = \"magpie\"\nmodel_catalog_json = \""+codexCat+"\"\n")
+	writeFile(t, filepath.Join(codexDir, "config.toml"), "model = \"relay/glm-4.6\"\nmodel_provider = \"magpie\"\nmodel_catalog_json = '"+codexCat+"'\n")
 	writeFile(t, codexCat, `{"models":[]}`)
 
 	if err := provider.Save(provider.Provider{ID: "added", Name: "Added", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"m2"}}); err != nil {
@@ -145,6 +247,7 @@ func TestSyncCatalogRewritesAgentLists(t *testing.T) {
 func TestSyncCatalogAgesCodexCache(t *testing.T) {
 	home := syncHome(t)
 	dir := filepath.Join(home, ".codex")
+	writeFile(t, filepath.Join(dir, "auth.json"), `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`)
 	writeFile(t, filepath.Join(dir, "config.toml"), "model = \"relay/glm-4.6\"\nopenai_base_url = \""+codexGatewayURL()+"\"\n")
 	cache := filepath.Join(dir, "models_cache.json")
 	writeFile(t, cache, `{"fetched_at":"2026-09-25T10:00:00Z","etag":"W/\"v1\"","client_version":"0.155.1","models":[{"slug":"gpt-5.5"}]}`)

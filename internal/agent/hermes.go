@@ -7,27 +7,40 @@ package agent
 // with the catalog as its models) and points model.provider at it; a model
 // through magpie is "magpie/<provider>/<model>" here and model.default holds
 // "<provider>/<model>". The provider and model the user had are stashed and
-// put back when magpie steps out.
+// put back when magpie steps out. A model of the user's own picked after
+// that, in Hermes or on the Agents page, leaves magpie's provider in
+// providers: Hermes stays connected, its session model picker still offers
+// magpie's models beside its own (lijiho96940561 on X: Hermes went to Not
+// connected and magpie's models left its picker), and only Disconnect
+// takes the provider out.
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/gateway"
 )
 
-func hermes(home string) *Agent {
-	dir := os.Getenv("HERMES_HOME")
+func hermes(home string) *Agent { return hermesIn(here(home)) }
+
+// hermesIn is Hermes at a place: this machine's home, or a WSL distro's
+// (see wsl.go), where HERMES_HOME isn't read and its provider names the
+// gateway as the distro reaches it.
+func hermesIn(at place) *Agent {
+	dir := at.getenv("HERMES_HOME")
 	if dir == "" {
-		dir = filepath.Join(home, ".hermes")
+		dir = filepath.Join(at.home, ".hermes")
 	}
 	path := filepath.Join(dir, "config.yaml")
+	hermesProvider := func() hermesProviderEntry { return hermesProviderAt(at.gw()) }
 	key := "hermes:" + path + ":"
 	getKey := func(k string) string { v, _ := edit.GetYAML(path, k); return v }
 	onMagpie := func() bool { return getKey("model.provider") == magpieID }
-	// restore puts back the provider and model the user had before magpie
+	// joined: magpie's provider is in providers, though the model is one of
+	// Hermes's own
+	joined := func() bool { _, ok := edit.GetYAML(path, "providers."+magpieID+".base_url"); return ok }
+	// restore puts back the provider and model the user had before magpie,
+	// magpie's provider left beside them
 	restore := func() error {
 		var del []string
 		var kvs []edit.KV
@@ -38,8 +51,10 @@ func hermes(home string) *Agent {
 				del = append(del, k)
 			}
 		}
-		if err := edit.DelYAML(path, append(del, "providers."+magpieID)...); err != nil {
-			return err
+		if len(del) > 0 {
+			if err := edit.DelYAML(path, del...); err != nil {
+				return err
+			}
 		}
 		if len(kvs) == 0 {
 			return nil
@@ -47,7 +62,7 @@ func hermes(home string) *Agent {
 		return edit.SetYAML(path, kvs...)
 	}
 	return &Agent{
-		ID: "hermes", Name: "Hermes Agent", Icon: "hermes", Aliases: []string{"hermes-agent"},
+		ID: "hermes", Name: "Hermes Agent", Icon: "hermes", Aliases: []string{"hermes-agent"}, Spelled: prefixed,
 		UA:  []string{"hermes-agent"},
 		Bin: "hermes", Dir: dir, Path: path,
 		Sync: func() error {
@@ -59,12 +74,21 @@ func hermes(home string) *Agent {
 			}
 			return ""
 		},
+		Joined: joined,
+		// Disconnect takes magpie's provider out; the model, when it is
+		// magpie's, goes back by the field
+		Unwire: func() error {
+			if !joined() {
+				return nil
+			}
+			return edit.DelYAML(path, "providers."+magpieID)
+		},
 		Check: func() string {
 			if !onMagpie() {
 				return ""
 			}
 			return wiringOff("Hermes", path, func(k string) (string, bool) { return edit.GetYAML(path, "providers."+magpieID+"."+k) },
-				"base_url", gatewayV1(), "api_key", gateway.Token)
+				"base_url", at.v1(), "api_key", at.gwKey())
 		},
 		Fields: []Field{{
 			Key: "model", Label: "model",
@@ -135,16 +159,16 @@ type hermesProviderEntry struct {
 	Models  []string          `yaml:"models"`
 }
 
-// hermesProvider is magpie's entry under providers. Hermes sends its own
-// User-Agent only from a recent release on, so the header names it for the
-// gateway's usage view.
-func hermesProvider() hermesProviderEntry {
+// hermesProviderAt is magpie's entry under providers, for a Hermes reaching
+// the gateway at gw. Hermes sends its own User-Agent only from a recent
+// release on, so the header names it for the gateway's usage view.
+func hermesProviderAt(gw string) hermesProviderEntry {
 	ms := []string{}
 	for _, m := range magpieModels("hermes") {
 		ms = append(ms, m.ID)
 	}
 	return hermesProviderEntry{
-		Name: magpieID, BaseURL: gatewayV1(), APIKey: gateway.Token, APIMode: "chat_completions",
+		Name: magpieID, BaseURL: gw + "/v1", APIKey: keyAt(gw), APIMode: "chat_completions",
 		Headers: map[string]string{"User-Agent": "hermes-agent"}, Models: ms,
 	}
 }

@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 func TestCommandCodePlan(t *testing.T) {
@@ -246,5 +249,94 @@ func TestCommandCodeSignInWhoamiDown(t *testing.T) {
 		if c.state == "done" && (st.User != c.user || st.Plan != "Pro" || asked.Load() != 3) {
 			t.Fatalf("signed in: %+v, whoami asked %d times", st, asked.Load())
 		}
+	}
+}
+
+// The CLI's own account removed in magpie, then signed in to again from
+// magpie (#320, ttbug): the sign-in said done, but the key was the CLI's
+// own account's, let go as one, and that one stayed hidden, so magpie
+// said "signed in, but magpie can't list it". Signing in brings it back.
+func TestCommandCodeSignInAgainToRemovedOwn(t *testing.T) {
+	home := signIn(t)
+	writeFile(t, filepath.Join(home, ".commandcode", "auth.json"), map[string]any{
+		"apiKey": "own-key", "userId": "u1", "userName": "ownuser", "keyName": "cli",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/alpha/whoami":
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": map[string]any{"id": "u1", "userName": "ownuser"}})
+		case "/alpha/billing/subscriptions":
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "data": map[string]any{"planId": "individual-pro-monthly", "status": "active"}})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	oldAPI := cmdAPI
+	cmdAPI = srv.URL
+	defer func() { cmdAPI = oldAPI }()
+
+	if ls := Logins(CommandCodePlanID); len(ls) != 1 || ls[0].User != "ownuser" {
+		t.Fatalf("own: %+v", ls)
+	}
+	if err := ForgetLogin(CommandCodePlanID, "ownuser"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := find(All(), CommandCodePlanID); ok {
+		t.Fatal("removed, still listed")
+	}
+
+	st, err := StartSignIn(CommandCodePlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(st.URL)
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	if _, err := noFollow.PostForm(u.Query().Get("callback"), url.Values{"apiKey": {"new-key"}, "state": {u.Query().Get("state")},
+		"userId": {"u1"}, "userName": {"ownuser"}, "keyName": {"magpie"}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if st, _ = WaitSignIn(ctx, st.ID); st.State != "done" || st.User != "ownuser" {
+		t.Fatalf("sign-in: %+v", st)
+	}
+	if ls := Logins(CommandCodePlanID); len(ls) != 1 || ls[0].User != "ownuser" || !ls[0].Active {
+		t.Fatalf("logins: %+v", ls)
+	}
+	if p, ok := find(All(), CommandCodePlanID); !ok || p.Account.User != "ownuser" {
+		t.Fatalf("not listed after signing in again: %v %+v", ok, p)
+	}
+}
+
+// Command Code answers a 200 with success false when it couldn't read the
+// subscription ("write CONNECTION_CLOSED …"): the plan is unread, not none.
+func TestCommandCodeSubscriptionUnread(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "write CONNECTION_CLOSED db.local:5432"})
+	}))
+	defer srv.Close()
+	oldAPI := cmdAPI
+	cmdAPI = srv.URL
+	defer func() { cmdAPI = oldAPI }()
+	if _, plan, _, _, ok := cmdSubscription(context.Background(), cmdAuth{APIKey: "k"}); ok || plan != "" {
+		t.Fatalf("plan %q, ok %v: want it unread", plan, ok)
+	}
+}
+
+// A Command Code model is told to the agents with a reply limit within the
+// 200000 Command Code takes: models.dev gives DeepSeek V4 384000, and an
+// agent asking for that was refused. Another provider's is left as it is.
+func TestCommandCodeOutputCapped(t *testing.T) {
+	m := catalog.Model{ID: "deepseek/deepseek-v4-pro", Context: 1_000_000, Output: 384_000}
+	if got := entryFor(Provider{ID: CommandCodePlanID}, m, settings.Settings{}).Output; got != CommandCodeMaxOutput {
+		t.Errorf("Command Code: output %d, want %d", got, CommandCodeMaxOutput)
+	}
+	if got := entryFor(Provider{ID: "deepseek"}, m, settings.Settings{}).Output; got != 384_000 {
+		t.Errorf("deepseek: output %d, want 384000", got)
+	}
+	m.Output = 64_000
+	if got := entryFor(Provider{ID: CommandCodePlanID}, m, settings.Settings{}).Output; got != 64_000 {
+		t.Errorf("Command Code, within: output %d, want 64000", got)
 	}
 }

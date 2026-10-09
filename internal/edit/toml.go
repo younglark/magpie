@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pelletier/go-toml/v2/unstable"
@@ -239,6 +241,16 @@ func getTOMLTopLines(path, key string) (string, bool) {
 // there is none. Every key is located in the file as it was read, so the
 // edit is one write that either happens entirely or not at all.
 func SetTOMLTop(path string, kvs ...KV) error {
+	return setTOMLTop(path, false, kvs...)
+}
+
+// SetTOMLTopPreserving is SetTOMLTop with an existing key's spacing and trailing
+// comment kept. New keys use the same spelling as SetTOMLTop.
+func SetTOMLTopPreserving(path string, kvs ...KV) error {
+	return setTOMLTop(path, true, kvs...)
+}
+
+func setTOMLTop(path string, preserve bool, kvs ...KV) error {
 	raw, err := Read(path)
 	if err != nil {
 		return err
@@ -260,10 +272,13 @@ func SetTOMLTop(path string, kvs ...KV) error {
 		at = doc.root.keys[n-1].to
 	}
 	for _, kv := range kvs {
-		line := kv.Path + " = " + strconv.Quote(toString(kv.Value))
+		line := kv.Path + " = " + tomlLiteral(kv.Value)
 		found := false
 		for _, k := range doc.root.keys {
 			if k.name == kv.Path {
+				if preserve {
+					line = k.prefix + tomlLiteral(kv.Value) + k.suffix
+				}
 				replace[k.from] = span{k.to, line}
 				found = true
 				break
@@ -413,6 +428,7 @@ type tomlFile struct {
 func parseTOMLFile(lines []string) (tomlFile, error) {
 	p := unstable.Parser{KeepComments: true}
 	p.Reset([]byte(strings.Join(lines, "\n")))
+	shapeOf := tomlShaper(lines)
 	root := tomlTableSpan{to: len(lines)}
 	var tables []tomlTableSpan
 	current := func() *tomlTableSpan {
@@ -470,7 +486,7 @@ func parseTOMLFile(lines []string) (tomlFile, error) {
 				keyRange.Length = key.Raw.Offset + key.Raw.Length - keyRange.Offset
 			}
 		}
-		shape := p.Shape(keyRange)
+		shape := shapeOf(keyRange)
 		i := shape.Start.Line - 1
 		if err := finishKey(i); err != nil {
 			return tomlFile{}, err
@@ -496,7 +512,7 @@ func parseTOMLFile(lines []string) (tomlFile, error) {
 				value: string(value.Data), scalar: value.Kind != unstable.Array && value.Kind != unstable.InlineTable,
 			}
 			if comment := expr.Next(); comment != nil && comment.Kind == unstable.Comment {
-				kv.comment = p.Shape(comment.Raw).Start.Column - 1
+				kv.comment = shapeOf(comment.Raw).Start.Column - 1
 			}
 			table.keys = append(table.keys, kv)
 		}
@@ -508,6 +524,25 @@ func parseTOMLFile(lines []string) (tomlFile, error) {
 		return tomlFile{}, err
 	}
 	return tomlFile{root: root, tables: tables}, nil
+}
+
+// tomlShaper is the parser's Shape for the document of lines, found from
+// where each line starts rather than by counting the newlines before each
+// range, as Shape does: that is a pass over the file for each key, which
+// took a third of a second on a 1.5 MB config.toml of Codex's.
+func tomlShaper(lines []string) func(unstable.Range) unstable.Shape {
+	starts := make([]int, len(lines))
+	for i, off := 1, 0; i < len(lines); i++ {
+		off += len(lines[i-1]) + 1
+		starts[i] = off
+	}
+	at := func(off int) unstable.Position {
+		i := sort.Search(len(starts), func(i int) bool { return starts[i] > off }) - 1
+		return unstable.Position{Offset: off, Line: i + 1, Column: off - starts[i] + 1}
+	}
+	return func(r unstable.Range) unstable.Shape {
+		return unstable.Shape{Start: at(int(r.Offset)), End: at(int(r.Offset + r.Length))}
+	}
 }
 
 func tomlParseError(p *unstable.Parser, err error) error {
@@ -535,7 +570,8 @@ func tomlParseError(p *unstable.Parser, err error) error {
 // also checks duplicate keys and conflicting definitions; it never rewrites
 // the document, so comments and formatting survive validation unchanged.
 func writeTOML(path string, lines []string) error {
-	data := []byte(joinLines(lines))
+	orig, _ := Read(path)
+	data := []byte(joinLinesLike(lines, string(orig)))
 	if err := validateTOML(data); err != nil {
 		return fmt.Errorf("%s: edited TOML is invalid: %w", path, err)
 	}
@@ -583,7 +619,56 @@ func tomlLiteral(v any) string {
 	case int:
 		return strconv.Itoa(x)
 	}
-	return strconv.Quote(toString(v))
+	return tomlString(toString(v))
+}
+
+// tomlString spells s as a TOML basic string. Go's strconv.Quote is not a
+// substitute: it escapes a control byte as \x01, and TOML defines no \x
+// escape, so such a value leaves a file no TOML parser reads. writeTOML
+// refuses that file before any change reaches the disk, so the config is
+// never corrupted, but the edit then cannot be made at all — an agent's own
+// value has to be writable. Escapes taken from the TOML spec; anything else
+// that is printable, including non-ASCII, is written as it is.
+func tomlString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		if r == utf8.RuneError && size == 1 {
+			// One byte that is not part of a rune: TOML has no escape for a
+			// single byte, only for code points, so a value that is not valid
+			// UTF-8 cannot be written. It is left as it is, and writeTOML
+			// refuses the file, rather than being quietly replaced by U+FFFD.
+			b.WriteByte(s[i-size])
+			continue
+		}
+		switch r {
+		case '\b':
+			b.WriteString(`\b`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&b, `\u%04X`, r)
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // Table is one TOML table: its header name and its keys, in order.
@@ -597,6 +682,12 @@ type Table struct {
 // tables magpie owns as a whole (one per model of its catalog), which would
 // otherwise be rewritten once per table. With no tables it only removes.
 func SetTOMLTables(path string, prefixes []string, tables []Table) error {
+	return SetTOMLTablesMatching(path, nil, prefixes, tables)
+}
+
+// SetTOMLTablesMatching replaces tables whose names are exact matches or
+// begin with one of prefixes, then appends the given tables in one write.
+func SetTOMLTablesMatching(path string, names, prefixes []string, tables []Table) error {
 	raw, err := Read(path)
 	if err != nil {
 		return err
@@ -607,6 +698,11 @@ func SetTOMLTables(path string, prefixes []string, tables []Table) error {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	owned := func(name string) bool {
+		for _, n := range names {
+			if name == n {
+				return true
+			}
+		}
 		for _, p := range prefixes {
 			if strings.HasPrefix(name, p) {
 				return true

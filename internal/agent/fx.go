@@ -25,8 +25,13 @@ import (
 // past it fx refuses the whole settings file.
 const fxMaxModels = 256
 
-func fx(home string) *Agent {
-	dir := filepath.Join(home, ".fx")
+func fx(home string) *Agent { return fxIn(here(home)) }
+
+// fxIn is fx at a place: this machine's home, or a WSL distro's (see
+// wsl.go), its provider naming the gateway as the distro reaches it.
+func fxIn(at place) *Agent {
+	fxProvider := func(cur string) any { return fxProviderAt(cur, at.v1()) }
+	dir := filepath.Join(at.home, ".fx")
 	path := filepath.Join(dir, "settings.json")
 	get := func(k string) string { v, _ := edit.GetJSON(path, k); return v }
 	// the provider fx talks to; unset, it is Vercel's AI Gateway
@@ -52,8 +57,11 @@ func fx(home string) *Agent {
 		return edit.DelJSON(path, keys...)
 	}
 	return &Agent{
-		ID: "fx", Name: "fx", Icon: "fx",
-		Bin: "fx", Dir: dir, Path: path,
+		ID: "fx", Name: "fx", Icon: "fx", Spelled: prefixed,
+		Dir: dir, Path: path,
+		// ~/.fx is where its settings are. No command: `fx` is a common name
+		// (the JSON viewer has it too), as in WSL (wsl.go).
+		detect: func() bool { return isDir(dir) },
 		Sync: func() error {
 			return syncJSON(path, "providers."+magpieID, func() any { return fxProvider(fxModels(path)[magpieID]) })
 		},
@@ -68,7 +76,7 @@ func fx(home string) *Agent {
 				return ""
 			}
 			return wiringOff("fx", path, func(k string) (string, bool) { return edit.GetJSON(path, "providers."+magpieID+"."+k) },
-				"base_url", gatewayV1())
+				"base_url", at.v1())
 		},
 		Fields: []Field{{
 			Key: "model", Label: "model",
@@ -135,10 +143,11 @@ func fxModels(path string) map[string]string {
 	return out
 }
 
-// fxProvider is magpie's entry in settings.json's providers. Its
-// model_metadata is what fx's model picker lists: the catalog, the model
-// in use first so it is never the one cut at fx's limit.
-func fxProvider(cur string) any {
+// fxProviderAt is magpie's entry in settings.json's providers, for an fx
+// reaching the gateway's /v1 at v1. Its model_metadata is what fx's model
+// picker lists: the catalog, the model in use first so it is never the one
+// cut at fx's limit.
+func fxProviderAt(cur, v1 string) any {
 	all := magpieModels("fx")
 	slices.SortStableFunc(all, func(a, b catalog.Model) int {
 		switch {
@@ -165,7 +174,7 @@ func fxProvider(cur string) any {
 		ms[m.ID] = e
 	}
 	return map[string]any{
-		"protocol": "openai-chat-completions", "base_url": gatewayV1(), "auth": map[string]any{"type": "none"},
+		"protocol": "openai-chat-completions", "base_url": v1, "auth": map[string]any{"type": "none"},
 		"tool_choice_mode": "send", "model_metadata": ms,
 	}
 }

@@ -15,7 +15,6 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/settings"
 )
 
 // A model that can't see images is given what a model that can says of
@@ -24,6 +23,15 @@ import (
 // the image's place, in the current turn, older turns and tool results
 // alike. With Vision off, or no model that sees, such an image is turned
 // away as before (textOnlyBody).
+
+// Agents are told a model that can't see takes images while one that can
+// describes them to it.
+func init() {
+	provider.Described = func() bool {
+		_, ok := seer()
+		return ok
+	}
+}
 
 // VisionAgent is the User-Agent of the descriptions magpie asks for.
 const VisionAgent = "magpie-vision/1"
@@ -54,20 +62,80 @@ func describing(ctx context.Context) bool {
 	return v
 }
 
+// describeForKey holds the request an image is described for: the Routing
+// view names it by the description's row, in that request's session.
+type describeForKey struct{}
+
+type describeFor struct {
+	call    *CallFor
+	session string
+}
+
+func withDescribeFor(ctx context.Context, agent, model, session string, unknown bool) context.Context {
+	return context.WithValue(ctx, describeForKey{}, describeFor{&CallFor{Agent: agent, Model: model, Unknown: unknown, Missing: VisionMissing()}, session})
+}
+
+func describedFor(ctx context.Context) *CallFor {
+	f, _ := ctx.Value(describeForKey{}).(describeFor)
+	return f.call
+}
+
+// blindTo is whether a describer is to describe images for pid/model: its
+// list says it takes none (in), or says nothing and magpie counts it
+// text-only — as agents were told before Vision had them told every model
+// takes images (provider.Described): models.dev doesn't say it sees either.
+func blindTo(pid, model string, in *bool) bool {
+	if in != nil {
+		return !*in
+	}
+	e, ok := provider.ServedEntryOf(pid + "/" + model)
+	return ok && !e.Images
+}
+
 // seer is the model that describes images: the Settings' Vision while it
 // resolves, else AutoVision's. None when Vision is off or no model sees.
+// A Vision that no longer resolves (its provider removed or off, the model
+// gone) is not described with in silence by AutoVision's: VisionMissing
+// names it, the description's row in Routing and Settings › Models say it
+// is missing, and a request turned away for want of a describer says so.
 func seer() (string, bool) {
-	switch v := settings.Load().Vision; v {
+	switch v := provider.HeldSettings().Vision; v {
 	case "off":
 		return "", false
 	case "":
 	default:
-		if _, _, ok := provider.Resolve(v); ok {
+		if pickedMissing(v) == "" {
 			return v, true
 		}
 	}
 	m := AutoVision()
 	return m, m != ""
+}
+
+// VisionMissing is the model Settings › Models › Image recognition names
+// when magpie can't find it any more, so that AutoVision's describes in its
+// place. "" when none is named, Vision is off, or it resolves.
+func VisionMissing() string { return pickedMissing(provider.HeldSettings().Vision) }
+
+// pickedMissing is a model the user picked in Settings (v) that doesn't
+// resolve: "" for none picked, off, or one magpie finds.
+func pickedMissing(v string) string {
+	if v == "" || v == "off" {
+		return ""
+	}
+	if _, _, ok := provider.Resolve(v); ok {
+		return ""
+	}
+	return v
+}
+
+// missingSeerNote is what a request turned away, or whose image wasn't
+// described, says of a picked Image recognition model that is missing.
+func missingSeerNote() string {
+	if v := VisionMissing(); v != "" {
+		return fmt.Sprintf("; the Image recognition model picked in magpie's Settings, %q, isn't set up any more: pick another in Settings → Models → Image recognition", v)
+	}
+	return ""
 }
 
 // AutoVision is the model magpie picks to describe images when the
@@ -88,7 +156,7 @@ func AutoVision() string {
 	}
 	best, bestTier, bestCost := "", 0, 0.0
 	for _, p := range provider.All() {
-		if !p.On() || p.Decides() {
+		if !p.On() || p.DecideOnly() {
 			continue
 		}
 		t := tier(p)
@@ -179,12 +247,16 @@ func (s *Server) askVision(ctx context.Context, model, src string) (string, erro
 		req["reasoning_effort"] = effort
 	}
 	body, _ := json.Marshal(req)
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://magpie/v1/chat/completions", nil)
+	r, err := http.NewRequestWithContext(magpieChose(ctx), http.MethodPost, "http://magpie/v1/chat/completions", nil)
 	if err != nil {
 		return "", err
 	}
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("User-Agent", VisionAgent)
+	if f, _ := ctx.Value(describeForKey{}).(describeFor); f.session != "" {
+		// in the Routing view beside the request it describes for
+		r.Header.Set(SessionHeader, f.session)
+	}
 	w := httptest.NewRecorder()
 	s.serve(w, r, provider.Chat, body)
 	if ctx.Err() != nil {
