@@ -81,6 +81,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie accounts [agent] [--json]  every subscription magpie knows, with each one's allowance used and when it resets
   magpie accounts add <agent>     sign in to one more Claude, ChatGPT or Google (Gemini CLI, Antigravity) subscription
   magpie accounts add copilot [--host <name>.ghe.com]   one more Copilot account, on github.com or an enterprise's GHE.com
+  magpie accounts import <codex|claude|antigravity|factory> <file>... [--yes]   bring in accounts from other tools' files (Codex's auth.json, Cockpit Tools, CLIProxyAPI, Sub2API); the tool a ChatGPT or Claude file came from is signed out of it
   magpie accounts switch <agent> <email>   sign the agent in to another of them
   magpie accounts refresh         renew the saved ChatGPT sign-ins now (the gateway does it daily)
   magpie accounts checkin         WorkBuddy's daily check-in (签到) for each WorkBuddy account, now (Settings can do it daily)
@@ -212,6 +213,9 @@ func run(args []string) error {
 	// a model Claude Code names that magpie doesn't serve goes to the one
 	// it is set to use for that tier
 	gateway.StandIn = agent.StandIn
+	// a Codex that reaches magpie for account failover alone is handed
+	// only its own models (#1385)
+	gateway.CodexOwnOnly = agent.CodexOwnOnly
 	// the setup kept the same on every computer, by whichever serves
 	gateway.WhileServing = append(gateway.WhileServing, davsync.Run)
 	// and dsh's patch lists, which dsh reads live: a route left behind by
@@ -519,6 +523,10 @@ func list(agents []*agent.Agent, detectedOnly bool, dimFrom int) error {
 				r.name = faint.Render(a.Name) + " " + faint.Render("hidden")
 			}
 			r.vals = strings.Join(parts, label.Render("  ·  "))
+			// through magpie for account failover while not connected (#1385)
+			if said := a.FailoverSaid(); said != "" {
+				r.vals += label.Render("  ·  " + said)
+			}
 			if a.Import != nil {
 				if a.Added != nil && a.Added() {
 					r.vals = value.Render("magpie added")
