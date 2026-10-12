@@ -169,6 +169,16 @@ func (p Provider) Fetch(ctx context.Context) ([]catalog.Model, error) {
 // A pick the old list didn't have was typed in by hand, and stays; a
 // fetch that fails, or that answers no model at all, changes nothing.
 func (p Provider) Refetch(ctx context.Context) ([]catalog.Model, []string, error) {
+	if p.IsPlugin() {
+		// its plugin's list, read again: a pick it had and has no more
+		// goes as a built-in's does (plugin_relist.go)
+		before := plugin.Cached()
+		ms, err := p.fetch(ctx)
+		if err != nil {
+			return ms, nil, err
+		}
+		return ms, dropGonePluginPicks(before, plugin.Cached())[p.ID], nil
+	}
 	if p.Account != nil || p.DecideOnly() {
 		ms, err := p.fetch(ctx)
 		return ms, nil, err
@@ -542,6 +552,9 @@ func (p Provider) planModels(ms []catalog.Model) []catalog.Model {
 	if r := p.regionOf(pr); r != nil && r.Models != nil {
 		models = r.Models
 	}
+	if p.IsVertex() && p.Vertex != nil {
+		models = vertexModels(p.Vertex.Location) // each location serves its own
+	}
 	if pr.Only == "" && (len(models) == 0 || len(ms) > 0) {
 		return ms
 	}
@@ -747,17 +760,26 @@ func anyImageInput(a, b *bool) *bool {
 
 // Serves reports whether key k can be asked for model: false only when the
 // vendor's lists say another of the provider's keys sees it and k doesn't.
+// A key no list marks — its own wasn't answered, or it was added since —
+// is unknown, and serves: a failed list is not an empty one (#1598, the
+// first of five keys left out of every request).
 func (p Provider) Serves(k KeyAccount, model string) bool {
 	live, _, ok := p.live()
 	if !ok {
 		return true
 	}
+	id := keyID(k.Key)
+	var keys []string
+	found, listed := false, false
 	for _, m := range live {
 		if m.ID == model {
-			return len(m.Keys) == 0 || slices.Contains(m.Keys, keyID(k.Key))
+			keys, found = m.Keys, true
+		}
+		if !listed && slices.Contains(m.Keys, id) {
+			listed = true
 		}
 	}
-	return true
+	return !found || len(keys) == 0 || !listed || slices.Contains(keys, id)
 }
 
 // Exposed lists the models magpie offers to agents for this provider: the
@@ -799,7 +821,7 @@ func (p Provider) Exposed() []catalog.Model {
 		picks = slices.DeleteFunc(slices.Clone(picks), p.Account.unusable)
 	}
 	if len(picks) > 0 {
-		return pick(picks)
+		return pick(p.withNewlyListed(picks, avail))
 	}
 	// another magpie's list is already the models its user exposed
 	if len(avail) <= manyModels || p.IsRemoteMagpie() {
@@ -809,6 +831,69 @@ func (p Provider) Exposed() []catalog.Model {
 	// vendor's own list — theirs run newest first — and let the user pick
 	// from the rest; nothing here is compiled in.
 	return avail[:manyModels]
+}
+
+// Picks are the models the user picked, with those the vendor has listed
+// since beside them (withNewlyListed): what agents are served of the
+// picks, and what an editor starts its picks from. None when nothing is
+// picked.
+func (p Provider) Picks() []string {
+	if len(p.Models) == 0 {
+		return p.Models
+	}
+	return p.withNewlyListed(p.Models, p.Available())
+}
+
+// withNewlyListed is picks with the models the vendor has listed since
+// they were saved put first, when they held every model listed then. A
+// Claude account whose user picked every model (Select all, or the TUI's
+// toggles) was served the list as it was then, and never Haiku 5.5 when
+// models.dev listed it (wakaka on Discord, after 9b51428e). A model that
+// was listed and left unpicked stays left out, and so do new ones beside
+// picks that left any out. Picks saved before PickedFrom was kept are taken
+// to have held every model when they hold every one released up to the
+// newest of them, and a model released after it is the new one.
+func (p Provider) withNewlyListed(picks []string, avail []catalog.Model) []string {
+	if len(avail) == 0 {
+		return picks
+	}
+	picked := make(map[string]bool, len(picks))
+	for _, id := range picks {
+		picked[id] = true
+	}
+	var isNew func(catalog.Model) bool
+	if p.PickedFrom != nil {
+		listed := make(map[string]bool, len(p.PickedFrom))
+		for _, id := range p.PickedFrom {
+			listed[id] = true
+		}
+		isNew = func(m catalog.Model) bool { return !listed[m.ID] }
+	} else {
+		newest := ""
+		for _, m := range avail {
+			if picked[m.ID] && m.Released > newest {
+				newest = m.Released
+			}
+		}
+		if newest == "" {
+			return picks
+		}
+		isNew = func(m catalog.Model) bool { return m.Released > newest }
+	}
+	var added []string
+	for _, m := range avail {
+		if picked[m.ID] {
+			continue
+		}
+		if !isNew(m) {
+			return picks // one the user saw and left unpicked
+		}
+		added = append(added, m.ID)
+	}
+	if len(added) == 0 {
+		return picks
+	}
+	return append(added, picks...)
 }
 
 // RejectsTemperature reports whether the model is known to refuse
@@ -1033,11 +1118,18 @@ func EffectivePriceIn(s settings.Settings, providerID, model string) (catalog.Pr
 	// key under a display name counts only for a caller naming that name
 	// too. Nothing writes such a key — SetModelPrice re-keys the way
 	// SetModelName does — which is what keeps the two from drifting.
-	id := providerID
 	p, known := byIDOrWas(providerID)
-	if known {
-		id = p.ID
+	if !known {
+		p = Provider{ID: providerID}
 	}
+	return priceOf(s, p, known, model)
+}
+
+// priceOf is EffectivePriceIn for a provider already looked up, for a
+// caller pricing many models at once: byIDOrWas reads every provider's
+// accounts each time.
+func priceOf(s settings.Settings, p Provider, known bool, model string) (catalog.Price, bool) {
+	id := p.ID
 	// then what they said the model costs from any provider (*/model):
 	// still the user's word, so before any list price
 	for _, key := range [...]string{id + "/" + model, id + "/*", AnyPriceKey(model)} {
@@ -1123,9 +1215,15 @@ func byIDOrWas(id string) (Provider, bool) {
 // prices it.
 var grokEffort = regexp.MustCompile(`^((?:.*/)?grok-[0-9][^/]*?)-(?:minimal|low|medium|high|xhigh|extra-high)$`)
 
+// grokWindow is a Grok id offered at a context window of its own
+// ("grok-4.7@500k", grokContextModels and the grok plugin's windowsOf): the
+// same model, asked for at a longer window.
+var grokWindow = regexp.MustCompile(`^((?:.*/)?grok-[0-9][^/@]*)@[0-9]+k$`)
+
 // pricedNames are the ids a model is priced by, in order: its own, then,
 // for a Grok id named at an effort, the model it is that effort of — the
-// same model, at the same price (#224). Codex Auto Review uses GPT-5.6 Luna
+// same model, at the same price (#224) — or at a window (grok-4.7@500k),
+// the model it is that window of. Codex Auto Review uses GPT-5.6 Luna
 // according to OpenAI's rate card (2026-09-30):
 // https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing
 // This is a list-price estimate, not evidence of a response's served model.
@@ -1135,6 +1233,9 @@ func pricedNames(model string) []string {
 	out := []string{model}
 	if model == "codex-auto-review" {
 		out = append(out, "gpt-5.6-luna")
+	}
+	if m := grokWindow.FindStringSubmatch(strings.ToLower(strings.TrimSpace(model))); m != nil {
+		out = append(out, m[1])
 	}
 	if m := grokEffort.FindStringSubmatch(strings.ToLower(strings.TrimSpace(model))); m != nil {
 		out = append(out, m[1])
@@ -1183,10 +1284,13 @@ func (p Provider) Chosen(id string) bool {
 
 // Entry is one model as the agents see it.
 type Entry struct {
-	ID         string   `json:"id"`                // what the agent sends magpie
-	Model      string   `json:"model"`             // what magpie sends the vendor
-	Name       string   `json:"name"`              // the user's name for it, when they gave one (SetModelName)
-	Default    string   `json:"default,omitempty"` // the model's own name, when the user gave it another
+	ID      string `json:"id"`                // what the agent sends magpie
+	Model   string `json:"model"`             // what magpie sends the vendor
+	Name    string `json:"name"`              // the user's name for it, when they gave one (SetModelName)
+	Default string `json:"default,omitempty"` // the model's own name, when the user gave it another
+	// Plain is a remote magpie's model's name there alone, when Name is
+	// its label there with that magpie's provider after it (catalog.Model's)
+	Plain      string   `json:"-"`
 	Efforts    []string `json:"efforts,omitempty"`
 	Provider   Provider `json:"-"`                // a group's: its first member's
 	Group      string   `json:"group,omitempty"`  // set on a routing group (group.go)
@@ -1194,6 +1298,10 @@ type Entry struct {
 	Icons      []string `json:"-"`                // a group's: its providers' icons, one per provider
 	Images     bool     `json:"images,omitempty"` // takes images as input (a group's: a member does)
 	ImageInput *bool    `json:"-"`                // explicit answer, nil when unknown
+	// Inputs and Outputs are what the model's source listed it takes and
+	// gives (catalog.Model's InputModalities, OutputModalities); see
+	// Modalities
+	Inputs, Outputs []string `json:"-"`
 	// Context is the tokens a prompt may hold, when known (a group's: the
 	// least of its members')
 	Context int `json:"context,omitempty"`
@@ -1220,6 +1328,13 @@ type Entry struct {
 	// multi-agent V2 for it, so Ultra hands work to its agents, whose
 	// tasks a magpie-served lead writes as text.
 	AgentsV2 bool `json:"-"`
+	// Tiers are the service tiers its list offers Codex on the model:
+	// another magpie's, those it offers its own Codex (#1234)
+	Tiers []string `json:"-"`
+	// Released is the model's release day (YYYY-MM-DD) as its list or
+	// models.dev says it, "" when neither does: what a group's template
+	// weighs a newer model by (grouptemplate.go)
+	Released string `json:"-"`
 }
 
 // Catalog lists the routing groups, then every exposed model of every ready
@@ -1295,9 +1410,12 @@ func entryFor(p Provider, m catalog.Model, s settings.Settings) Entry {
 	// an agent's list showed the whole magpie/<provider>/<model> (#955)
 	name := cmp.Or(m.Name, m.ID)
 	e := Entry{ID: p.ID + "/" + m.ID, Model: m.ID, Family: p.Family, Name: name, Efforts: effortsOf(m), Provider: p,
-		Images: images, ImageInput: imageInput, Context: ctx, Output: output, Free: m.Free, Rate: m.Rate, RateWas: m.RateWas}
+		Images: images, ImageInput: imageInput, Context: ctx, Output: output, Free: m.Free, Rate: m.Rate, RateWas: m.RateWas, Tiers: m.Tiers, Released: m.Released,
+		Inputs: m.InputModalities, Outputs: m.OutputModalities}
 	if n, ok := modelNameIn(s.ModelNames, p.ID, m.ID); ok {
 		e.Name, e.Default = n, name
+	} else {
+		e.Plain = m.Plain
 	}
 	// a model that thinks still does with the levels the user kept or
 	// none at all; one its source says nothing of thinks as most of the
@@ -1314,6 +1432,29 @@ func entryFor(p Provider, m catalog.Model, s settings.Settings) Entry {
 		e.AgentsV2 = slices.Contains(e.Efforts, "ultra")
 	}
 	return e
+}
+
+// Modalities are what the model takes and gives, as an agent's model list
+// says them: every kind its source listed (a plugin's audio, video and pdf
+// too, #1595), with image as Images has it, the user's say included. With
+// no list, the input is text and image or text alone when whether it
+// takes images is known, and nil when it isn't; output is nil unless said.
+func (e Entry) Modalities() (in, out []string) {
+	if e.Inputs != nil {
+		in = slices.DeleteFunc(slices.Clone(e.Inputs), func(k string) bool { return k == "image" })
+		if e.Images {
+			at := 0
+			if len(in) > 0 && in[0] == "text" {
+				at = 1
+			}
+			in = slices.Insert(in, at, "image")
+		}
+	} else if e.Images {
+		in = []string{"text", "image"}
+	} else if e.ImageInput != nil {
+		in = []string{"text"}
+	}
+	return in, slices.Clone(e.Outputs)
 }
 
 // EntryOf is the model as the agents see it, by the id they ask for. It is

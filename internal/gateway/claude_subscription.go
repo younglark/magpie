@@ -60,6 +60,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/claudecode"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
@@ -266,13 +267,7 @@ type bridgeTool struct {
 	InputSchema json.RawMessage `json:"inputSchema"`
 }
 
-func claudeConfigDir() string {
-	if d := appdir.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
-		return d
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude")
-}
+func claudeConfigDir() string { return appdir.ClaudeDir() }
 
 // claudeProjectName is the folder Claude Code keeps a working directory's
 // sessions under: the path with everything but letters and digits made "-".
@@ -428,14 +423,16 @@ type claudeCLI struct {
 	wsl  *wslrun.Tool
 }
 
+// claudeBinary is this machine's Claude Code, or the one magpie downloaded
+// for it (claudecode.Find), else one in WSL.
 func claudeBinary() (claudeCLI, error) {
-	if p := proc.FindTool("claude"); p != "" {
+	if p := claudecode.Find(); p != "" {
 		return claudeCLI{path: p}, nil
 	}
 	if t, ok := wslrun.Find("claude"); ok {
 		return claudeCLI{wsl: &t}, nil
 	}
-	return claudeCLI{}, errors.New("Claude Code is not installed; install it and run `claude auth login`")
+	return claudeCLI{}, errors.New("Claude Code is not installed; install it and run `claude auth login`, " + claudecode.InstallHint)
 }
 
 func (c claudeCLI) command(ctx context.Context, args ...string) *exec.Cmd {
@@ -443,6 +440,46 @@ func (c claudeCLI) command(ctx context.Context, args ...string) *exec.Cmd {
 		return c.wsl.Command(ctx, args...)
 	}
 	return proc.CommandContext(ctx, c.path, args...)
+}
+
+// claudeEuid is the user magpie runs as; a var for tests.
+var claudeEuid = os.Geteuid
+
+// root is whether this Claude Code runs as root: magpie itself as root
+// (a server's or a container's), or a WSL distro's default user root.
+func (c claudeCLI) root() bool {
+	if c.wsl != nil {
+		return c.wsl.Root
+	}
+	return runtime.GOOS != "windows" && claudeEuid() == 0
+}
+
+// asRoot is env for a bridge run (claudeCLIArgs) by a Claude Code run as
+// root, which refuses --dangerously-skip-permissions there ("cannot be
+// used with root/sudo privileges") unless IS_SANDBOX is "1" or
+// CLAUDE_CODE_BUBBLEWRAP is set: its setup checks exactly that (2.1.296).
+// The run has no tool of Claude Code's own that touches the machine, only
+// magpie's MCP ones, answered by the client, and Anthropic's web search,
+// so skipping the permission prompts as root does nothing more than as
+// anyone else. Run as anyone else, env is kept as it is.
+func (c claudeCLI) asRoot(env []string) []string {
+	if !c.root() {
+		return env
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		switch k, v, _ := strings.Cut(e, "="); {
+		case k == "CLAUDE_CODE_BUBBLEWRAP" && v != "":
+			return env
+		case k == "IS_SANDBOX":
+			if v == "1" {
+				return env
+			}
+			continue
+		}
+		out = append(out, e)
+	}
+	return append(out, "IS_SANDBOX=1")
 }
 
 // claudeEnvVars are the variables magpie sets for a Claude Code run, which
@@ -460,6 +497,10 @@ func (c claudeCLI) env(env []string, configDir string) []string {
 	names := claudeEnvVars
 	if configDir != "" {
 		names = append(slices.Clone(names), "CLAUDE_CONFIG_DIR/p")
+	}
+	if c.wsl.Root {
+		// asRoot's, for a distro whose user is root
+		names = append(slices.Clone(names), "IS_SANDBOX")
 	}
 	return c.wsl.Env(env, names...)
 }
@@ -483,6 +524,10 @@ func callbackBaseURL() string {
 	}
 	return "http://" + host + ":" + port
 }
+
+// claudeMCPPath is where the Claude subscription bridge's MCP helper hands
+// a tool call back: the path, then the run's callback token.
+const claudeMCPPath = "/_magpie/claude-mcp/"
 
 // from, when set, is the conversation's session a run let go past idleMost
 // saved (unshelve): Claude Code goes on with it, told only the messages
@@ -530,10 +575,18 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 		return nil, nil, err
 	}
 
+	// the token lets the helper's calls in without a gateway key
+	// (ownCallback), so it is handed over in a file of the run's own, which
+	// only this user reads, never on Claude Code's command line, which every
+	// user of the computer can list
 	token := randomToken()
-	callback := callbackBaseURL() + "/_magpie/claude-mcp/" + token
+	callbackPath := filepath.Join(tmp, "callback")
+	if err := os.WriteFile(callbackPath, []byte(callbackBaseURL()+claudeMCPPath+token), 0o600); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
 	mcpConfig, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{
-		"magpie": map[string]any{"command": exe, "args": []string{"claude-mcp-helper", callback, toolsPath}},
+		"magpie": map[string]any{"command": exe, "args": []string{"claude-mcp-helper", callbackPath, toolsPath}},
 	}})
 	args := claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
 	if req.ThinkOff {
@@ -589,7 +642,7 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	if len(req.Safeguards) > 0 {
 		env = append(env, "ANTHROPIC_BETAS="+req.SafeguardBeta)
 	}
-	cmd.Env = binary.env(env, configDir)
+	cmd.Env = binary.env(binary.asRoot(env), configDir)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cleanup()
@@ -624,6 +677,7 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	b.mu.Lock()
 	b.runs[token] = run
 	b.mu.Unlock()
+	addCallback(token)
 
 	run.outputs = []*os.File{stdout, stderr}
 	run.reading.Add(2)
@@ -920,7 +974,7 @@ func newLooseTurn(owner string, req *Request, msgs []Message, sealed bool) *loos
 		}
 	}
 	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00%t\x00%t\x00%s\x00%s\x00%t\x00%s\x00%d", owner, req.Model, req.Effort != "", req.ThinkOff, req.ToolChoice, req.System, req.WebSearch, req.Format.schema(), start)
+	fmt.Fprintf(h, "%s\x00%s\x00%t\x00%t\x00%s\x00%s\x00%t\x00%s\x00%d", owner, req.Model, req.Effort != "", req.ThinkOff, req.ToolChoice, withoutBillingHeader(req.System), req.WebSearch, req.Format.schema(), start)
 	hashMessages(h, msgs[:start], nil)
 	l := &looseTurn{key: hex.EncodeToString(h.Sum(nil)), runs: heardRuns(msgs[start:], sealed)}
 	words := messageWords(msgs)
@@ -1133,16 +1187,40 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 	r.bridge.mu.Lock()
 	r.loose = loose
 	r.bridge.mu.Unlock()
-	r.bridge.keepIdle(r, key, conv)
+	if !r.bridge.keepIdle(r, key, conv) {
+		return // it ended during its reply (#1667)
+	}
 	r.timer.Reset(idleLongest)
 }
 
 // keepIdle leaves run waiting for the turn after the conversation key
 // names, the longest waiting let go past idleMost; conv, when set, is that
-// conversation whatever the model (convKey).
-func (b *subscriptionBridge) keepIdle(r *subscriptionRun, key, conv string) {
+// conversation whatever the model (convKey). A run that has ended isn't
+// kept, and keepIdle says so: its 30-minute timer can end it during a
+// reply that still reaches the client whole (#1667), and kept, it held one
+// of idleMost places until pushed out, as removeRun, which takes it out,
+// had already been. finish says it ended before removeRun takes b.mu, so a
+// run kept here before then is taken out by it.
+func (b *subscriptionBridge) keepIdle(r *subscriptionRun, key, conv string) bool {
 	var drop []*subscriptionRun
 	b.mu.Lock()
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
+		b.mu.Unlock()
+		return false
+	}
+	// a run waits at one point of its conversation: kept again, it leaves
+	// the key it waited at, unless another run waits there now (#1596:
+	// which caller kept one run twice isn't known; ended and letGo of one
+	// request exclude each other through gone()). Left there, the same
+	// run under two keys was the oldest again after each pass below, which
+	// let go of one key only, so the loop never ended and drop grew with
+	// b.mu held (X, Sma1lboy: magpie at 158 GB after two days).
+	if r.idleKey != "" && r.idleKey != key && b.idle[r.idleKey] == r {
+		delete(b.idle, r.idleKey)
+	}
 	if old := b.idle[key]; old != nil && old != r {
 		drop = append(drop, old)
 	}
@@ -1152,21 +1230,28 @@ func (b *subscriptionBridge) keepIdle(r *subscriptionRun, key, conv string) {
 		r.convKey = conv
 	}
 	for len(b.idle) > idleMost {
+		var oldKey string
 		var oldest *subscriptionRun
-		for _, run := range b.idle {
+		for k, run := range b.idle {
 			if oldest == nil || run.idleAt.Before(oldest.idleAt) {
-				oldest = run
+				oldKey, oldest = k, run
 			}
 		}
 		b.shelve(oldest)
-		delete(b.idle, oldest.idleKey)
-		oldest.idleKey = ""
-		drop = append(drop, oldest)
+		// the key found, not the run's own: each pass takes one entry out
+		delete(b.idle, oldKey)
+		if oldest.idleKey == oldKey {
+			oldest.idleKey = ""
+		}
+		if !slices.Contains(drop, oldest) {
+			drop = append(drop, oldest)
+		}
 	}
 	b.mu.Unlock()
 	for _, run := range drop {
 		run.abort()
 	}
+	return true
 }
 
 // shelfMost is how many saved sessions the shelf keeps, the longest
@@ -1463,7 +1548,9 @@ func (r *subscriptionRun) letGo() {
 	// stops (an interrupted result) is read past
 	r.endSegment()
 	// found at once by a resend, which waits for the rewind (resume)
-	r.bridge.keepIdle(r, back, "")
+	if !r.bridge.keepIdle(r, back, "") {
+		return // it ended since (#1667): there is nothing to take back
+	}
 	if err := r.rewind(turn); err != nil {
 		log.Printf("claude: a turn the client gave up on could not be taken back, its run let go: %v", err)
 		r.abort()
@@ -1594,10 +1681,14 @@ func (r *subscriptionRun) park() {
 // turned thinking off, which its Claude Code was started with): a
 // run is told another level as its turn starts (setEffort), where one
 // started anew would write the whole conversation to the cache again (#502).
+// Nor is the client's billing line, which renderClaudePrompt leaves out of
+// what a run is told: its Claude Code changes fields in it every turn (cch,
+// cc_prompt_id, cc_prev_req…), and with them in the key no turn found the
+// run it went on from, so each started one anew (#1638).
 func turnKey(owner string, req *Request, msgs []Message) string {
 	h := sha256.New()
 	tools, _ := json.Marshal(req.Tools)
-	fmt.Fprintf(h, "%s\x00%s\x00%t\x00%t\x00%s\x00%s\x00%s\x00%t\x00%s", owner, req.Model, req.Effort != "", req.ThinkOff, req.ToolChoice, req.System, tools, req.WebSearch, req.Format.schema())
+	fmt.Fprintf(h, "%s\x00%s\x00%t\x00%t\x00%s\x00%s\x00%s\x00%t\x00%s", owner, req.Model, req.Effort != "", req.ThinkOff, req.ToolChoice, withoutBillingHeader(req.System), tools, req.WebSearch, req.Format.schema())
 	hashMessages(h, msgs, nil)
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -2105,11 +2196,23 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				unstreamed, blocks = whole.ID, 0
 			}
 			unstreamedStop = whole.StopReason
-			for _, c := range whole.Content {
+			var raws struct {
+				Content []json.RawMessage `json:"content"`
+			}
+			for i, c := range whole.Content {
 				index := blocks
 				blocks++
 				switch c.Type {
+				case "redacted_thinking":
+					// sealed whole, as Anthropic wrote it (#1445)
+					if raws.Content == nil {
+						_ = json.Unmarshal(envelope.Message, &raws)
+					}
+					if i < len(raws.Content) {
+						r.emit(Event{Kind: KSealed, Name: sealAnthropic, Text: string(raws.Content[i])})
+					}
 				case "thinking":
+					r.emit(Event{Kind: KThinkStart})
 					if c.Thinking != "" {
 						r.emit(Event{Kind: KThink, Text: c.Thinking})
 					}
@@ -2173,6 +2276,18 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				}
 			case "text":
 				text(e.ContentBlock.Text)
+			case "thinking":
+				// a block of its own, signed with no text or not (#1445)
+				r.emit(Event{Kind: KThinkStart})
+			case "redacted_thinking":
+				var raw struct {
+					Event struct {
+						Block json.RawMessage `json:"content_block"`
+					} `json:"event"`
+				}
+				if json.Unmarshal(b, &raw) == nil && len(raw.Event.Block) > 0 {
+					r.emit(Event{Kind: KSealed, Name: sealAnthropic, Text: string(raw.Event.Block)})
+				}
 			}
 		case "content_block_delta":
 			switch e.Delta.Type {
@@ -3096,6 +3211,7 @@ func (b *subscriptionBridge) abortAll() {
 }
 
 func (b *subscriptionBridge) removeRun(run *subscriptionRun) {
+	dropCallback(run.token)
 	b.mu.Lock()
 	delete(b.runs, run.token)
 	if run.idleKey != "" && b.idle[run.idleKey] == run {

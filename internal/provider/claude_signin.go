@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/claudecode"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/wslrun"
@@ -141,7 +142,7 @@ func (c claudeCLI) env(env []string) []string {
 func startClaudeSignIn(s *signInFlow) error {
 	cli, ok := findClaudeCLI()
 	if !ok {
-		return errors.New("install Claude Code first, the `claude` command line (the Claude desktop app is not it): magpie signs in to Claude through it")
+		return errors.New("install Claude Code first, the `claude` command line (the Claude desktop app is not it): magpie signs in to Claude through it; " + claudecode.InstallHint)
 	}
 	if err := os.MkdirAll(claudeDirsRoot(), 0o700); err != nil {
 		return err
@@ -159,7 +160,8 @@ func startClaudeSignIn(s *signInFlow) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := cli.command(ctx, "auth", "login", "--claudeai")
 	cmd.Dir = dir
-	cmd.Env = cli.env(netproxy.Env(env))
+	// through the proxy the account's requests will go through (#1663)
+	cmd.Env = cli.env(netproxy.EnvWith(s.proxy, env))
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -209,7 +211,7 @@ func startClaudeSignIn(s *signInFlow) error {
 			msg = tail[n-1]
 		}
 		if err == nil {
-			l, lerr := claudeSignedIn(cli, dir)
+			l, lerr := claudeSignedIn(cli, dir, s.proxy)
 			if lerr == nil {
 				var using bool
 				if using, lerr = addLogin(l); lerr == nil {
@@ -285,8 +287,8 @@ func isLoopback(host string) bool {
 
 // claudeSignedIn is the account `claude auth login` signed in to in config
 // directory dir, as magpie keeps it: the sign-in Claude Code kept, and who
-// it says that is.
-func claudeSignedIn(cli claudeCLI, dir string) (savedLogin, error) {
+// it says that is, asked through the sign-in's proxy.
+func claudeSignedIn(cli claudeCLI, dir, proxy string) (savedLogin, error) {
 	c, ok := readClaudeDir(dir)
 	if !ok {
 		return savedLogin{}, errors.New("Claude Code signed in, but kept no sign-in magpie can read")
@@ -295,7 +297,7 @@ func claudeSignedIn(cli claudeCLI, dir string) (savedLogin, error) {
 	defer cancel()
 	cmd := cli.probe(ctx, "auth", "status", "--json")
 	cmd.Dir = dir
-	cmd.Env = cli.env(claudeSignInEnv(os.Environ(), dir))
+	cmd.Env = cli.env(netproxy.EnvWith(proxy, claudeSignInEnv(os.Environ(), dir)))
 	b, _ := cmd.Output()
 	var status struct {
 		Email            string `json:"email"`

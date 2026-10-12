@@ -39,8 +39,25 @@ func (p Provider) Test(ctx context.Context) []Result {
 		return p.testDecide(ctx)
 	}
 	_, listErr := p.Fetch(ctx)
+	if client := testClient(ctx); client != "" {
+		// the one endpoint that agent's requests go to
+		proto := clientProto(client, p.Speaks())
+		q, ok := p.keyFor(proto)
+		model := p.testModel(q, proto)
+		if why := p.TestsAs(client); why != "" {
+			return []Result{{Protocol: proto, Model: model, Error: why}}
+		}
+		if !ok {
+			return []Result{{Protocol: proto, Model: model, Error: "no key is on for this endpoint"}}
+		}
+		url, body := tiny(q, proto, UpstreamName(p, model))
+		return []Result{probe(ctx, q, proto, url, q.tested(asClient(client, proto, body)), model, testWait)}
+	}
 	if p.isClaudeAccount() {
 		return []Result{p.testClaude(ctx, p.testModel(p, Anthropic))}
+	}
+	if p.testsTranslated() {
+		return []Result{p.testTranslated(ctx, p.testModel(p, CodeAssist))}
 	}
 	var out []Result
 	for _, proto := range p.Speaks() {
@@ -51,7 +68,7 @@ func (p Provider) Test(ctx context.Context) []Result {
 			continue
 		}
 		url, body := tiny(q, proto, UpstreamName(p, model))
-		out = append(out, probe(ctx, q, proto, url, q.Prepare([]byte(body)), model, testWait))
+		out = append(out, probe(ctx, q, proto, url, q.tested(body), model, testWait))
 	}
 	if p.IsRemoteMagpie() {
 		// The model list already checked its key and named its decisions.
@@ -110,7 +127,9 @@ func clineProbe(body string) string {
 // for them; "own-api" for a sign-in reached
 // through its agent's own API (Cursor, Devin, Kiro, Zed, Qoder, a Google
 // sign-in), which the gateway translates every request for, so a probe
-// has no endpoint to go to.
+// has no endpoint to go to. A Google sign-in's are asked through the
+// gateway's translator (testsTranslated). Vertex AI's generateContent is
+// asked as it is.
 func (p Provider) ModelTest() string {
 	if p.DecideOnly() {
 		if p.AsksDecideModels() {
@@ -118,7 +137,7 @@ func (p Provider) ModelTest() string {
 		}
 		return "decide"
 	}
-	if p.isClaudeAccount() {
+	if p.isClaudeAccount() || p.testsTranslated() || p.IsVertex() {
 		return ""
 	}
 	for _, pr := range p.Speaks() {
@@ -153,6 +172,9 @@ func tinyBody(q Provider, proto Protocol, model string) (url, body string) {
 	case Anthropic:
 		return q.Anthropic + "/v1/messages", fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, model)
 	case Gemini:
+		if q.IsVertex() {
+			return vertexTest(q, model)
+		}
 		if q.FactoryGemini() {
 			// Factory's generate route. droid sends no stream field.
 			return q.Base(Gemini) + "/generate", fmt.Sprintf(`{"model":%q,"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, model)
@@ -225,8 +247,15 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 		r.OK, r.Status = true, http.StatusOK
 		return r
 	}
+	client := testClient(ctx)
+	if why := p.TestsAs(client); why != "" {
+		return Result{Protocol: clientProto(client, p.Speaks()), Model: model, Error: why}
+	}
 	if p.isClaudeAccount() {
 		return p.testClaude(ctx, model)
+	}
+	if p.testsTranslated() {
+		return p.testTranslated(ctx, model)
 	}
 	var protos []Protocol
 	for _, pr := range p.Speaks() {
@@ -241,8 +270,11 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 	// Claude model, else the one it prefers; an image model draws on the
 	// chat endpoint's images API
 	proto := protos[0]
-	draws := p.drawsOnImages(model) && slices.Contains(protos, Chat)
-	if draws {
+	draws := client == "" && p.drawsOnImages(model) && slices.Contains(protos, Chat)
+	if client != "" {
+		// on the API that agent's requests go to (TestAs)
+		proto = clientProto(client, protos)
+	} else if draws {
 		proto = Chat
 	} else if apis := p.APIs(model); apis != nil {
 		if i := slices.IndexFunc(protos, func(pr Protocol) bool { return slices.Contains(apis, pr) }); i >= 0 {
@@ -280,14 +312,17 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 		r := probe(ctx, q, proto, url, []byte(body), model, drawWait)
 		if !r.OK && (r.Status == 404 || r.Status == 405) {
 			url, body := tiny(q, proto, model)
-			if c := probe(ctx, q, proto, url, q.Prepare([]byte(body)), model, testWait); c.OK {
+			if c := probe(ctx, q, proto, url, q.tested(body), model, testWait); c.OK {
 				return c
 			}
 		}
 		return r
 	}
 	url, body := tiny(q, proto, UpstreamName(p, model))
-	return probe(ctx, q, proto, url, q.Prepare([]byte(body)), model, testWait)
+	if client != "" {
+		body = asClient(client, proto, body)
+	}
+	return probe(ctx, q, proto, url, q.tested(body), model, testWait)
 }
 
 // keyFor is p using the first key on that works with proto: one made for
@@ -355,7 +390,8 @@ func isClaude(id string) bool {
 // Azure OpenAI takes a key in api-key alone: a Bearer there is an Entra ID
 // token, and the key sent as one is turned away.
 func AuthHeaders(p Provider, proto Protocol) map[string]string {
-	if p.Key == "" {
+	// Vertex AI's is the Google token Sign sets, which a key would replace
+	if p.Key == "" || p.IsVertex() {
 		return map[string]string{}
 	}
 	if p.IsAzure() {
@@ -404,6 +440,9 @@ func probe(ctx context.Context, p Provider, proto Protocol, url string, body []b
 	}
 	if p.IsKilo() {
 		KiloClient(req.Header, p.Key, "")
+	}
+	if client := testClient(ctx); client != "" {
+		clientHeaders(client, req.Header)
 	}
 	if err := p.Sign(ctx, req, proto, body); err != nil {
 		r.Error = err.Error()

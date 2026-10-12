@@ -142,7 +142,18 @@ func (v *claudeFiveVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"error":{"type":"invalid_request_error","message":`+msg+`},"type":"error"}`)
 	}
 	sonnet55 := strings.Contains(model, "sonnet-5-5") || strings.Contains(model, "sonnet-5.5") || strings.Contains(model, "s55")
+	haiku55 := strings.Contains(model, "haiku-5-5") || strings.Contains(model, "h55")
+	temp := gjson.GetBytes(b, "temperature")
 	switch {
+	case haiku55 && temp.Exists() && temp.Float() != 1:
+		refuse("\"`temperature` is deprecated for this model. (tid: 2026101003072022550024879833267)\"")
+		return
+	case haiku55 && gjson.GetBytes(b, "top_p").Exists():
+		refuse("\"`top_p` is deprecated for this model. (tid: 2026101003072327076516219357568)\"")
+		return
+	case haiku55 && gjson.GetBytes(b, "top_k").Exists():
+		refuse("\"`top_k` is deprecated for this model. (tid: 2026101003072467419049331484203)\"")
+		return
 	case sonnet55 && t == "disabled":
 		refuse(`"To turn thinking off on this model, send \"thinking\": {\"type\": \"between_tools\"} instead of {\"type\": \"disabled\"}. The model does not think before responding. The short updates it writes between tool calls come back as thinking blocks. (tid: 2026101002490321168731647902503)"`)
 		return
@@ -240,5 +251,93 @@ func TestBetweenToolsReadAsThinkingOff(t *testing.T) {
 		if !r.ThinkOff || r.Thinking || r.Effort != "" {
 			t.Errorf("%s: ThinkOff = %v, Thinking = %v, Effort = %q; want thinking off", typ, r.ThinkOff, r.Thinking, r.Effort)
 		}
+	}
+}
+
+// Claude Code's auto mode classifier asks at temperature 0, and Haiku 5.5
+// answers "`temperature` is deprecated for this model" (#1454). The models
+// Anthropic documents as refusing temperature, top_p and top_k are sent
+// none; every other request goes byte for byte as it came.
+func TestSamplingAsTheModelTakesIt(t *testing.T) {
+	sampled := `{"model":"%s","max_tokens":64,"temperature":0,"top_p":0.5,"top_k":5,"stop_sequences":["</block>"],"messages":[{"role":"user","content":"a <b> & c"}]}`
+	for _, m := range []string{"claude-haiku-5-5", "claude-haiku-5.5", "anthropic.claude-haiku-5-5-20261001-v1:0",
+		"claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-5-20260801", "claude-opus-5-5", "claude-opus-5",
+		"claude-opus-4-8", "claude-opus-4-7", "claude-fable-5-1", "claude-fable-5", "claude-mythos-5-1"} {
+		got := samplingAsTaken([]byte(strings.ReplaceAll(sampled, "%s", m)), "/v1/messages")
+		if hasSampling(got) {
+			t.Errorf("%s: sampling still sent: %s", m, got)
+		}
+		if gjson.GetBytes(got, "stop_sequences.0").String() != "</block>" || gjson.GetBytes(got, "max_tokens").Int() != 64 {
+			t.Errorf("%s: other fields changed: %s", m, got)
+		}
+	}
+	// Bedrock names the model in the path alone
+	body := `{"max_tokens":64,"temperature":0,"messages":[]}`
+	if got := samplingAsTaken([]byte(body), "/model/anthropic.claude-haiku-5-5-20261001-v1:0/invoke"); hasSampling(got) {
+		t.Errorf("Bedrock path: sampling still sent: %s", got)
+	}
+	for _, m := range []string{"claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-sonnet-4-5",
+		"claude-opus-4-6", "claude-opus-4-1", "claude-3-7-sonnet-latest", "claude-sonnet-6", "claude-haiku-6",
+		"deepseek-v4-pro", "glm-5.3", "kimi-k3", "gpt-6"} {
+		in := strings.ReplaceAll(sampled, "%s", m)
+		if got := samplingAsTaken([]byte(in), "/v1/messages"); string(got) != in {
+			t.Errorf("%s changed:\n got %s\nwant %s", m, got, in)
+		}
+	}
+	if in := `{"model":"claude-haiku-5-5","max_tokens":64,"messages":[]}`; string(samplingAsTaken([]byte(in), "/v1/messages")) != in {
+		t.Error("a body with no sampling changed")
+	}
+}
+
+// Haiku 5.5 on the wire: the classifier relayed, magpie's own classifier
+// built from chat at temperature 0, and a Haiku 5.5 by a name magpie can't
+// read, asked again without sampling, once. Haiku 4.5 keeps its
+// temperature.
+func TestHaikuFiveFiveSamplingOnTheWire(t *testing.T) {
+	fresh(t)
+	up := &claudeFiveVendor{}
+	srv := httptest.NewServer(up)
+	t.Cleanup(srv.Close)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Anthropic: srv.URL,
+		Models: []string{"claude-haiku-5-5", "claude-haiku-4-5", "h55"}}); err != nil {
+		t.Fatal(err)
+	}
+	classifier := `{"model":"relay/%s","max_tokens":64,"temperature":0,"stop_sequences":["</block>"],"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"<transcript>ls</transcript>"}]}`
+	for _, c := range []struct {
+		name, path, body string
+		calls            int
+		temperature      string // as sent, "" for none
+	}{
+		{"classifier to Haiku 5.5", "/v1/messages", strings.ReplaceAll(classifier, "%s", "claude-haiku-5-5"), 1, ""},
+		{"top_p and top_k to Haiku 5.5", "/v1/messages",
+			`{"model":"relay/claude-haiku-5-5","max_tokens":64,"top_p":0.9,"top_k":40,"messages":[{"role":"user","content":"hi"}]}`, 1, ""},
+		{"magpie's own classifier from chat", "/v1/chat/completions",
+			`{"model":"relay/claude-haiku-5-5","stream":false,"temperature":0,"max_tokens":2048,"messages":[{"role":"user","content":"which kind?"}]}`, 1, ""},
+		{"Haiku 4.5 keeps its temperature", "/v1/messages", strings.ReplaceAll(classifier, "%s", "claude-haiku-4-5"), 1, "0"},
+		{"a name magpie can't read is asked again", "/v1/messages", strings.ReplaceAll(classifier, "%s", "h55"), 2, ""},
+		// the same request from a Chat client is translated, where the
+		// name can't be read to leave the sampling out up front either
+		{"a name magpie can't read is asked again from chat", "/v1/chat/completions",
+			`{"model":"relay/h55","stream":false,"temperature":0,"max_tokens":2048,"messages":[{"role":"user","content":"which kind?"}]}`, 2, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			up.mu.Lock()
+			before := len(up.sent)
+			up.mu.Unlock()
+			code, body := post(t, c.path, c.body)
+			if code != 200 {
+				t.Fatalf("status %d: %s", code, body)
+			}
+			up.mu.Lock()
+			calls := len(up.sent) - before
+			up.mu.Unlock()
+			if calls != c.calls {
+				t.Errorf("%d calls upstream, want %d", calls, c.calls)
+			}
+			got := up.last()
+			if tp := gjson.Get(got, "temperature").Raw; tp != c.temperature {
+				t.Errorf("temperature = %s, want %q: %s", tp, c.temperature, got)
+			}
+		})
 	}
 }

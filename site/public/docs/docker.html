@@ -134,6 +134,12 @@ docker logs magpie</pre>
       <pre id="ex-signin">docker exec -it magpie magpie accounts add codex</pre>
     </div>
     <p>Open the link it prints, sign in, then paste the address the browser ended on. The browser UI can also import sign-ins from a file.</p>
+    <p>A Claude subscription is signed in to and answered through Claude Code, which the image doesn’t have. Have magpie download Anthropic’s own build first: it says the version, where it comes from and where it goes, asks, and checks the download’s SHA-256 against Anthropic’s manifest. It is kept in <code>/config/cache</code>; run it again for a newer one. <code>magpie accounts add claude</code> offers it too when Claude Code is missing.</p>
+    <div class="code">
+      <span class="lang">Shell</span>
+      <button class="copy" data-copy="ex-claude-code">Copy</button>
+      <pre id="ex-claude-code">docker exec -it magpie magpie claude-code install</pre>
+    </div>
 
     <h2 id="volume"><a class="anchor" href="#volume">What is kept</a></h2>
     <p>Everything magpie writes is under <code>/config</code>, so a restart, or a new container on the same volume, keeps your providers, keys, sign-ins and plugins.</p>
@@ -141,7 +147,7 @@ docker logs magpie</pre>
       <tr><th>Path</th><th>Holds</th></tr>
       <tr><td><code>/config/magpie</code></td><td>magpie’s own files: <code>settings.json</code>, providers, gateway keys, routing groups</td></tr>
       <tr><td><code>/config/home</code></td><td>the container’s <code>HOME</code>: sign-ins kept where their agent keeps them (<code>~/.codex</code>, <code>~/.claude</code>…)</td></tr>
-      <tr><td><code>/config/cache</code></td><td>the model catalog, and Bun, which plugins run on (downloaded the first time one is used)</td></tr>
+      <tr><td><code>/config/cache</code></td><td>the model catalog, Bun, which plugins run on (downloaded the first time one is used), and the Claude Code <code>magpie claude-code install</code> downloaded</td></tr>
       <tr><td><code>/config/data</code>, <code>/config/state</code></td><td>the rest of what magpie keeps</td></tr>
     </table></div>
     <p>A volume made by an older image keeps working: magpie adds the folders it lacks when it starts. Only sign-ins made with that older image, which lived outside the volume, have to be made again.</p>
@@ -157,7 +163,7 @@ docker logs magpie</pre>
 
     <h2 id="share"><a class="anchor" href="#share">Gateway keys and other machines</a></h2>
     <ol class="steps">
-      <li><b>Make a key for each client</b><span class="ui">Gateway</span> → <span class="ui">Gateway keys</span>, or in a terminal <code>docker exec magpie magpie gateway-key add "Laptop"</code>, which prints the new <code>sk-magpie-key-…</code>. Every request from outside the container, the host’s own included, must carry an enabled gateway key, and one without gets 401. A key can have its own daily, weekly or monthly limit and its own list of models (<code>magpie gateway-key limit</code>, <code>magpie gateway-key models</code>).</li>
+      <li><b>Make a key for each client</b><span class="ui">Gateway</span> → <span class="ui">Gateway keys</span>, or in a terminal <code>docker exec magpie magpie gateway-key add "Laptop"</code>, which prints the new <code>sk-magpie-key-…</code>. Every request from outside the container, the host’s own included, must carry an enabled gateway key, and one without gets 401. A key can have its own daily, weekly, monthly or every-N-days limit and its own list of models (<code>magpie gateway-key limit</code>, <code>magpie gateway-key models</code>).</li>
       <li><b>Publish the port</b>Recreate the container with <code>-p 3425:3425</code>, or bound to the NAS’s LAN or VPN address (<code>-p 192.168.1.20:3425:3425</code>), and with <code>-e MAGPIE_PUBLIC_URL=http://192.168.1.20:3425</code>.</li>
     </ol>
     <p>On each other computer, point the agent at the gateway with one of those keys as its API key: <code>http://192.168.1.20:3425/v1</code> for an OpenAI client, <code>http://192.168.1.20:3425</code> for an Anthropic or Gemini one. Model ids are <code>provider/model</code>, or a routing group’s; <code>GET /v1/models</code> lists them. If that computer runs magpie itself, add the container as a <a href="/docs/remote">Remote magpie</a> instead, and magpie wires its agents for you.</p>

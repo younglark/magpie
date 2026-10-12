@@ -134,6 +134,12 @@ docker logs magpie</pre>
       <pre id="ex-signin">docker exec -it magpie magpie accounts add codex</pre>
     </div>
     <p>打开它打印的链接并登录，再把浏览器最后停在的地址粘贴回去。Web 界面也能从文件导入登录。</p>
+    <p>Claude 订阅的登录和请求都经过 Claude Code，而镜像里没有它。先让 magpie 下载 Anthropic 官方的构建：它会说明版本、下载来源和保存位置，问过你再下载，并用 Anthropic 清单里的 SHA-256 校验。它保存在 <code>/config/cache</code> 里；再运行一次可以更新到新版本。缺少 Claude Code 时，<code>magpie accounts add claude</code> 也会提出下载。</p>
+    <div class="code">
+      <span class="lang">Shell</span>
+      <button class="copy" data-copy="ex-claude-code">复制</button>
+      <pre id="ex-claude-code">docker exec -it magpie magpie claude-code install</pre>
+    </div>
 
     <h2 id="volume"><a class="anchor" href="#volume">保存了什么</a></h2>
     <p>magpie 写的所有东西都在 <code>/config</code> 下，所以重启、或者在同一个数据卷上新建容器，供应商、密钥、登录和插件都还在。</p>
@@ -141,7 +147,7 @@ docker logs magpie</pre>
       <tr><th>路径</th><th>内容</th></tr>
       <tr><td><code>/config/magpie</code></td><td>magpie 自己的文件：<code>settings.json</code>、供应商、网关密钥、路由组</td></tr>
       <tr><td><code>/config/home</code></td><td>容器的 <code>HOME</code>：登录保存在对应 Agent 保存的位置（<code>~/.codex</code>、<code>~/.claude</code>……）</td></tr>
-      <tr><td><code>/config/cache</code></td><td>模型目录，以及插件运行用的 Bun（第一次用插件时下载）</td></tr>
+      <tr><td><code>/config/cache</code></td><td>模型目录、插件运行用的 Bun（第一次用插件时下载），以及 <code>magpie claude-code install</code> 下载的 Claude Code</td></tr>
       <tr><td><code>/config/data</code>、<code>/config/state</code></td><td>magpie 保存的其他内容</td></tr>
     </table></div>
     <p>旧镜像创建的数据卷照样能用：magpie 启动时会补上缺的目录。只有用旧镜像做的登录（当时存在数据卷之外）需要重新登录。</p>
@@ -157,7 +163,7 @@ docker logs magpie</pre>
 
     <h2 id="share"><a class="anchor" href="#share">网关密钥与其他机器</a></h2>
     <ol class="steps">
-      <li><b>给每个客户端生成一个密钥</b><span class="ui">网关</span> → <span class="ui">网关密钥</span>，或在终端里 <code>docker exec magpie magpie gateway-key add "Laptop"</code>，它会打印新的 <code>sk-magpie-key-…</code>。容器外的每个请求（包括宿主机自己的）都必须带一个启用的网关密钥，不带的返回 401。每个密钥可以有自己的每日、每周或每月上限和可用模型（<code>magpie gateway-key limit</code>、<code>magpie gateway-key models</code>）。</li>
+      <li><b>给每个客户端生成一个密钥</b><span class="ui">网关</span> → <span class="ui">网关密钥</span>，或在终端里 <code>docker exec magpie magpie gateway-key add "Laptop"</code>，它会打印新的 <code>sk-magpie-key-…</code>。容器外的每个请求（包括宿主机自己的）都必须带一个启用的网关密钥，不带的返回 401。每个密钥可以有自己的每日、每周、每月或每 N 天的上限和可用模型（<code>magpie gateway-key limit</code>、<code>magpie gateway-key models</code>）。</li>
       <li><b>发布端口</b>用 <code>-p 3425:3425</code>（或绑定到 NAS 的局域网或 VPN 地址，<code>-p 192.168.1.20:3425:3425</code>）并加上 <code>-e MAGPIE_PUBLIC_URL=http://192.168.1.20:3425</code> 重新创建容器。</li>
     </ol>
     <p>在其他电脑上，把 Agent 指向这个网关，用其中一个密钥作为 API key：OpenAI 客户端用 <code>http://192.168.1.20:3425/v1</code>，Anthropic 或 Gemini 客户端用 <code>http://192.168.1.20:3425</code>。模型 id 是 <code>provider/model</code> 或路由组的名字，<code>GET /v1/models</code> 会列出它们。如果那台电脑自己也运行 magpie，就把容器添加为<a href="/docs/zh/remote">远程 magpie</a>，由 magpie 替你配置 Agent。</p>

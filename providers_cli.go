@@ -1,11 +1,13 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,7 +32,7 @@ const providerUsage = `usage:
   magpie provider add <preset> <key>      add a preset vendor   e.g. magpie provider add deepseek sk-…
                                           again, it adds another (deepseek-2); k=v pairs too: id, name, header.X-Foo
   magpie provider add <name> k=v…         add a custom vendor   k: url, anthropic, responses, gemini, decide, key, models, catalog, icon, header.X-Foo, balance, balance.path, balance.token, models.url, search,
-                                          access.key, access.secret (a Volcengine account's access key, for its plan's windows)
+                                          access.key, access.secret (a Volcengine access key, or a Tencent Cloud SecretId and SecretKey, for its plan's windows)
   magpie provider set <id> k=v…           change a provider's settings, with the same k=v pairs as add
   magpie provider key <id> <key>          change the API key
   magpie provider icon <id> <file|name>   give a custom provider a picture (PNG, JPEG, SVG…) or a built-in icon
@@ -56,7 +58,9 @@ const providerUsage = `usage:
                                           one more waits for room, up to 2 minutes, then is turned away with a 429
   magpie provider listed <id> yes|no      no: its models serve only through routing groups, not in the list
   magpie provider off|on <id>             switch it off (kept, but no agent or request uses it), or on again
-  magpie provider test <id> [model…]      send a tiny request through each endpoint, or to each model
+  magpie provider test <id> [--as codex|claude-code] [model…]
+                                          send a tiny request through each endpoint, or to each model;
+                                          --as asks it as that agent does, for a relay that serves only it
   magpie provider rm <id>                 remove a provider
 
   e.g. magpie provider add "My Relay" url=https://relay.example.com/v1 key=sk-…
@@ -66,6 +70,14 @@ const providerUsage = `usage:
                                    (another computer's magpie, shared on its network: its models and routing
                                     groups as office/…, each request sent on in the API the agent spoke)
        magpie provider add bailian-decision sk-… workspace=<workspace id>   (or region=ap-southeast-1, or region=token-plan with an sk-sp- key)
+       magpie provider add bailian-token-plan sk-sp-…   (Bailian's Token Plan: its chat models, and its decision model for routing groups;
+                                    qwen-token-plan is the Qwen AI platform's, qwen-decision its pay-as-you-go decision model)
+       magpie provider add google-vertex project=my-project impersonate=vertex@my-project.iam.gserviceaccount.com
+                                   (Google Vertex AI in your Google Cloud project, with no key: signed with gcloud's
+                                    Application Default Credentials (gcloud auth application-default login) unless
+                                    credentials=<file> names another, a service account key too; impersonate= needs
+                                    roles/iam.serviceAccountTokenCreator on that account; location= global (the
+                                    default), us, eu or a region such as us-central1; set changes them, empty clears)
        magpie provider add "My Decider" decide=https://decide.example.com/v1 key=sk-… models=my-decision-model
                                    (a System One API, POST …/systemone: it routes groups, its models are never an agent's)
        magpie provider add anthropic sk-… id=anthropic-ws2 name="Anthropic WS2" header.anthropic-workspace-id=wrkspc_…
@@ -117,6 +129,18 @@ func providers() error {
 			r.key = faint.Render("○ switched off")
 		case p.Account != nil:
 			r.key = green.Render("●") + " " + muted.Render("signed in as "+p.Account.User)
+		case p.IsVertex() && !p.Ready():
+			// no project an address can be made of (providers.json edited
+			// by hand): nothing is asked, as the app's row says
+			r.key = amber.Render("○ needs a project")
+		case p.IsVertex():
+			// no key: a token minted from the user's Google credentials,
+			// traded for a service account's when it impersonates one
+			who := "Google credentials"
+			if p.Vertex != nil && p.Vertex.Impersonate != "" {
+				who += " as " + p.Vertex.Impersonate
+			}
+			r.key = green.Render("●") + " " + muted.Render(who)
 		case p.Key != "":
 			r.key = green.Render("●") + " " + muted.Render(provider.Mask(p.Key))
 		case p.Ready():
@@ -206,7 +230,7 @@ func presets() error {
 	for _, pr := range append(all, provider.Presets()...) {
 		if pr.Kind != kind {
 			kind = pr.Kind
-			fmt.Println(faint.Render("  " + map[provider.Kind]string{provider.KindPartner: "partners (sponsors)", provider.KindVendor: "vendors", provider.KindRelay: "relays", provider.KindLocal: "local"}[kind]))
+			fmt.Println(faint.Render("  " + map[provider.Kind]string{provider.KindPartner: "partners (sponsors)", provider.KindVendor: "vendors", provider.KindRelay: "relays", provider.KindLocal: "local", provider.KindRemote: "another computer's magpie"}[kind]))
 		}
 		name := bold.Render(pr.Name)
 		if pr.Sponsored && pr.Kind != provider.KindPartner {
@@ -215,6 +239,9 @@ func presets() error {
 		state := muted.Render("magpie provider add " + pr.ID + " <key>")
 		if pr.NoKey {
 			state = muted.Render("magpie provider add " + pr.ID)
+		}
+		if pr.ID == provider.VertexPreset {
+			state = muted.Render("magpie provider add " + pr.ID + " project=<project id>")
 		}
 		if have[pr.ID] {
 			state = green.Render("✓ added")
@@ -376,6 +403,9 @@ func providerCmd(args []string) error {
 		if err != nil {
 			return err
 		}
+		if p.IsVertex() {
+			return fmt.Errorf("%s is asked with your Google credentials, not an API key · magpie provider set %s credentials=<file> impersonate=<service account> changes them", p.Name, p.ID)
+		}
 		p.Key = rest[1]
 		if err := provider.Save(*p); err != nil {
 			return err
@@ -456,8 +486,19 @@ func providerCmd(args []string) error {
 		return nil
 	case "test":
 		// with models named, a request to each of them; else one per endpoint
+		// --as codex|claude-code, anywhere after test: asked as that agent asks
+		as := ""
+		for i := 0; i < len(rest); i++ {
+			if v, ok := strings.CutPrefix(rest[i], "--as="); ok {
+				as, rest = v, slices.Delete(slices.Clone(rest), i, i+1)
+				i--
+			} else if rest[i] == "--as" && i+1 < len(rest) {
+				as, rest = rest[i+1], slices.Delete(slices.Clone(rest), i, i+2)
+				i--
+			}
+		}
 		if len(rest) < 1 {
-			return fmt.Errorf("magpie provider test <id> [model…]")
+			return fmt.Errorf("magpie provider test <id> [--as codex|claude-code] [model…]")
 		}
 		p, err := provider.Find(rest[0])
 		if err != nil {
@@ -467,7 +508,7 @@ func providerCmd(args []string) error {
 		if models := rest[1:]; len(models) > 0 {
 			res, wait = func(ctx context.Context) []provider.Result { return p.TestModels(ctx, models) }, 90*time.Second
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), wait)
+		ctx, cancel := context.WithTimeout(provider.TestAs(context.Background(), as), wait)
 		defer cancel()
 		ok := true
 		for _, r := range res(ctx) {
@@ -603,6 +644,9 @@ func addProvider(rest []string) error {
 	if pr, err := provider.FromPreset(strings.ToLower(rest[0])); err == nil {
 		p = pr
 		if len(rest) > 1 && !strings.Contains(rest[1], "=") {
+			if p.IsVertex() {
+				return fmt.Errorf("%s is asked with your Google credentials, not an API key · magpie provider add %s project=<your Google Cloud project's id>", p.Name, p.ID)
+			}
 			p.Key = rest[1]
 			rest = rest[2:]
 		} else {
@@ -618,6 +662,10 @@ func addProvider(rest []string) error {
 	// adding a preset that is already here adds another of it (deepseek-2),
 	// for another key or another header, rather than replacing the first
 	id, err := provider.Add(p)
+	if err != nil && p.IsVertex() && (p.Vertex == nil || strings.TrimSpace(p.Vertex.Project) == "") {
+		// the pair that gives the project, which Save's words don't name
+		return fmt.Errorf("%w · magpie provider add %s project=<your Google Cloud project's id>", err, p.Preset)
+	}
 	if err != nil {
 		return err
 	}
@@ -706,6 +754,25 @@ func showProvider(p provider.Provider) error {
 			}
 		}
 		kv("account", who+muted.Render("  from "+from))
+	case p.IsVertex():
+		// no key: where its requests go, and the Google credentials that
+		// sign them
+		v := provider.Vertex{}
+		if p.Vertex != nil {
+			v = *p.Vertex
+		}
+		project := v.Project
+		if !p.Ready() {
+			project = amber.Render(cmp.Or(project, "not set")) + muted.Render("  magpie provider set "+p.ID+" project=…")
+		}
+		kv("project", project)
+		kv("location", v.Location)
+		creds := v.Credentials
+		if creds == "" {
+			creds = "gcloud's Application Default Credentials" + muted.Render("  gcloud auth application-default login")
+		}
+		kv("signs with", creds)
+		kv("as", v.Impersonate)
 	case p.Key != "":
 		kv("key", muted.Render(provider.Mask(p.Key)))
 	case p.Ready():
@@ -769,6 +836,12 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 		if !ok {
 			return fmt.Errorf("expected key=value, got %q\n\n%s", kv, providerUsage)
 		}
+		if p.IsVertex() && slices.Contains([]string{"url", "chat", "openai", "responses", "anthropic", "decide"}, strings.ToLower(k)) {
+			// asked only at the address its project and location make, so
+			// that its Google token goes nowhere else: one given here would
+			// be dropped without a word
+			return fmt.Errorf("%s is asked at its Google Cloud project's own address: project= and location= say where", p.Name)
+		}
 		switch strings.ToLower(k) {
 		case "id":
 			p.ID = v
@@ -790,8 +863,41 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			p.Decide = v
 		case "workspace":
 			workspace = strings.TrimSpace(v)
+		case "project", "location", "credentials", "impersonate":
+			// Google Vertex AI's project and location, and the Google
+			// credentials that sign its requests in place of a key; empty
+			// clears one, and location= is global again
+			if !p.IsVertex() {
+				return fmt.Errorf("%s= is Google Vertex AI's, and %s isn't Vertex AI", strings.ToLower(k), p.Name)
+			}
+			x := provider.Vertex{}
+			if p.Vertex != nil {
+				x = *p.Vertex
+			}
+			switch v = strings.TrimSpace(v); strings.ToLower(k) {
+			case "project":
+				x.Project = v
+			case "location":
+				x.Location = v
+			case "credentials":
+				// a file named from where the command runs: the gateway,
+				// which runs nowhere in particular, needs its full path
+				if v != "" && !filepath.IsAbs(v) && !strings.HasPrefix(v, "~") {
+					if abs, err := filepath.Abs(v); err == nil {
+						v = abs
+					}
+				}
+				x.Credentials = v
+			default:
+				x.Impersonate = v
+			}
+			p.Vertex = &x
 		case "region", "plan":
 			pr := provider.Preset(p.Preset)
+			if p.IsVertex() {
+				// what Google Cloud calls a region is Vertex AI's location
+				return fmt.Errorf("%s has no regions or plans to pick: location= says where it is asked (global, us, eu or a region such as us-central1)", p.Name)
+			}
 			if pr == nil || len(pr.Regions) == 0 {
 				return fmt.Errorf("%s has no regions or plans to pick", p.Name)
 			}
@@ -826,7 +932,8 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			p.BalanceToken = v
 		case "access.key":
 			// a Volcengine account's access key, which Ark tells its
-			// Coding or Agent Plan's windows to (#1427)
+			// Coding or Agent Plan's windows to (#1427), or a Tencent Cloud
+			// SecretId, which TokenHub tells Token Plan 企业版's usage to (#1574)
 			p.AccessKeyID = v
 		case "access.secret":
 			p.SecretAccessKey = v
