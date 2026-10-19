@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
@@ -19,8 +20,55 @@ import (
 // on Discord) keeps that address and its key, as ZCode's and WorkBuddy's
 // writers do on their own (zcodeAddress). Without it, every start and
 // update of magpie (SyncCatalog) put the agent back on 127.0.0.1.
+//
+// What the filter (kept.away) needs of this magpie (the gateway's address, the LAN key)
+// is read here, before the filter is on, never by the filter: every file
+// written through edit while it is on passes through it, on whichever
+// goroutine and under whichever lock wrote it. settings.Save, the window's
+// size kept after a resize, writes under the lock settings.Load takes, and
+// a filter reading the settings waited on it for good (ylorn on Discord).
 func synced(sync func() error) error {
-	return edit.Filtered(keptAway, sync)
+	return edit.Filtered(keeping().away, sync)
+}
+
+// kept is what kept.away knows of this magpie, read before a sync's writes:
+// the gateway's address (gateway.URL) and the LAN sharing key.
+type kept struct{ gateway, lan string }
+
+func keeping() kept { return kept{gateway.URL(), access.LANSecret()} }
+
+// ours says v, with any "Bearer " before it, is a key magpie gives an
+// agent: gateway.Token, one that names the agent (gateway.TokenFor), or the
+// LAN sharing key (ourKey's, as read before).
+func (k kept) ours(v string) bool {
+	v = strings.TrimPrefix(v, "Bearer ")
+	return v == gateway.Token || v != "" && v == k.lan || strings.HasPrefix(v, gateway.Token+"-")
+}
+
+// magpieFile says path, a file edit is about to write (a link's target,
+// edit.Target), is in magpie's own folder, as it is named or where its
+// links lead: with ~/.config a link into a dotfiles repo, settings.json is
+// written at the repo's path (ylorn on Discord). A file not there yet has
+// its folder's links followed.
+func magpieFile(path string) bool {
+	sep := string(filepath.Separator)
+	dir := filepath.Dir(provider.Path())
+	dirs := []string{dir}
+	if r, err := filepath.EvalSymlinks(dir); err == nil && r != dir {
+		dirs = append(dirs, r)
+	}
+	paths := []string{path}
+	if r, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		paths = append(paths, filepath.Join(r, filepath.Base(path)))
+	}
+	for _, d := range dirs {
+		for _, p := range paths {
+			if strings.HasPrefix(p, d+sep) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // originRE is an http(s) URL's scheme and host, as it is written in a file.
@@ -38,14 +86,6 @@ var keyLineRE = regexp.MustCompile(`(["']?)([A-Za-z0-9_\-]+)(["']?)[ \t]*[:=][ \
 func keyName(name string) bool {
 	n := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(name))
 	return n == "key" || strings.HasSuffix(n, "apikey") || strings.HasSuffix(n, "token") || strings.HasSuffix(n, "authorization")
-}
-
-// ourToken says v, with any "Bearer " before it, is a key magpie gives an
-// agent: gateway.Token, one that names the agent (gateway.TokenFor), or the
-// LAN sharing key.
-func ourToken(v string) bool {
-	v = strings.TrimPrefix(v, "Bearer ")
-	return ourKey(v) || strings.HasPrefix(v, gateway.Token+"-")
 }
 
 type keyValue struct {
@@ -71,34 +111,41 @@ func keyValues(b []byte) []keyValue {
 	return out
 }
 
-// keptAway is data, a sync's write of the file at path, with magpie kept
+// away is data, a sync's write of the file at path, with magpie kept
 // where the file had it on another machine. That is a file without the
 // gateway's own address (gateway.URL), with an address on another machine
 // and none a WSL distro was seen at (a distro's way to Windows is magpie's
 // to move, wslMovedFrom). Where the write brings the gateway's address in
 // place of one on another machine, that one stays; where it brings magpie's
 // own key in place of another, in a file that had none of magpie's keys,
-// the other stays. An address on this machine's loopback (another port,
-// localhost) is magpie's own and follows the gateway; with more than one
+// the other stays, with the path every URL there had before magpie's (a
+// reverse proxy's /magpie). An address on this machine's loopback
+// (another port, localhost) is magpie's own and follows the gateway, but
+// for a local proxy's route, one with a path of its own where nothing but
+// magpie has answered (#1985); with more than one
 // address or key gone, which went where can't be told, and the write is
-// left as it is. magpie's own files are never the user's pointing.
-func keptAway(path string, data []byte) []byte {
-	if strings.HasPrefix(path, filepath.Dir(provider.Path())+string(filepath.Separator)) {
+// left as it is. magpie's own files are never the user's pointing
+// (magpieFile). It takes no lock a writer may hold: k is read before.
+func (k kept) away(path string, data []byte) []byte {
+	if magpieFile(path) {
 		return data
 	}
-	g := gateway.URL()
+	g := k.gateway
 	was, err := edit.Read(path)
 	if err != nil || len(was) == 0 || bytes.Contains(was, []byte(g)) {
 		return data
 	}
-	elsewhere := false
+	elsewhere, local := false, false
 	for _, o := range originRE.FindAll(was, -1) {
 		if wslHost(string(o)) {
 			return data
 		}
 		elsewhere = elsewhere || onAnotherMachine(string(o))
 	}
-	if !elsewhere {
+	for _, u := range urlRE.FindAll(was, -1) {
+		local = local || loopbackWithPath(string(u))
+	}
+	if !elsewhere && !local {
 		return data
 	}
 	out := data
@@ -112,16 +159,27 @@ func keptAway(path string, data []byte) []byte {
 				away = s
 			}
 		}
+		p := awayPath(was, data, g, away)
+		// on this machine, a local proxy's route (#1985): one with a path
+		// of its own before magpie's, where magpie answers or hasn't been
+		// asked yet; without one it is magpie's own on an older port
 		if !onAnotherMachine(away) {
-			return data
+			if !loopbackWithPath(away + p) {
+				return data
+			}
+			if ok, known := magpieAt(away + p); known && !ok {
+				return data
+			}
 		}
-		out = replaceOrigin(data, g, away)
+		out = replaceOrigin(data, g, away+p)
+	} else if !elsewhere {
+		return data
 	}
 
 	// the key: the one that went with the address, in place of magpie's
 	theirs, before, after := "", keyCounts(was), keyCounts(out)
 	for v, n := range before {
-		if ourToken(v) {
+		if k.ours(v) {
 			return out
 		}
 		if after[v] < n {
@@ -137,7 +195,7 @@ func keptAway(path string, data []byte) []byte {
 	kvs := keyValues(out)
 	for i := len(kvs) - 1; i >= 0; i-- {
 		kv := kvs[i]
-		if !ourToken(kv.value) {
+		if !k.ours(kv.value) {
 			continue
 		}
 		v := theirs
@@ -147,6 +205,46 @@ func keptAway(path string, data []byte) []byte {
 		out = append(out[:kv.start:kv.start], append([]byte(v), out[kv.end:]...)...)
 	}
 	return out
+}
+
+// urlRE is an http(s) URL with its path, as it is written in a file.
+var urlRE = regexp.MustCompile(`https?://[^\s"'<>,{}\[\]\\]+`)
+
+// awayPath is the path before magpie's own that the address away keeps in
+// was, the file before a sync wrote data with the gateway's address g: the
+// /magpie of https://ai.corp.example/magpie/v1, a reverse proxy's (#1985),
+// where data has g/v1. It is the shortest that every one of was's URLs at
+// away starts with; "" when one is at away itself, or none fits.
+func awayPath(was, data []byte, g, away string) string {
+	var tails []string
+	for _, d := range urlRE.FindAll(data, -1) {
+		if t, ok := strings.CutPrefix(strings.TrimSuffix(string(d), "/"), g); ok {
+			tails = append(tails, t)
+		}
+	}
+	var ws []string
+	for _, w := range urlRE.FindAll(was, -1) {
+		if s := strings.TrimSuffix(string(w), "/"); s == away || strings.HasPrefix(s, away+"/") {
+			ws = append(ws, s)
+		}
+	}
+	best, found := "", false
+	for _, w := range ws {
+		for _, t := range tails {
+			p, ok := strings.CutSuffix(strings.TrimPrefix(w, away), t)
+			if !ok || found && len(p) >= len(best) {
+				continue
+			}
+			all := true
+			for _, o := range ws {
+				all = all && (o == away+p || strings.HasPrefix(o, away+p+"/"))
+			}
+			if all {
+				best, found = p, true
+			}
+		}
+	}
+	return best
 }
 
 // keyCounts are the values of the keys keyName takes in b, "Bearer " left

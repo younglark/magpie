@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tidwall/gjson"
+
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/testenv"
@@ -293,6 +295,81 @@ func TestAutoModeReviewOnlyForClaude(t *testing.T) {
 	}
 	if f.path != "/v1/messages/count_tokens" || strings.Contains(f.head.Get("anthropic-beta"), "dangerous-tool-use") {
 		t.Errorf("count_tokens to DeepSeek: %s %q", f.path, f.head.Get("anthropic-beta"))
+	}
+}
+
+// TestAutoModeReviewedRoutes: the models whose requests can carry auto
+// mode's review to Anthropic, the rule Claude Code's wiring turns the
+// review off by while none of them is behind magpie (1EFLOPS on X): the
+// Claude subscription, a Claude model under any vendor's spelling of it,
+// and Anthropic's own API. Codex, DeepSeek's Anthropic API and an
+// OpenAI-compatible relay's GPT are not.
+func TestAutoModeReviewedRoutes(t *testing.T) {
+	sub := provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}
+	codex := provider.Provider{ID: "codex", Account: &provider.Account{Agent: "codex", User: "u"}}
+	anthropic := provider.Provider{ID: "anthropic", Anthropic: "https://api.anthropic.com", Key: "k"}
+	relay := provider.Provider{ID: "or", Chat: "https://openrouter.ai/api/v1", Anthropic: "https://openrouter.ai/api", Key: "k"}
+	deepseek := provider.Provider{ID: "ds", Anthropic: "https://api.deepseek.com/anthropic", Key: "k"}
+	// another vendor's subscription or a plugin serves Claude models as
+	// its own service: Copilot turns the safeguards away (#1756), Kiro and
+	// Cursor translate the request, and none answers with a review
+	copilot := provider.Provider{ID: "copilot", Anthropic: "https://api.githubcopilot.com", Account: &provider.Account{Agent: "copilot", User: "u"}}
+	kiro := provider.Provider{ID: "kiro", Account: &provider.Account{Agent: "kiro", User: "u"}}
+	plugin := provider.Provider{ID: "x-plugin", Account: &provider.Account{Agent: "plugin", User: "u"}}
+	pluginOnAnthropic := provider.Provider{ID: "y-plugin", Anthropic: "https://api.anthropic.com", Account: &provider.Account{Agent: "plugin", User: "u"}}
+	for _, c := range []struct {
+		p     provider.Provider
+		model string
+		want  bool
+	}{
+		{sub, "claude-opus-4-8", true},
+		{sub, "", true},
+		{anthropic, "claude-sonnet-5", true},
+		{anthropic, "some-new-name", true},
+		{relay, "anthropic/claude-sonnet-5", true},
+		{relay, "us.anthropic.claude-opus-4-8-v1:0", true},
+		{relay, "claude-opus-4-8@20260101", true},
+		{codex, "gpt-6.1-sol", false},
+		{deepseek, "deepseek-v4", false},
+		{relay, "openai/gpt-6", false},
+		{relay, "claudette-7", false},
+		{copilot, "claude-sonnet-5", false},
+		{kiro, "claude-sonnet-5", false},
+		{plugin, "claude-opus-4-8", false},
+		{pluginOnAnthropic, "claude-opus-4-8", true},
+	} {
+		if got := AutoModeReviewed(c.p, c.model); got != c.want {
+			t.Errorf("%s/%s: %v, want %v", c.p.ID, c.model, got, c.want)
+		}
+	}
+}
+
+// Claude Code asks for the review on every auto-mode request. A Claude
+// model on another vendor's subscription (Copilot here, which answers the
+// safeguards with "Extra inputs are not permitted", #1756) is sent neither
+// the beta nor the safeguards, so it isn't refused and asked again; the
+// Claude subscription and Anthropic's API get both.
+func TestAutoModeReviewLeftOffOtherSubscriptions(t *testing.T) {
+	s := &Server{}
+	asked := []string{"dangerous-tool-use-2026-09-03", "interleaved-thinking-2025-05-14"} // as askedBetas splits them
+	body := []byte(`{"model":"claude-sonnet-5","safeguards":[{"type":"dangerous_tool_use"}],"messages":[]}`)
+	for _, c := range []struct {
+		p    provider.Provider
+		want bool
+	}{
+		{provider.Provider{ID: "copilot", Anthropic: "https://api.githubcopilot.com", Account: &provider.Account{Agent: "copilot", User: "u"}}, false},
+		{provider.Provider{ID: "claude", Account: &provider.Account{Agent: "claude", User: "u"}}, true},
+		{provider.Provider{ID: "anthropic", Anthropic: "https://api.anthropic.com", Key: "k"}, true},
+	} {
+		betas, out := s.serverReview(c.p, asked, body)
+		beta := slices.ContainsFunc(betas, isServerReviewBeta)
+		guards := gjson.GetBytes(out, "safeguards").Exists()
+		if beta != c.want || guards != c.want {
+			t.Errorf("%s: beta %v, safeguards %v, want %v", c.p.ID, beta, guards, c.want)
+		}
+		if !slices.Contains(betas, "interleaved-thinking-2025-05-14") {
+			t.Errorf("%s: another beta went too: %v", c.p.ID, betas)
+		}
 	}
 }
 
@@ -698,7 +775,7 @@ func TestClaudeBridgeSafeguardConcurrentHandoff(t *testing.T) {
 	}
 	blocked("a")
 	waiter := run.pending["a"]
-	segment, err := run.continueWith(results, nil)
+	segment, err := run.continueWith(results, "", nil)
 	if err != nil || (<-waiter).Content[0]["text"] != "A" {
 		t.Fatalf("first handoff: %v", err)
 	}

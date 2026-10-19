@@ -18,6 +18,11 @@
 // and it runs in moejs in magpie's own process, as gateway middleware
 // does: there is no Node here, so a package it imports is bundled into it.
 //
+// An agent whose model is picked in the agent itself (Raycast's own
+// picker, among the models connect writes) leaves model out: it is connect
+// only, a switch on the Agents page as an app whose one setting is magpie
+// as its provider is, and connect is called without a model (#2374).
+//
 // The agent export may also say where its agent reads what magpie's
 // Library gives (internal/library): an instructions file, an MCP file in
 // one of MCPFormats, and a skills folder; each is optional.
@@ -30,6 +35,8 @@
 package agentplug
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -256,6 +263,11 @@ func Compile(spec, file string) (*Agent, error) {
 			}
 		}
 	}
+	// connect only: with no model key, connect's keys are all magpie
+	// writes, so a module with neither would write nothing
+	if a.Desc.Model == "" && !a.has {
+		return nil, errors.New("agent.model names no key, and there is no connect to write the gateway: say one or both")
+	}
 	return a, nil
 }
 
@@ -266,9 +278,8 @@ func (d *Desc) check() error {
 		return fmt.Errorf("agent.id %q: lower-case letters, digits, '.', '_' and '-' only", d.ID)
 	case strings.TrimSpace(d.Config) == "":
 		return errors.New("agent.config names no file")
-	case strings.TrimSpace(d.Model) == "":
-		return errors.New("agent.model names no key")
 	}
+	d.Model = strings.TrimSpace(d.Model)
 	if d.Name == "" {
 		d.Name = d.ID
 	}
@@ -340,13 +351,44 @@ func (a *Agent) Connect(in map[string]any) (map[string]any, error) {
 	if !res.IsObject() {
 		return nil, errors.New("connect returned neither an object nor nothing")
 	}
-	g, err := a.rt.ToGo(res)
+	b, err := a.rt.AppendJSON(nil, res)
 	if err != nil {
 		return nil, err
 	}
-	out, ok := g.(map[string]any)
-	if !ok {
+	return keys(b)
+}
+
+// keys is connect's result, as JSON text, by key path. An object or array
+// stays its JSON text (a json.RawMessage), so its members are written in
+// the order the module gave them: a Go map would write them sorted, and an
+// agent shows Kilo's effort variants low, medium, high as high, low, medium
+// (#1890). A string, number, boolean or null is its Go value.
+func keys(b []byte) (map[string]any, error) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(b, &top); err != nil || top == nil {
 		return nil, errors.New("connect returned no object of keys")
+	}
+	out := make(map[string]any, len(top))
+	for k, raw := range top {
+		switch raw[0] {
+		case '{', '[':
+			out[k] = raw
+			continue
+		}
+		d := json.NewDecoder(bytes.NewReader(raw))
+		d.UseNumber()
+		var v any
+		if err := d.Decode(&v); err != nil {
+			return nil, fmt.Errorf("connect's %q: %w", k, err)
+		}
+		if n, ok := v.(json.Number); ok {
+			if i, err := n.Int64(); err == nil {
+				v = i
+			} else {
+				v, _ = n.Float64()
+			}
+		}
+		out[k] = v
 	}
 	return out, nil
 }

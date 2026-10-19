@@ -261,7 +261,7 @@ func reasonixIn(at place) *Agent {
 			}
 			currentState.AddedAccess = true
 		}
-		if token, _ := edit.GetEnvFile(env, reasonixKey); token != gwKey() {
+		if token, _ := edit.GetEnvFile(env, reasonixKey); !keyHolds(token, gwKey()) {
 			if err := edit.SetEnvFile(env, edit.KV{Path: reasonixKey, Value: gwKey()}); err != nil {
 				return err
 			}
@@ -297,7 +297,7 @@ func reasonixIn(at place) *Agent {
 	}
 
 	a := &Agent{
-		ID: "reasonix", Name: "Reasonix Studio", Icon: "reasonix-color", Aliases: []string{"reasonix-studio"},
+		ID: "reasonix", Name: "Reasonix Studio", Icon: "reasonix-color", Aliases: []string{"reasonix-studio"}, NoNames: true,
 		Bin: "reasonix", Dir: dir, Path: path, UA: []string{"reasonix"},
 		detect: func() bool { return reasonixDetected(at.home) },
 		Notice: func() string {
@@ -328,10 +328,10 @@ func reasonixIn(at place) *Agent {
 			if err := checkOwner(cfg, state); err != nil {
 				return err.Error()
 			}
-			if p.Kind != "openai" || p.BaseURL != at.v1() {
+			if p.Kind != "openai" || p.BaseURL != at.v1() && !reachesMagpie(p.BaseURL, at.v1()) {
 				return "Reasonix's magpie base_url or kind changed"
 			}
-			if token, _ := edit.GetEnvFile(env, reasonixKey); token != gwKey() {
+			if token, _ := edit.GetEnvFile(env, reasonixKey); !keyHolds(token, gwKey()) {
 				return "Reasonix's gateway credential changed"
 			}
 			if !slices.Contains(p.Models, ref) || cfg.Agent.Planner != nil && usesMagpie(*cfg.Agent.Planner) && !slices.Contains(p.Models, strings.TrimPrefix(*cfg.Agent.Planner, magpieID+"/")) {

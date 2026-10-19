@@ -76,7 +76,8 @@ func LoginUsage(ctx context.Context, agent string) map[string]SubscriptionQuota 
 // one taken from the cache is up to a minute old already, and Allowances
 // counts its own minute from then, not from when it asked (#1295).
 func loginUsageAt(ctx context.Context, agent string) (map[string]SubscriptionQuota, time.Time) {
-	if settings.AccountDiscoveryOff() {
+	// nor of a provider switched off or removed (leftAlone)
+	if settings.AccountDiscoveryOff() || leftAlone(agent) {
 		return nil, time.Time{}
 	}
 	asked := time.Now()
@@ -84,11 +85,6 @@ func loginUsageAt(ctx context.Context, agent string) (map[string]SubscriptionQuo
 		return out, asked
 	}
 	out := map[string]SubscriptionQuota{}
-	if agent == "grok" {
-		if _, ok := pluginOfAgent(agent); !ok {
-			return grokLoginUsage(ctx), asked
-		}
-	}
 	logins, ok := usageLogins(agent)
 	if !ok {
 		return out, asked
@@ -153,6 +149,18 @@ var noteHistoryWrite = noteQuotaHistory
 // allows, rather than asked for again — the vendors' endpoints are
 // rate limited, and two readings a moment apart told an account two ways.
 func loginReading(ctx context.Context, l Login) loginUsageEntry {
+	e := cachedLoginReading(ctx, l)
+	if l.Agent == "codex" {
+		// what magpie spent of its resets, as of now: a reading kept from
+		// before one was spent still says it was
+		used := ResetsUsed(l.User)
+		e.q.ResetsUsed, e.read.ResetsUsed = used, used
+	}
+	return e
+}
+
+// cachedLoginReading is loginReading as read or kept.
+func cachedLoginReading(ctx context.Context, l Login) loginUsageEntry {
 	key := l.Agent + "/" + strings.ToLower(l.User)
 	c := &loginUsageCache
 	// with allowances read only when asked, one nobody asked for is what
@@ -198,8 +206,8 @@ func loginReading(ctx context.Context, l Login) loginUsageEntry {
 		}
 		c.pending[key] = r
 		ctx, _ = quotaReading(ctx)
+		asked := claudeAskGeneration.Load()
 		go func() {
-			start := time.Now()
 			// read for all who wait for it: no one's ctx cuts it short, but
 			// it is bounded as the Usage page's refresh is
 			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subscriptionTimeout)
@@ -211,7 +219,7 @@ func loginReading(ctx context.Context, l Login) loginUsageEntry {
 			// (AskClaudeUsage), as SubscriptionUsage reads it: neither is kept
 			if c.pending[key] == r {
 				delete(c.pending, key)
-				if l.Agent != "claude" || claudeAsked.Load() <= start.UnixNano() {
+				if l.Agent != "claude" || claudeAskGeneration.Load() == asked {
 					if c.m == nil {
 						c.m = map[string]loginUsageEntry{}
 					}
@@ -228,7 +236,7 @@ func loginReading(ctx context.Context, l Login) loginUsageEntry {
 		return r.e
 	case <-ctx.Done():
 		// given up on: as a reading cut short would have said
-		return entry(keepLast(SubscriptionQuota{Provider: loginProvider(l), Plan: l.Plan, Windows: []QuotaWindow{}, Error: ctx.Err().Error()}, l.User))
+		return entry(keepReading(ctx, SubscriptionQuota{Provider: loginProvider(l), Plan: l.Plan, Windows: []QuotaWindow{}, Error: ctx.Err().Error()}, l.User))
 	}
 }
 
@@ -255,32 +263,10 @@ func builtinLogins(agent string) (logins []Login, ok bool) {
 		logins = Logins(agent)
 	case "copilot":
 		logins = copilotLoginList()
-	case "zcode":
-		logins = zcodeLoginList()
-	case "kiro":
-		logins = kiroLoginList()
-	case "workbuddy", WorkBuddyAIID:
-		logins = wbLoginList(wbSiteOf(agent))
-	case CommandCodePlanID:
-		logins = cmdLoginList()
-	case "qoder", QoderCNID:
-		logins = loginsOf(qoderLoginsOf(agent))
-	case "zed":
-		logins = zedLoginList()
-	case "devin":
-		logins = devinLoginList()
-	case "factory":
-		logins = factoryLoginList()
-	case MiMoID:
-		logins = mimoLoginList()
 	case ChatGPTAPIID:
 		logins = siwcLoginList()
 	case "gemini", "antigravity":
 		logins = googleLoginList(agent)
-	case "cursor": // one account, the one cursor-agent is signed in to
-		if user, plan, ok := cursorIdentity(); ok {
-			logins = []Login{{Agent: agent, User: user, Plan: plan, Active: true, On: true}}
-		}
 	default:
 		return nil, false
 	}
@@ -302,42 +288,13 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	if strings.HasPrefix(l.Agent, "plugin:") {
 		return pluginLoginQuota(ctx, l)
 	}
-	if l.Agent == "qoder" || l.Agent == QoderCNID {
-		return qoderLoginQuota(ctx, l)
-	}
-	if l.Agent == "zed" {
-		return zedLoginQuota(ctx, l)
-	}
-	if l.Agent == "devin" {
-		return devinLoginQuota(ctx, l)
-	}
-	if l.Agent == "factory" {
-		return factoryLoginQuota(ctx, l)
-	}
-	if l.Agent == MiMoID {
-		return mimoLoginQuota(ctx, l)
-	}
-	if l.Agent == "cursor" {
-		return cursorSubscriptionUsage(ctx, l.Plan)
-	}
 	if l.Agent == "gemini" || l.Agent == "antigravity" {
 		return googleLoginQuota(ctx, l)
-	}
-	if l.Agent == "zcode" {
-		return zcodeLoginQuota(ctx, l)
-	}
-	if l.Agent == "kiro" {
-		return kiroLoginQuota(ctx, l)
-	}
-	if w := wbSiteOf(l.Agent); w != nil {
-		return wbLoginQuota(ctx, w, l)
-	}
-	if l.Agent == CommandCodePlanID {
-		return cmdLoginQuota(ctx, l)
 	}
 	if l.Agent == "copilot" {
 		for _, c := range copilotLogins(copilotConfigDir()) {
 			if strings.EqualFold(c.User, l.User) {
+				orig := c.app
 				q := copilotSubscriptionUsage(ctx, c.app.Token, c.app.Host)
 				// an editor's stale token, the CLI signed in to the same
 				// account: read as the requests are sent (#1238)
@@ -348,7 +305,16 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 						q = copilotSubscriptionUsage(ctx, cli.Token, cli.Host)
 					}
 				}
+				// GitHub refused the token, with none in its place: the
+				// account is signed out (echo_ts on Discord)
+				if q.Error == http.StatusText(http.StatusUnauthorized) {
+					copilotRefuse(orig.Token, http.StatusUnauthorized)
+					copilotRefuse(c.app.Token, http.StatusUnauthorized)
+					copilotLapse(orig)
+					q.Error = copilotLapsedText
+				}
 				if q.Error == "" {
+					copilotUnlapse(orig)
 					refreshCopilotEntitlement(c.app, q.Plan, q.AccessSKU)
 				}
 				return q
@@ -374,7 +340,7 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	switch {
 	case l.Agent == "claude": // Claude Code reads its own (claudeWindows)
 	case l.Active:
-		tok, accountID, err = codexToken(ctx, codexAuthPath())
+		tok, accountID, err = codexToken(ctx, codexHome())
 	default:
 		tok, accountID, err = savedLoginToken(ctx, l.Agent, l.User)
 	}
@@ -405,7 +371,29 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 func CodexUsedUp(ctx context.Context) bool {
 	// read as LoginUsage has it, fetched at most once a minute: the agent
 	// package asks on every catalog sync
-	u := LoginUsage(ctx, "codex")
+	return codexReadingHeld(LoginUsage(ctx, "codex"))
+}
+
+// CodexUsedUpKnown is CodexUsedUp over what was read already, asking no
+// one and waiting for no one. False when nothing was read yet, which is
+// CodexUsedUp's own answer for an account it can't tell about.
+//
+// For a caller on a path that must not do I/O: agent.SyncCatalog runs
+// inside a write's own request (a routing group's Save), and the reading
+// there is one the vendor is asked for over the network — a save waited
+// 1.1s of the miss of its minute's cache. Nothing is lost by not asking:
+// KeepOnAnAccountWithRoom reads it every loginSwitchEvery and
+// noteCodexUsedUp tells the catalog when the answer changes, which is what
+// the sync is reacting to, and the Usage page and routing read it as the
+// user looks at them.
+func CodexUsedUpKnown() bool {
+	return codexReadingHeld(knownLoginUsage("codex"))
+}
+
+// codexReadingHeld is whether the reading u has the ChatGPT account Codex
+// is signed in to held by the Codex app. The held of one account's
+// reading, not codexHeld, which is what one vendor reply says.
+func codexReadingHeld(u map[string]SubscriptionQuota) bool {
 	for _, l := range Logins("codex") {
 		if q, ok := u[l.User]; l.Active && ok && q.Error == "" && q.Held {
 			return true
@@ -414,11 +402,40 @@ func CodexUsedUp(ctx context.Context) bool {
 	return false
 }
 
+// knownLoginUsage is LoginUsage over the readings already in hand, with
+// no reading asked for: an account not read yet is left out, which its
+// callers read as "not known".
+func knownLoginUsage(agent string) map[string]SubscriptionQuota {
+	logins, ok := usageLogins(agent)
+	if !ok {
+		return map[string]SubscriptionQuota{}
+	}
+	out := map[string]SubscriptionQuota{}
+	for _, l := range logins {
+		if e, ok := loginReadingKnown(l); ok {
+			out[l.User] = e.q
+		}
+	}
+	return out
+}
+
+// loginReadingKnown is what is known of l's allowance without asking:
+// loginReading's cache alone, and none of its reading. False when the
+// cache has nothing at all for the account.
+func loginReadingKnown(l Login) (loginUsageEntry, bool) {
+	key := l.Agent + "/" + strings.ToLower(l.User)
+	c := &loginUsageCache
+	c.Lock()
+	defer c.Unlock()
+	e, ok := c.m[key]
+	return e, ok
+}
+
 // codexLoginAuth is the auth.json of a ChatGPT account magpie knows: the
-// file Codex is signed in with, or the one kept for it.
+// sign-in Codex goes by (auth.json or its keychain item), or the one kept for it.
 func codexLoginAuth(l Login) []byte {
 	if l.Active {
-		b, _ := readAccountFile(codexAuthPath())
+		b, _, _ := readCodexLogin(codexHome(), false)
 		return b
 	}
 	loginsMu.Lock()

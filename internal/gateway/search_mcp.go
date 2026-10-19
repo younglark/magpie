@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/access"
-	"github.com/yetone/magpie/internal/budget"
 )
 
 // magpie's web search, the one a model that can't search is given
@@ -23,7 +22,7 @@ import (
 // POST. It is a gateway route like the others: this computer calls it with
 // any key, another one only while magpie is shared and with an enabled
 // gateway key (lanGuard), a gateway key's limit holds each search
-// (budget.Reserve), and a web page is turned away, as the MCP spec has a
+// (reserveFor), and a web page is turned away, as the MCP spec has a
 // server check Origin.
 
 // SearchMCPPath is where the web search MCP server is served. It has two
@@ -68,14 +67,14 @@ func serveMCP(w http.ResponseWriter, r *http.Request, what string, limit int64, 
 		http.Error(w, "POST JSON-RPC messages here (MCP Streamable HTTP)", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, limit))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	body, ok := readMCPBody(w, r, limit)
+	if !ok {
 		return
 	}
 	body = bytes.TrimSpace(body)
 	batch := len(body) > 0 && body[0] == '['
 	var msgs []mcpMessage
+	var err error
 	if batch {
 		err = json.Unmarshal(body, &msgs)
 	} else {
@@ -122,7 +121,7 @@ func (s *Server) searchMCPCall(r *http.Request, m mcpMessage) (any, map[string]a
 			"protocolVersion": mcpVersion(m),
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "magpie-web-search", "title": "Magpie Web Search", "version": Version},
-			"instructions":    "web_search searches the web with the search magpie gives its models: a provider that can search, or the search APIs set up in magpie (Settings → Models → Web search).",
+			"instructions":    "web_search searches the web with the search magpie gives its models: a provider that can search, or the search APIs set up in magpie (Settings → Models → Web search). web_fetch reads a page it found, by its URL.",
 		}, nil
 	case "ping":
 		return map[string]any{}, nil
@@ -134,21 +133,28 @@ func (s *Server) searchMCPCall(r *http.Request, m mcpMessage) (any, map[string]a
 			"description": t.Description,
 			"inputSchema": t.Schema,
 			"annotations": map[string]any{"readOnlyHint": true, "openWorldHint": true},
-		}}}, nil
+		}, fetchTool()}}, nil
 	case "tools/call":
 		var p struct {
 			Name      string `json:"name"`
 			Arguments struct {
 				Query string `json:"query"`
+				fetchArgs
 			} `json:"arguments"`
 		}
 		if err := json.Unmarshal(m.Params, &p); err != nil {
 			return nil, map[string]any{"code": -32602, "message": "invalid params: " + err.Error()}
 		}
-		if p.Name != searchMCPTool {
-			return nil, map[string]any{"code": -32602, "message": "unknown tool " + p.Name + ": this server has " + searchMCPTool}
+		var said string
+		var err error
+		switch p.Name {
+		case searchMCPTool:
+			said, err = s.searchMCPRun(r, strings.TrimSpace(p.Arguments.Query))
+		case fetchMCPTool:
+			said, err = s.fetchMCPRun(r, p.Arguments.fetchArgs)
+		default:
+			return nil, map[string]any{"code": -32602, "message": "unknown tool " + p.Name + ": this server has " + searchMCPTool + " and " + fetchMCPTool}
 		}
-		said, err := s.searchMCPRun(r, strings.TrimSpace(p.Arguments.Query))
 		if err != nil {
 			return toolResult(err.Error(), true), nil
 		}
@@ -185,9 +191,9 @@ func (s *Server) searchMCPRun(r *http.Request, query string) (string, error) {
 	if query == "" {
 		return "", searchMCPError("web_search needs a query")
 	}
-	release, refused := budget.Reserve(access.Caller(r.Context()), int64(len(query)), "", limitClock())
-	if refused != nil {
-		return "", refused
+	release, err := reserveFor(access.Caller(r.Context()), int64(len(query)), "", limitClock())
+	if err != nil {
+		return "", err
 	}
 	defer release()
 	ctx := context.WithValue(r.Context(), searchForKey{}, &CallFor{Agent: callerOf(r).agent, MCP: true})
@@ -202,5 +208,34 @@ func (s *Server) searchMCPRun(r *http.Request, query string) (string, error) {
 		}
 		return "", searchMCPError(msg)
 	}
-	return said, nil
+	// what was masked on the way out (maskedQuery, or the searcher's
+	// request) is the agent's own: it gets it back
+	return restored(said, false), nil
+}
+
+// readMCPBody reads a request body of at most limit bytes, answering 413
+// for a longer one. A LimitReader alone ends at the limit as if the body
+// had, so a valid message padded past it was read as its prefix and run
+// (#1766); one byte more tells a body that ended from one that was cut.
+func readMCPBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+	if r.Body == nil {
+		return nil, true
+	}
+	tooLarge := func() ([]byte, bool) {
+		w.Header().Set("Connection", "close")
+		http.Error(w, "the request body is longer than this server takes", http.StatusRequestEntityTooLarge)
+		return nil, false
+	}
+	if r.ContentLength > limit {
+		return tooLarge()
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil, false
+	}
+	if int64(len(body)) > limit {
+		return tooLarge()
+	}
+	return body, true
 }

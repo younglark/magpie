@@ -9,6 +9,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -28,6 +29,15 @@ const (
 	// weight (KeyAccount.Weight, #841), smoothly: 3 and 1 go a, a, b, a…
 	Weighted = "weight"
 )
+
+// pluginRouting is a routing a plugin serves: "<plugin>/<name>".
+var pluginRouting = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// PluginRouting says whether routing is one a plugin serves,
+// "<plugin>/<name>" (a JS gateway plugin's strategies). providers.json
+// keeps one as saved, served now or not: one no plugin serves is tried in
+// its listed order.
+func PluginRouting(routing string) bool { return pluginRouting.MatchString(routing) }
 
 // SetRouting changes how a provider's requests spread over its keys or
 // accounts.
@@ -75,6 +85,39 @@ func SetKeepLogin(id string, keep bool) error {
 	return nil
 }
 
+// SetSwitchOnly has magpie only move Codex's own sign-in between its
+// accounts (Provider.SwitchOnly), its requests never sent through the
+// gateway for account failover, or lets failover go through it again.
+func SetSwitchOnly(id string, on bool) error {
+	p, err := Find(id)
+	if err != nil {
+		return err
+	}
+	if p.Account == nil || p.Account.Agent != p.ID || p.ID != "codex" {
+		return fmt.Errorf("magpie doesn't route %s's own requests for account failover", p.Name)
+	}
+	p.SwitchOnly = on
+	return Save(*p)
+}
+
+// SwitchOnly reports whether magpie only moves agent's own sign-in between
+// its accounts, sending none of its requests through the gateway for
+// account failover (Provider.SwitchOnly). While providers.json can't be
+// read the user's choice is unknown, and failover, magpie's own idea, is
+// not taken up on it.
+func SwitchOnly(agent string) bool {
+	f, err := read()
+	if err != nil {
+		return true
+	}
+	for _, p := range f.Providers {
+		if p.ID == agent {
+			return p.SwitchOnly
+		}
+	}
+	return false
+}
+
 // SetAffinity changes how long a provider's conversations stay with the key
 // or account that answered them.
 func SetAffinity(id, affinity string) error {
@@ -91,10 +134,11 @@ var usedCache struct {
 	m       map[string]map[string]Allowance // agent → user → allowance
 	at      map[string]time.Time
 	loading map[string]chan struct{} // closed when the fetch in flight is done
-	// renewed: when an account's windows were last started again (a
-	// Codex reset spent), by agent/user: a reading begun before says
-	// nothing of them
-	renewed map[string]time.Time
+	// renewed: the generation when an account's windows were started
+	// again. Read/reset order cannot use the clock: two events can have
+	// the same timestamp, even with its monotonic part.
+	renewed    map[string]uint64
+	generation uint64
 	// seen: each account's windows as last read, and when, by
 	// agent/user, kept through a reading that failed, for the next to be
 	// told renewed by (renewedFrom)
@@ -211,6 +255,29 @@ func (a Allowance) For(model string, now time.Time) (used float64, renews []time
 		renews = append(renews, l.Resets)
 	}
 	return used, renews
+}
+
+// Fullest is when the window For's share is of renews: the fullest that
+// counts model, the later of those as full. A display pairs the two, so
+// it names one window: a Factory account 32% into its week and 16% into
+// its month is 32% used, renewing with the week, not the month (#1778).
+// Zero when that window's reset isn't known, or has passed (it is empty
+// again then, its next reset not known).
+func (a Allowance) Fullest(model string, now time.Time) time.Time {
+	model = strings.ToLower(model)
+	used, at := -1.0, time.Time{}
+	for _, l := range a {
+		if !l.applies(model) {
+			continue
+		}
+		if !l.Resets.IsZero() && !l.Resets.After(now) {
+			l.Used, l.Resets = 0, time.Time{}
+		}
+		if l.Used > used || l.Used == used && l.Resets.After(at) {
+			used, at = l.Used, l.Resets
+		}
+	}
+	return at
 }
 
 // Count is the count of the window For's share is of — the fullest that
@@ -420,11 +487,11 @@ func Allowances(agent string) map[string]Allowance {
 	if done == nil && time.Since(c.at[agent]) > time.Minute {
 		done = make(chan struct{})
 		c.loading[agent] = done
+		began := c.generation
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			share := renewalShare(agent) // read before the lock: it reads providers.json
-			began := time.Now()
 			all := map[string]Allowance{}
 			readings, readAt := loginUsageAt(ctx, agent)
 			for user, q := range readings {
@@ -446,7 +513,7 @@ func Allowances(agent string) map[string]Allowance {
 			var renewed []string
 			for user, a := range all {
 				key := agent + "/" + strings.ToLower(user)
-				if c.renewed[key].After(began) {
+				if c.renewed[key] > began {
 					// started again while this was read: not known till
 					// it is read again, at once
 					delete(all, user)
@@ -578,9 +645,10 @@ func forgetAllowance(agent, user string) {
 	c.Lock()
 	defer c.Unlock()
 	if c.renewed == nil {
-		c.renewed = map[string]time.Time{}
+		c.renewed = map[string]uint64{}
 	}
-	c.renewed[agent+"/"+strings.ToLower(user)] = time.Now()
+	c.generation++
+	c.renewed[agent+"/"+strings.ToLower(user)] = c.generation
 	delete(c.seen, agent+"/"+strings.ToLower(user)) // told already, by renewedNow
 	if c.at != nil {
 		c.at[agent] = time.Time{}
@@ -612,19 +680,6 @@ func StaleAllowance(agent, user string) {
 	delete(loginUsageCache.m, key)
 	delete(loginUsageCache.pending, key) // nor a reading asked for before
 	loginUsageCache.Unlock()
-	// the built-in keeps Grok's usage by home; a Grok moved to its plugin
-	// keeps it as "plugin:grok"'s, the line above
-	if agent == "grok" {
-		gs := grokLogins()
-		grokHomeUsage.Lock()
-		for _, g := range gs {
-			if strings.EqualFold(g.User, user) {
-				delete(grokHomeUsage.m, g.Home)
-				delete(grokHomeUsage.pending, g.Home)
-			}
-		}
-		grokHomeUsage.Unlock()
-	}
 	usedCache.Lock()
 	if usedCache.at != nil {
 		usedCache.at[agent] = time.Time{}

@@ -14,6 +14,7 @@ func TestAgentOf(t *testing.T) {
 		"GeminiCLI/0.9.0 (darwin; arm64)":          "gemini",
 		"opencode/1.2.3":                           "opencode",
 		"mimocode/1.2.3":                           "mimocode",
+		"deveco/0.2.3 ai-sdk/provider-utils/4.0":   "deveco", // 0.2.3 sends ai-sdk/provider-utils/4.0.23
 		"curl/8.4.0":                               "curl",
 		"oh-my-pi/1.0":                             "omp",
 		"command-code/2.0":                         "commandcode",
@@ -27,9 +28,10 @@ func TestAgentOf(t *testing.T) {
 		"hanako":                                   "hanako", // its key
 		"atomcode/5.2.1":                           "atomcode",
 		"cline ai-sdk/openai-compatible/3.0.37":    "cline",
-		"minimax-code":                             "minimax-code", // what magpie's entry sends
-		"MiniMaxCode":                              "minimax-code", // 0.6.8's own (#1605)
-		"":                                         "other",
+		"Vibecoding Client/1.3.104 (darwin; arm64; go1.26.2)": "mothx",
+		"minimax-code": "minimax-code", // what magpie's entry sends
+		"MiniMaxCode":  "minimax-code", // 0.6.8's own (#1605)
+		"":             "other",
 	}
 	for ua, want := range cases {
 		if got := usage.AgentOf(ua); got != want {
@@ -49,7 +51,7 @@ func TestEveryAgentNamedByItsKey(t *testing.T) {
 			t.Errorf("%s's key names %q", a.ID, got)
 		}
 	}
-	for _, id := range []string{"minimax-code", "stepcode", "jcode", "prime-agent", "snow"} {
+	for _, id := range []string{"minimax-code", "stepcode", "jcode", "prime-agent", "snow", "deveco"} {
 		if !seen[id] {
 			t.Errorf("%s isn't among the agents usage knows", id)
 		}

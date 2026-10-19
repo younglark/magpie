@@ -255,6 +255,57 @@ func stepcodeStartup(cfg stepcodeTOML) string {
 	return first
 }
 
+// stepcodeRenameRefs moves enabledModels off a renamed provider, in the
+// file and in the scope disconnect remembers, so a reset does not put the
+// old id back and still takes out only what magpie appended.
+func stepcodeRenameRefs(at place, path, from, to string) (bool, error) {
+	cur, err := readStepcodeTOML(path)
+	if err != nil {
+		return false, err
+	}
+	moved := false
+	if cur.Scope != nil {
+		next, ok := renameRefList(*cur.Scope, from, to)
+		if ok {
+			raw, err := stepcodeScopeRaw(next)
+			if err != nil {
+				return false, err
+			}
+			if err := edit.SetTOMLTopPreserving(path, edit.KV{Path: "enabledModels", Value: raw}); err != nil {
+				return false, err
+			}
+			moved = true
+		}
+	}
+	state, err := loadStepcodeState(at)
+	if err != nil {
+		return moved, err
+	}
+	if state == nil {
+		return moved, nil
+	}
+	changed := false
+	if next, ok := renameRefList(state.OrigScope, from, to); ok {
+		state.OrigScope = next
+		changed = true
+	}
+	if next, ok := renameRefList(state.LastScope, from, to); ok {
+		state.LastScope = next
+		changed = true
+	}
+	if next, ok := renameRefList(state.AppendedScope, from, to); ok {
+		state.AppendedScope = next
+		changed = true
+	}
+	if !changed {
+		return moved, nil
+	}
+	if err := stepcodeStoreState(at, state); err != nil {
+		return moved, err
+	}
+	return true, nil
+}
+
 func stepcodeIn(at place) *Agent {
 	dir := stepcodeDir(at)
 	path := filepath.Join(dir, "config.toml")
@@ -262,6 +313,8 @@ func stepcodeIn(at place) *Agent {
 	authPath := filepath.Join(dir, "auth.json")
 
 	block := theirsKept(modelsPath, "providers."+magpieID, func() any { return stepcodeProvider(at) }, "models")
+	// the entries of enabledModels a sync took out (scope_gone.go)
+	gone := at.key("stepcode.scope.gone")
 
 	startup := func() string {
 		curTOML, err := readStepcodeTOML(path)
@@ -371,6 +424,7 @@ func stepcodeIn(at place) *Agent {
 			}
 		}
 
+		forget(gone)
 		return stepcodeStoreState(at, nil)
 	}
 
@@ -418,7 +472,18 @@ func stepcodeIn(at place) *Agent {
 			if err := stepcodeValidateModels(modelsPath); err != nil {
 				return err
 			}
-			return syncJSON(modelsPath, "providers."+magpieID, block)
+			if err := syncJSON(modelsPath, "providers."+magpieID, block); err != nil {
+				return err
+			}
+			// an entry on a model magpie no longer gives StepCode names
+			// nothing (#2055, scope_gone.go)
+			return stepcodeScopeSynced(at, path, modelsPath, gone)
+		},
+		// enabledModels names models beyond the one field, as omp's list
+		// does: a provider renamed has to take those entries with it
+		RenameRefs: func(from, to string) (bool, error) {
+			scopeGoneRename(gone, from, to)
+			return stepcodeRenameRefs(at, path, from, to)
 		},
 		Fields: []Field{
 			{

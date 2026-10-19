@@ -35,6 +35,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -71,18 +72,20 @@ func cursorLocalRoots() []string {
 	home, _ := os.UserHomeDir()
 	switch runtime.GOOS {
 	case "darwin":
-		return []string{"/Applications", filepath.Join(home, "Applications")}
+		return macAppFolders(home)
 	case "windows":
+		// LOCALAPPDATA is the user's (a test's lies under its home);
+		// ProgramFiles is the machine's, so it goes through SystemDirs
 		var out []string
-		for _, v := range []string{"LOCALAPPDATA", "ProgramFiles"} {
-			if d := os.Getenv(v); d != "" {
+		for _, d := range append([]string{os.Getenv("LOCALAPPDATA")}, proc.SystemDirs(os.Getenv("ProgramFiles"))...) {
+			if d != "" {
 				out = append(out, filepath.Join(d, "Programs"), d)
 			}
 		}
 		return out
 	}
-	return []string{"/opt", "/usr/share", "/usr/lib", filepath.Join(home, ".local", "share"), filepath.Join(home, "Applications"),
-		filepath.Join(home, ".local", "bin"), filepath.Join(home, "bin"), filepath.Join(home, "Downloads"), home}
+	return append(proc.SystemDirs("/opt", "/usr/share", "/usr/lib"), filepath.Join(home, ".local", "share"), filepath.Join(home, "Applications"),
+		filepath.Join(home, ".local", "bin"), filepath.Join(home, "bin"), filepath.Join(home, "Downloads"), home)
 }
 
 // findCursorLocal is the program of the Cursor Private Inference among the
@@ -278,7 +281,7 @@ func KeepCursorLocalEnv(context.Context) {
 
 func cursorLocal() *Agent {
 	return &Agent{
-		ID: CursorLocalID, Name: cursorLocalName, Icon: "cursor", Aliases: []string{"cursor-private-inference"},
+		ID: CursorLocalID, Name: cursorLocalName, Icon: "cursor", Aliases: []string{"cursor-private-inference"}, NoNames: true,
 		// its model picker lists the gateway's /models as its key is shown
 		// them, which the row's Models button picks
 		ListsModels: true,

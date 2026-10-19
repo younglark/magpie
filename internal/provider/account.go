@@ -17,10 +17,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
@@ -66,10 +68,6 @@ type Account struct {
 	// codeAssist is where a Gemini CLI or Antigravity account's requests
 	// go (google.go).
 	codeAssist string
-
-	// generate is set on a Command Code account: its key, and whether its
-	// plan is Go, asked at /alpha/generate (commandcode_plan.go).
-	generate func(ctx context.Context) (key string, ok bool)
 
 	sign   func(ctx context.Context, req *http.Request, body []byte) error
 	body   func(body []byte) []byte // request tweaks the backend insists on
@@ -134,10 +132,10 @@ func (p Provider) ListedAPIs(model string) []Protocol {
 	if p.IsPlugin() {
 		return p.pluginAPIs(model)
 	}
-	// asked for every model of every agent: read once while a request holds
-	ms, _, _ := p.live()
-	for _, m := range ms {
-		if m.ID == model && len(m.APIs) > 0 {
+	// asked for every model of every agent: looked up, not the list
+	// copied and scanned for each (2,500 models' /v1/models took 3s)
+	for _, m := range p.liveByID(model) {
+		if len(m.APIs) > 0 {
 			out := make([]Protocol, len(m.APIs))
 			for i, a := range m.APIs {
 				out[i] = Protocol(a)
@@ -192,6 +190,9 @@ func (p Provider) Sign(ctx context.Context, req *http.Request, proto Protocol, b
 	if p.Account != nil && p.Account.sign != nil {
 		return p.Account.sign(ctx, req, body)
 	}
+	// OpenCode's gateway routes nothing that names no session; the user's
+	// own header, below, still has the last word
+	OpenCodeSession(req.Header, req.URL.String())
 	if p.IsVertex() {
 		// a Google token, which goes nowhere but the project's own address
 		if base := p.vertexBase(); base == "" || !strings.HasPrefix(req.URL.String(), base+"/") {
@@ -272,11 +273,6 @@ func (p Provider) Explain(msg string, status int, body []byte) string {
 		return msg
 	}
 	if more := p.Account.explain(status, body); more != "" {
-		// an account's reading of a block page that names the network
-		// block itself (ZCodeStartBlockedHint) takes the generic one's place
-		if more == ZCodeStartBlockedHint {
-			msg = strings.TrimSuffix(msg, " — "+BlockedHint)
-		}
 		return msg + " — " + more
 	}
 	return msg
@@ -310,6 +306,10 @@ type Exclusion struct {
 	// Tucked: hidden from the Add sheet too, but for its "Show N hidden"
 	// and a search by name (#116).
 	Tucked bool `json:"tucked,omitempty"`
+	// Retry: the keychain didn't give Codex's sign-in (refused, no
+	// answer, or its prompt still up); Try again asks it once more
+	// (RetryCodexKeychain, #2367).
+	Retry bool `json:"retry,omitempty"`
 }
 
 // Excluded lists sign-ins magpie detects but leaves out: the accounts the
@@ -349,11 +349,20 @@ var (
 	claudeCacheC   claudeCredentials
 	claudeCacheLoc claudeCredentialLocation
 	claudeCacheOK  bool
+
+	claudeAskMu sync.Mutex
+	claudeAskAt time.Time // a keychain read that may have shown a dialog
 )
 
 // claudeCacheTTL keeps All() from spawning `security` on every gateway
 // request while still noticing a fresh login quickly.
 const claudeCacheTTL = 10 * time.Second
+
+// keychainDeniedTTL is how long a keychain read that may have shown the
+// user a dialog is not asked again, as copilotCLISecret doesn't re-ask a
+// denied one at once (#723, #2408): with the item's trust list holding no
+// `security`, every ask can show the dialog again.
+const keychainDeniedTTL = 10 * time.Minute
 
 type claudeAuth struct {
 	AccessToken      string   `json:"accessToken"`
@@ -432,6 +441,17 @@ func readClaudeCredential() (claudeCredentials, claudeCredentialLocation, bool) 
 	if settings.AccountDiscoveryOff() {
 		return claudeCredentials{}, claudeCredentialLocation{}, false
 	}
+	var mine claudeKeychainItem
+	if claudeKeychain {
+		// the item under the account ($USER) is the sign-in Claude Code goes
+		// by, emptied or not: it reads no file beside it, so an emptied item
+		// is a sign-out even where an older file still parses, and a sign-in
+		// made in magpie is put in the item, not beside it (#1742)
+		mine = readClaudeKeychainItem(claudeKeychainAccount())
+		if mine.found && !mine.hex {
+			return mine.c, mine.loc, mine.ok
+		}
+	}
 	path := claudeCredentialsPath()
 	if b, err := readAccountFile(path); err == nil {
 		if c, ok := parseClaudeCredentials(b); ok {
@@ -441,34 +461,87 @@ func readClaudeCredential() (claudeCredentials, claudeCredentialLocation, bool) 
 	if !claudeKeychain {
 		return claudeCredentials{}, claudeCredentialLocation{}, false
 	}
-	// Claude Code reads the item under its account ($USER); by service
-	// alone the keychain may hand back another one — left from an earlier
-	// sign-in — which isn't the sign-in in use
-	account := claudeKeychainAccount()
-	var c claudeCredentials
-	var ok, wasHex bool
-	for _, args := range [][]string{{"-a", account}, nil} {
-		out, err := proc.Command("security", append([]string{"find-generic-password", "-s", "Claude Code-credentials", "-w"}, args...)...).Output()
-		if err != nil {
-			continue
-		}
-		var b []byte
-		b, wasHex = keychainText(bytes.TrimSpace(out))
-		if c, ok = parseClaudeCredentials(b); ok {
-			break
-		}
+	// neither the account's item, as Claude Code reads it, nor the file
+	// holds a sign-in. Left: the account's item as magpie wrote it before,
+	// over lines that `security -w` prints as hex (#70) — Claude Code reads
+	// that as no item, hence the file first — which is written again on one
+	// line, as Claude Code writes it; else by service alone another item,
+	// left from an earlier sign-in, that Claude Code never reads (58b67666)
+	i := mine
+	if !i.ok {
+		i = readClaudeKeychainItem("")
 	}
-	if !ok {
+	if !i.ok {
 		return claudeCredentials{}, claudeCredentialLocation{}, false
 	}
-	loc := claudeCredentialLocation{keychain: true, account: account}
-	if wasHex {
-		// written by magpie before it wrote them on one line: Claude Code
-		// reads that hex as no sign-in, so it is written again as it
-		// writes it
-		saveClaudeCredential(loc, c)
+	if i.hex {
+		// not through saveClaudeCredential: claudeCredential reads under
+		// claudeCacheMu, which caching would take again, and caches what
+		// this returns itself
+		writeClaudeCredential(i.loc, i.c)
 	}
-	return c, loc, ok
+	return i.c, i.loc, true
+}
+
+// claudeKeychainItem is what `security` reads of the "Claude Code-credentials"
+// item. found says an item is there that reads as a JSON object — the sign-in
+// Claude Code goes by, emptied or not (an item that reads as none it takes
+// for an absent one, and so does readClaudeDir of the item in a config
+// directory); ok, that it holds tokens to run on; hex, that magpie wrote it
+// over more than one line, which `security -w` prints as hex and Claude Code
+// reads as none (#70).
+type claudeKeychainItem struct {
+	c         claudeCredentials
+	loc       claudeCredentialLocation
+	ok, found bool
+	hex       bool
+}
+
+// keychainDenied says whether a failed `security find-generic-password`
+// could have been a dialog the user answered no to: 44 is the item not
+// being there, which asks nobody.
+func keychainDenied(err error) bool {
+	var xe *exec.ExitError
+	return errors.As(err, &xe) && xe.ExitCode() != 44
+}
+
+// readClaudeKeychainItem reads the item for a keychain account, or by
+// service alone when the account is "". Either way it is the one under
+// $USER that a sign-in is written back to.
+func readClaudeKeychainItem(account string) claudeKeychainItem {
+	args := []string{"find-generic-password", "-s", claudeHomeService(), "-w"}
+	if account != "" {
+		args = append(args, "-a", account)
+	}
+	out, err := proc.Command("security", args...).Output()
+	if err != nil {
+		if keychainDenied(err) {
+			claudeAskMu.Lock()
+			claudeAskAt = time.Now()
+			claudeAskMu.Unlock()
+		}
+		return claudeKeychainItem{}
+	}
+	b, wasHex := keychainText(bytes.TrimSpace(out))
+	c, ok := parseClaudeCredentials(b)
+	if c.raw == nil {
+		return claudeKeychainItem{}
+	}
+	return claudeKeychainItem{
+		c: c, ok: ok, found: true, hex: wasHex,
+		loc: claudeCredentialLocation{keychain: true, account: claudeKeychainAccount()},
+	}
+}
+
+// claudeHomeService is the keychain item Claude Code keeps the sign-in
+// magpie reads as its own in: "Claude Code-credentials", or with
+// CLAUDE_CONFIG_DIR set, that directory's own (claudeDirService), as
+// Claude Code names it, beside the .credentials.json there.
+func claudeHomeService() string {
+	if d := appdir.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		return claudeDirService(d)
+	}
+	return "Claude Code-credentials"
 }
 
 // claudeKeychainAccount is the account Claude Code keeps its sign-in
@@ -508,7 +581,16 @@ func claudeCredential() (claudeCredentials, claudeCredentialLocation, bool) {
 	}
 	claudeCacheMu.Lock()
 	defer claudeCacheMu.Unlock()
-	if time.Since(claudeCacheAt) < claudeCacheTTL {
+	ttl := claudeCacheTTL
+	if !claudeCacheOK {
+		claudeAskMu.Lock()
+		ask := claudeAskAt
+		claudeAskMu.Unlock()
+		if time.Since(ask) < keychainDeniedTTL {
+			ttl = keychainDeniedTTL
+		}
+	}
+	if time.Since(claudeCacheAt) < ttl {
 		return claudeCacheC, claudeCacheLoc, claudeCacheOK
 	}
 	c, loc, ok := readClaudeCredential()
@@ -527,9 +609,21 @@ func forgetClaudeCredential() {
 	claudeCacheMu.Lock()
 	claudeCacheAt = time.Time{}
 	claudeCacheMu.Unlock()
+	claudeAskMu.Lock()
+	claudeAskAt = time.Time{}
+	claudeAskMu.Unlock()
 }
 
 func saveClaudeCredential(loc claudeCredentialLocation, c claudeCredentials) error {
+	if err := writeClaudeCredential(loc, c); err != nil {
+		return err
+	}
+	cacheClaudeCredential(c, loc)
+	return nil
+}
+
+// writeClaudeCredential writes c where loc says, leaving the cache alone.
+func writeClaudeCredential(loc claudeCredentialLocation, c claudeCredentials) error {
 	if discoveryOff() {
 		return errAccountDiscoveryOff
 	}
@@ -548,11 +642,14 @@ func saveClaudeCredential(loc claudeCredentialLocation, c claudeCredentials) err
 		b = one.Bytes()
 	}
 	if !loc.keychain {
-		if err := os.WriteFile(loc.path, append(b, '\n'), 0o600); err != nil {
+		// Claude Code's own sign-in: never truncated in place, so a machine
+		// going down mid-write or a file held for a moment on Windows
+		// leaves the old one whole, not an empty file (#2239, #1505)
+		if err := writePrivate(loc.path, append(b, '\n')); err != nil {
 			return err
 		}
 	} else {
-		args := []string{"add-generic-password", "-U", "-s", "Claude Code-credentials"}
+		args := []string{"add-generic-password", "-U", "-s", claudeHomeService()}
 		if loc.account != "" {
 			args = append(args, "-a", loc.account)
 		}
@@ -561,7 +658,6 @@ func saveClaudeCredential(loc claudeCredentialLocation, c claudeCredentials) err
 			return fmt.Errorf("save Claude Code credentials: %v: %s", err, strings.TrimSpace(string(out)))
 		}
 	}
-	cacheClaudeCredential(c, loc)
 	return nil
 }
 
@@ -579,9 +675,13 @@ var claudeExecutable = claudecode.Find
 // still lying around (a keychain item logout left behind), so a signed-out
 // account stops showing up as a provider.
 func claudeIdentity() (user, plan string, signedOut bool) {
+	// switched off or removed, Claude Code isn't asked: what it said last
+	// is served (leftAlone)
+	quiet := leftAlone("claude")
 	claudeStatusMu.Lock()
 	defer claudeStatusMu.Unlock()
 	switch {
+	case quiet:
 	case claudeStatusAt.IsZero():
 		claudeStatusAt = time.Now()
 		if u, p, out, ok := askClaudeStatus(); ok {
@@ -672,7 +772,15 @@ func claudeAccount() (Provider, bool) {
 	// named as its saved login is (liveLogin): it is then the account Logins
 	// flags Active, not served a second time beside itself, and its
 	// allowances and limits are found under its name (#177)
-	user, _ = claudeSignedInUser(c.OAuth.SubscriptionType, statusPlan, user)
+	user, acct := claudeSignedInUser(c.OAuth.SubscriptionType, statusPlan, user)
+	if b, err := c.marshal(); err == nil && user != "" {
+		// by its sign-in when its profile is another's (claudeSignInOwner)
+		l := savedLogin{Agent: "claude", User: user, Auth: b}
+		if acct != nil {
+			l.Profile, _ = json.Marshal(acct)
+		}
+		user = claudeSignInOwner(readLogins(), l).User
+	}
 	if user == "" {
 		user = "Claude account"
 		if plan != "" {
@@ -741,43 +849,6 @@ func Accounts() []Provider {
 	if p, ok := copilotAccount(cfg); ok {
 		out = append(out, p)
 	}
-	if p, ok := cursorAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := grokAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := devinAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := kiroAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := zcodeAccount(); ok {
-		out = append(out, p)
-	}
-	for _, w := range []*wbSite{wbCN, wbAI} {
-		if p, ok := workBuddyAccount(w); ok {
-			out = append(out, p)
-		}
-	}
-	if p, ok := commandCodeAccount(); ok {
-		out = append(out, p)
-	}
-	for _, agent := range qoderAgents {
-		if p, ok := qoderAccountOf(agent); ok {
-			out = append(out, p)
-		}
-	}
-	if p, ok := zedAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := factoryAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := mimoAccount(); ok {
-		out = append(out, p)
-	}
 	if p, ok := siwcAccount(); ok {
 		out = append(out, p)
 	}
@@ -787,7 +858,7 @@ func Accounts() []Provider {
 		}
 	}
 	// a built-in moved onto its plugin is the plugin's now (migrate.go)
-	out = slices.DeleteFunc(out, func(p Provider) bool { return Moved(p.ID) })
+	out = slices.DeleteFunc(out, func(p Provider) bool { return PluginServes(p.ID) })
 	return placeMoved(out, pluginAccounts())
 }
 
@@ -806,7 +877,7 @@ func placeMoved(out, plugins []Provider) []Provider {
 	}
 	var rest []Provider
 	for _, p := range plugins {
-		if !Moved(p.ID) || !slices.Contains(builtinOrder, p.ID) {
+		if !PluginServes(p.ID) || !slices.Contains(builtinOrder, p.ID) {
 			rest = append(rest, p)
 			continue
 		}
@@ -896,8 +967,10 @@ func codexAccount(home string) (Provider, bool) {
 	if settings.AccountDiscoveryOff() {
 		return Provider{}, false
 	}
-	path := filepath.Join(appdir.CodexHomeIn(home), "auth.json")
-	b, err := readAccountFile(path)
+	dir := appdir.CodexHomeIn(home)
+	// where Codex's config.toml keeps it: auth.json, or the macOS
+	// keychain item (#2367)
+	b, _, err := readCodexLogin(dir, false)
 	var a codexAuth
 	if err != nil || json.Unmarshal(b, &a) != nil || a.Tokens.AccessToken == "" || a.AuthMode == "apikey" {
 		return Provider{}, false
@@ -912,7 +985,7 @@ func codexAccount(home string) (Provider, bool) {
 		// the email is "email · Team · <workspace>" (#1424)
 		acct.User = codexLiveName(acct.User, bytes.TrimSpace(b))
 	}
-	acct.sign = codexSign(func(ctx context.Context) (string, string, error) { return codexToken(ctx, path) })
+	acct.sign = codexSign(func(ctx context.Context) (string, string, error) { return codexToken(ctx, dir) })
 	acct.body = codexBody
 	acct.models = catalog.Codex
 	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
@@ -928,36 +1001,70 @@ func codexAccount(home string) (Provider, bool) {
 	return Provider{ID: "codex", Name: "Codex", Icon: "codex-color", Responses: CodexBase, Website: "https://chatgpt.com/codex", Account: acct}, true
 }
 
-// codexToken returns a usable access token, refreshing it through OpenAI
-// when it is about to expire. A refresh rotates the tokens, so the new
-// ones go back into auth.json for Codex CLI to find.
-func codexToken(ctx context.Context, path string) (tok, accountID string, err error) {
+// codexToken returns a usable access token for the Codex home dir,
+// refreshing it through OpenAI when it is about to expire. A refresh
+// rotates the tokens, so the new ones go back where Codex keeps its
+// sign-in (auth.json or the keychain item, codexStore.write) for Codex to
+// find.
+func codexToken(ctx context.Context, dir string) (tok, accountID string, err error) {
 	codexMu.Lock()
 	defer codexMu.Unlock()
+	b, st, err := readCodexLogin(dir, false)
 	var a codexAuth
-	if !readJSON(path, &a) || a.Tokens.AccessToken == "" {
-		return "", "", errors.New("Codex is signed out; run codex login")
+	if err == nil && json.Unmarshal(b, &a) == nil && a.Tokens.AccessToken != "" {
+		if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute {
+			return a.Tokens.AccessToken, codexAccountID(a), nil
+		}
+		// about to be refreshed: the store's own, not a kept read, which
+		// Codex may have rotated since (its refresh token spent)
+		if st.keychain {
+			b, st, err = readCodexLogin(dir, true)
+			a = codexAuth{}
+			if err == nil && json.Unmarshal(b, &a) == nil && a.Tokens.AccessToken != "" {
+				if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute {
+					return a.Tokens.AccessToken, codexAccountID(a), nil
+				}
+			}
+		}
 	}
-	accountID = a.Tokens.AccountID
-	if accountID == "" {
-		accountID = claimString(jwtClaims(a.Tokens.IDToken), "https://api.openai.com/auth", "chatgpt_account_id")
-	}
-	if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute {
-		return a.Tokens.AccessToken, accountID, nil
+	var se *codexStoreError
+	if errors.As(err, &se) {
+		return "", "", se
 	}
 	var raw map[string]any
-	if !readJSON(path, &raw) {
+	if err != nil || a.Tokens.AccessToken == "" || json.Unmarshal(b, &raw) != nil {
 		return "", "", errors.New("Codex is signed out; run codex login")
 	}
+	accountID = codexAccountID(a)
 	tok, err = codexRefresh(ctx, raw)
 	if err != nil {
 		return "", "", err
 	}
-	// keep every other field of the file as Codex CLI wrote it
+	// keep every other field as Codex wrote it. auth.json is the user's
+	// own sign-in, which Codex CLI and the Codex app read: written beside
+	// it, flushed and renamed in, never truncated in place, so a machine
+	// going down mid-write leaves the old one whole and a file held for a
+	// moment on Windows is waited out (#2239, #1505). A write that still
+	// fails loses the rotation, said in the log; the fresh access token in
+	// hand still serves this request.
 	if out, err := json.MarshalIndent(raw, "", "  "); err == nil {
-		os.WriteFile(path, append(out, '\n'), 0o600)
+		if werr := st.write(out); werr != nil {
+			where := st.file()
+			if st.keychain {
+				where = "the keychain item " + codexKeychainService
+			}
+			log.Printf("codex: the refreshed sign-in didn't reach %s: %v", where, werr)
+		}
 	}
 	return tok, accountID, nil
+}
+
+// codexAccountID is the ChatGPT account a sign-in's requests name.
+func codexAccountID(a codexAuth) string {
+	if a.Tokens.AccountID != "" {
+		return a.Tokens.AccountID
+	}
+	return claimString(jwtClaims(a.Tokens.IDToken), "https://api.openai.com/auth", "chatgpt_account_id")
 }
 
 // codexRefresh renews the tokens of an auth.json-shaped sign-in in place,
@@ -968,6 +1075,18 @@ func codexRefresh(ctx context.Context, raw map[string]any) (string, error) {
 		toks = map[string]any{}
 	}
 	refresh, _ := toks["refresh_token"].(string)
+	// Once sent, a refresh is waited for even when whoever asked gives up
+	// (a request the agent cancelled, a usage read's or the keep-alive's
+	// deadline): OpenAI rotates the refresh token as it answers, and an
+	// answer dropped leaves magpie holding the spent one, which the next
+	// refresh is refused for (refresh_token_reused). The account then
+	// read as signed out while its access token still served (willz on
+	// Discord). The ChatGPT API's refresh waits so already (siwcFresh).
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
 	body, _ := json.Marshal(map[string]string{"client_id": codexClientID, "grant_type": "refresh_token",
 		"refresh_token": refresh, "scope": "openid profile email"})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexTokenURL, bytes.NewReader(body))
@@ -1166,11 +1285,20 @@ func copilotStandIn(a copilotApp) (copilotApp, bool) {
 	return cli, ok && copilotSameAccount(cli, a)
 }
 
-// session is what this sign-in's requests carry. An editor's token GitHub
-// refuses is replaced by the Copilot CLI's sign-in of the same account,
-// sent as the CLI sends it; with none, the error names the file the
-// refused token is in, since it is read before the CLI's (#1238).
+// session is what this sign-in's requests carry, and what GitHub said of
+// it is kept on its account: refused, it is signed out; served, it isn't
+// (copilotSessionDone).
 func (a copilotApp) session(ctx context.Context) (copilotSession, error) {
+	s, err := a.trade(ctx)
+	copilotSessionDone(a, err)
+	return s, err
+}
+
+// trade gets this sign-in's session. An editor's token GitHub refuses is
+// replaced by the Copilot CLI's sign-in of the same account, sent as the
+// CLI sends it; with none, the error names the file the refused token is
+// in, since it is read before the CLI's (#1238).
+func (a copilotApp) trade(ctx context.Context) (copilotSession, error) {
 	if a.cli {
 		return copilotDirect(ctx, a)
 	}

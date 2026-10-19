@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,19 +41,39 @@ type sessionsJSON struct {
 	Dirs     []string `json:"dirs"` // where they were read from
 }
 
+// gatewayExternal is a gateway session without its days: a list, a manage
+// page and a detail (MergeExternal) never read them, and copying every
+// session's days for each poll of an open Sessions page was ~1.8 GB in 4
+// minutes over ~720k calls (#2776). The stats add them (gatewayDays).
 func gatewayExternal(g usage.GatewaySession) sessions.ExternalSession {
 	e := sessions.ExternalSession{Agent: g.Agent, ID: g.ID, Start: g.Start, Last: g.Last, Tokens: g.Tokens, Cost: g.Cost, Unpriced: g.Unpriced}
+	e.Models = make([]sessions.ExternalModel, 0, len(g.Models))
 	for _, m := range g.Models {
 		e.Models = append(e.Models, sessions.ExternalModel{Model: m.Model, Tokens: m.Tokens, Cost: m.Cost, Priced: m.Priced})
-	}
-	for _, d := range g.Daily {
-		e.Daily = append(e.Daily, sessions.ExternalDayUsage{Date: d.Date, Agent: d.Agent, Model: d.Model, Tokens: d.Tokens, Cost: d.Cost, Priced: d.Priced})
 	}
 	return e
 }
 
+// gatewayDays is a gateway session's usage by day, as the stats count it.
+func gatewayDays(g usage.GatewaySession) []sessions.ExternalDayUsage {
+	out := make([]sessions.ExternalDayUsage, 0, len(g.Daily))
+	for _, d := range g.Daily {
+		out = append(out, sessions.ExternalDayUsage{Date: d.Date, Agent: d.Agent, Model: d.Model, Tokens: d.Tokens, Cost: d.Cost, Priced: d.Priced})
+	}
+	return out
+}
+
+// gatewayListed is a gateway session as a list shows it: titled by what it
+// was first asked, when magpie recorded it, not by its ses_… id (YOU on
+// Discord)
+func gatewayListed(g usage.GatewaySession) sessions.ExternalSession {
+	e := gatewayExternal(g)
+	e.Title = sessions.GatewayTitle(g.Agent, g.ID)
+	return e
+}
+
 func gatewaySession(g usage.GatewaySession) sessions.Session {
-	return sessions.MergeExternal(nil, []sessions.ExternalSession{gatewayExternal(g)})[0]
+	return sessions.MergeExternal(nil, []sessions.ExternalSession{gatewayListed(g)})[0]
 }
 
 func sessionRoutes(mux *http.ServeMux, w Windows) {
@@ -86,11 +107,21 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		gateway := listedGateway(usage.GatewaySessions(time.Time{}, nativeKeys))
 		ext := make([]sessions.ExternalSession, 0, len(gateway))
 		for _, g := range gateway {
-			ext = append(ext, gatewayExternal(g))
+			ext = append(ext, gatewayListed(g))
 		}
 		list = sessions.MergeExternal(list, ext)
 		if len(list) > n {
 			list = list[:n]
+		}
+		var modelEffort map[string][]sessions.ModelEffort
+		for _, s := range list {
+			if s.Agent == "codex" {
+				modelEffort = usage.CodexModelEffort(usage.All)
+				break
+			}
+		}
+		for i := range list {
+			addCodexModelEffort(&list[i], modelEffort)
 		}
 		since := time.Now()
 		for _, s := range list {
@@ -100,9 +131,9 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		}
 		vias := usage.Vias(since.Add(-time.Minute))
 		for _, s := range list {
-			j := sessionJSON{Session: s, Name: s.Agent, Icon: "generic", Via: vias[s.Agent+"|"+s.ID]}
+			j := sessionJSON{Session: s, Name: s.Agent, Icon: "generic", Via: vias.Of(s.Agent + "|" + s.ID)}
 			if a := agents[s.Agent]; a != nil {
-				j.Name, j.Icon = a.Name, a.Icon
+				j.Name, j.Icon = a.SharedName(), a.Icon
 			}
 			j.Name = wslName(j.Name, s)
 			j.Path = tilde(j.Path)
@@ -118,7 +149,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		st := statsFor(n)
 		names := map[string]string{}
 		for _, a := range agent.Clients() {
-			names[a.ID] = a.Name
+			names[a.ID] = a.SharedName()
 		}
 		agents := map[string]string{}
 		for _, d := range st.Days {
@@ -140,7 +171,33 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("GET /api/sessions/overview", func(rw http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		n, _ := strconv.Atoi(q.Get("days"))
-		writeJSON(rw, statsFor(n).Overview(q.Get("agent"), q.Get("model"), q.Get("cwd"), 8))
+		st := statsFor(n)
+		out := st.Overview(q.Get("agent"), q.Get("model"), q.Get("cwd"), 8)
+		period := usage.All
+		if n > 0 {
+			if p, ok := usage.RangeOf(st.From, st.To); ok {
+				period = p
+			}
+		}
+		needCodex := false
+		for key, top := range out.Top {
+			out.Top[key] = slices.Clone(top)
+			for i := range out.Top[key] {
+				if out.Top[key][i].Agent == "codex" {
+					needCodex = true
+				}
+			}
+		}
+		if needCodex {
+			modelEffort := usage.CodexModelEffort(period)
+			for key, top := range out.Top {
+				for i := range top {
+					addCodexSummaryModelEffort(&top[i], modelEffort)
+				}
+				out.Top[key] = top
+			}
+		}
+		writeJSON(rw, out)
 	})
 	// progress is how far the reading of the session files has got, for
 	// the page to show while its first read takes a while.
@@ -166,10 +223,13 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			_ = json.NewEncoder(rw).Encode(map[string]string{"error": "no such session"})
 			return
 		}
+		if s.Agent == "codex" {
+			addCodexModelEffort(&s, usage.CodexModelEffort(usage.All))
+		}
 		j := sessionJSON{Session: s, Name: s.Agent, Icon: "generic"}
 		for _, a := range agent.Clients() {
 			if a.ID == s.Agent {
-				j.Name, j.Icon = a.Name, a.Icon
+				j.Name, j.Icon = a.SharedName(), a.Icon
 			}
 		}
 		j.Name = wslName(j.Name, s)
@@ -177,7 +237,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		if since.IsZero() {
 			since = s.Last
 		}
-		j.Via = usage.Vias(since.Add(-time.Minute))[s.Agent+"|"+s.ID]
+		j.Via = usage.Vias(since.Add(-time.Minute)).Of(s.Agent + "|" + s.ID)
 		j.Path = tilde(j.Path)
 		writeJSON(rw, j)
 	})
@@ -200,7 +260,13 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, errors.New("no such session"))
 			return
 		}
-		t, err := sessions.TranscriptOf(s)
+		// sub: one of its subagents, found among those the session lists
+		// (#2261)
+		read := sessions.TranscriptOf
+		if sub := q.Get("sub"); sub != "" {
+			read = func(s sessions.Session) (sessions.Transcript, error) { return sessions.SubagentTranscript(s, sub) }
+		}
+		t, err := read(s)
 		if err != nil {
 			fail(rw, err)
 			return
@@ -296,7 +362,7 @@ func sessionMarkdown(agentID, id string) (stem string, md []byte, err error) {
 	name := s.Agent
 	for _, a := range agent.Clients() {
 		if a.ID == s.Agent {
-			name = a.Name
+			name = a.SharedName()
 		}
 	}
 	var b bytes.Buffer
@@ -336,19 +402,30 @@ func wslName(name string, s sessions.Session) string {
 // than a few seconds old it is read again behind, for the next ask.
 var statsMemo struct {
 	sync.Mutex
-	m map[int]*statsKept
+	m    map[int]*statsKept
+	asks uint64
 }
 
 type statsKept struct {
 	at   time.Time
 	st   sessions.Stats
 	busy bool
+	// used is the memo's ask count when this range was last asked: a count,
+	// not a clock, since Windows' clock can give two asks the same time.
+	used uint64
 }
+
+// statsMemoMost is how many distinct ?days values the memo keeps: each one is
+// a whole sessions.Stats, and ?days takes any number a caller sends, so the
+// least recently asked one is let go when a new value comes past it.
+const statsMemoMost = 8
 
 func statsFor(days int) sessions.Stats {
 	days = max(0, days)
 	statsMemo.Lock()
 	if k := statsMemo.m[days]; k != nil {
+		statsMemo.asks++
+		k.used = statsMemo.asks
 		if !k.busy && time.Since(k.at) > 10*time.Second {
 			k.busy = true
 			go func() {
@@ -369,18 +446,24 @@ func statsFor(days int) sessions.Stats {
 		statsMemo.m = map[int]*statsKept{}
 	}
 	if statsMemo.m[days] == nil {
-		statsMemo.m[days] = &statsKept{at: time.Now(), st: st}
+		if len(statsMemo.m) >= statsMemoMost {
+			oldest := -1
+			for d, k := range statsMemo.m {
+				if oldest == -1 || k.used < statsMemo.m[oldest].used {
+					oldest = d
+				}
+			}
+			delete(statsMemo.m, oldest)
+		}
+		statsMemo.asks++
+		statsMemo.m[days] = &statsKept{at: time.Now(), st: st, used: statsMemo.asks}
 	}
 	statsMemo.Unlock()
 	return st
 }
 
 func combinedSessionStats(days int) sessions.Stats {
-	st := sessions.StatsFor(days)
-	nativeKeys := map[string]bool{}
-	for _, s := range sessions.List(sessions.All) {
-		nativeKeys[s.Agent+"|"+s.ID] = true
-	}
+	st, nativeKeys := sessions.StatsAndNative(days)
 	var since time.Time
 	if days > 0 && st.From != "" {
 		since, _ = time.ParseInLocation(time.DateOnly, st.From, time.Local)
@@ -388,7 +471,9 @@ func combinedSessionStats(days int) sessions.Stats {
 	gs, gd := usage.GatewaySessionWindowExcept(since, nativeKeys)
 	ext := make([]sessions.ExternalSession, 0, len(gs))
 	for _, g := range gs {
-		ext = append(ext, gatewayExternal(g))
+		e := gatewayListed(g)
+		e.Daily = gatewayDays(g)
+		ext = append(ext, e)
 	}
 	daily := make([]sessions.ExternalDayUsage, 0, len(gd))
 	for _, d := range gd {
@@ -409,15 +494,29 @@ func warmSessions() {
 		time.Sleep(3 * time.Second)
 		// with few readers, as nobody waits on it yet: after an update
 		// that reads every file again, it held every core (#1665)
-		sessions.Warm(func() {
-			warmUp(
-				func() { statsFor(0) },
-				func() { statsFor(30) },
-				func() { usage.QueryPage(usage.All, usage.Filter{}, 0, 50) },
-			)
-		})
+		sessions.Warm(func() { warmUp(warmSteps()...) })
 	}()
 }
+
+// warmSteps are the reads the warm-up makes before any page asks for them.
+// The last is Codex's per-thread effort, when there are Codex sessions: a
+// first Codex page after a start read it from the whole ledger while it
+// waited (#2776), and every later ask is answered from what it kept.
+func warmSteps() []func() {
+	return []func(){
+		func() { statsFor(0) },
+		func() { statsFor(30) },
+		func() { usage.QueryPage(usage.All, usage.Filter{}, 0, 50) },
+		func() {
+			if slices.ContainsFunc(statsFor(0).Keys, func(k string) bool { return strings.HasPrefix(k, "codex:") }) {
+				warmCodexEffort()
+			}
+		},
+	}
+}
+
+// warmCodexEffort reads what the Sessions page's Codex rows ask for.
+var warmCodexEffort = func() { usage.CodexModelEffort(usage.All) }
 
 // warmUp runs the warm-up's reads, then hands what they threw away back to
 // the system at once. Reading a long history allocates many times what it

@@ -31,7 +31,6 @@ package agent
 import (
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -40,6 +39,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/proc"
 )
 
 // vscodeDefault is chat.defaultModel, a key with a dot in it, escaped for
@@ -215,7 +215,7 @@ func vscodeKindAt(k vscodeKind, dir string) *Agent {
 			if isDir(dir) {
 				return true
 			}
-			bin, err := exec.LookPath(k.bin)
+			bin, err := proc.Look(k.bin)
 			return err == nil && vscodeCodeBinary(bin)
 		},
 		Notice: func() string {
@@ -421,7 +421,7 @@ func vscodeGroupJSON(k vscodeKind, vendor string) map[string]any {
 		if output <= 0 {
 			output = 8192
 		}
-		output = min(output, context/4)
+		output = outputOr(m, min(output, context/4))
 		entry := map[string]any{
 			"id": m.ID, "name": m.Name, "url": vscodeURL(),
 			"toolCalling": true, "vision": m.Images,

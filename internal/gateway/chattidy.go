@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 	"strings"
 )
 
@@ -41,9 +42,15 @@ import (
 // reasoning_content, as other upstreams send it, and the text to a string
 // content.
 //
+// And an upstream that sometimes sends a tool call's first fragment with
+// no id (OpenCode Zen's free DeepSeek) has the agent keep the call as "",
+// which a strict upstream it is sent to later turns away (#2611): such a
+// fragment is given an id, and a later fragment's empty one is left out.
+//
 // Lines pass whole, as they came, unless one has any of them.
 type chatTidy struct {
 	buf []byte
+	ids streamCallIDs
 }
 
 var (
@@ -53,6 +60,7 @@ var (
 	emptyToolCalls    = []byte(`"tool_calls":[]`)
 	contentParts      = []byte(`"content":[`)
 	contentPartsSpace = []byte(`"content": [`)
+	toolCallsField    = []byte(`"tool_calls"`)
 )
 
 // write takes what was read and gives back what to send on: every line
@@ -63,19 +71,19 @@ func (t *chatTidy) write(b []byte) []byte {
 	if i < 0 {
 		return nil
 	}
-	out := tidyLines(t.buf[:i+1])
+	out := t.lines(t.buf[:i+1])
 	t.buf = append(t.buf[:0], t.buf[i+1:]...)
 	return out
 }
 
 // flush is what's left once the stream ends.
 func (t *chatTidy) flush() []byte {
-	out := tidyLines(t.buf)
+	out := t.lines(t.buf)
 	t.buf = nil
 	return out
 }
 
-func tidyLines(b []byte) []byte {
+func (t *chatTidy) lines(b []byte) []byte {
 	if !needsTidy(b) {
 		return append([]byte(nil), b...)
 	}
@@ -87,7 +95,7 @@ func tidyLines(b []byte) []byte {
 		} else {
 			b = nil
 		}
-		out = append(out, tidyLine(line)...)
+		out = append(out, t.line(line)...)
 	}
 	return out
 }
@@ -100,10 +108,14 @@ func needsTidy(line []byte) bool {
 		bytes.Contains(line, emptyToolName) ||
 		bytes.Contains(line, emptyToolCalls) ||
 		bytes.Contains(line, contentParts) ||
-		bytes.Contains(line, contentPartsSpace)
+		bytes.Contains(line, contentPartsSpace) ||
+		bytes.Contains(line, toolCallsField)
 }
 
-func tidyLine(line []byte) []byte {
+// tidyLine mends one line as the first of a stream.
+func tidyLine(line []byte) []byte { return (&chatTidy{}).line(line) }
+
+func (t *chatTidy) line(line []byte) []byte {
 	if !needsTidy(line) {
 		return line
 	}
@@ -122,7 +134,7 @@ func tidyLine(line []byte) []byte {
 		return line
 	}
 	changed := false
-	for _, c := range choices {
+	for k, c := range choices {
 		if string(c["finish_reason"]) == `""` {
 			c["finish_reason"] = json.RawMessage("null")
 			changed = true
@@ -140,6 +152,15 @@ func tidyLine(line []byte) []byte {
 			delete(delta, "tool_calls")
 			inDelta = true
 		} else if ok {
+			if t.ids == nil {
+				t.ids = streamCallIDs{}
+			}
+			choice := k
+			decodeJSON(c["index"], &choice)
+			if mended, chg := t.ids.mend(choice, calls); chg {
+				calls, delta["tool_calls"] = mended, mended
+				inDelta = true
+			}
 			if mended, chg := withoutEmptyNames(calls); chg {
 				delta["tool_calls"] = mended
 				inDelta = true
@@ -257,10 +278,15 @@ func flattenContent(m map[string]json.RawMessage, whole bool) bool {
 
 // chatWhole mends a Chat Completions reply that came whole, not streamed:
 // a message whose content is typed parts (Mistral's thinking, #483) goes
-// on with a string content and its thinking in reasoning_content. It is
-// held until it ends; any other reply passes byte for byte.
+// on with a string content and its thinking in reasoning_content, and,
+// when the request offered tools (names), calls the model wrote into its
+// text are made the calls they are, as textCallTidy makes them in a
+// stream (#1845), and a call the upstream gave no id is given one, as
+// chatTidy gives it in a stream (#2611). It is held until it ends; any
+// other reply passes byte for byte.
 type chatWhole struct {
-	buf []byte
+	names map[string]bool
+	buf   []byte
 }
 
 func (t *chatWhole) write(b []byte) []byte {
@@ -271,7 +297,8 @@ func (t *chatWhole) write(b []byte) []byte {
 func (t *chatWhole) flush() []byte {
 	b := t.buf
 	t.buf = nil
-	if !bytes.Contains(b, contentParts) && !bytes.Contains(b, contentPartsSpace) {
+	parts := bytes.Contains(b, contentParts) || bytes.Contains(b, contentPartsSpace)
+	if !parts && !mayWriteCalls(b, t.names) && !bytes.Contains(b, toolCallsField) {
 		return b
 	}
 	var reply map[string]json.RawMessage
@@ -285,17 +312,29 @@ func (t *chatWhole) flush() []byte {
 	changed := false
 	for _, c := range choices {
 		var msg map[string]json.RawMessage
-		if decodeJSON(c["message"], &msg) != nil || !flattenContent(msg, true) {
+		if decodeJSON(c["message"], &msg) != nil {
 			continue
 		}
-		c["message"], _ = json.Marshal(msg)
+		mended := parts && flattenContent(msg, true)
+		// a call the upstream gave no id (#2611)
+		mended = wholeCallIDs(msg) || mended
+		if wrote, called := wholeTextCalls(msg, t.names); wrote {
+			if called {
+				c["finish_reason"] = json.RawMessage(`"tool_calls"`)
+			}
+			mended = true
+		}
+		if !mended {
+			continue
+		}
+		c["message"], _ = marshalPlain(msg)
 		changed = true
 	}
 	if !changed {
 		return b
 	}
-	reply["choices"], _ = json.Marshal(choices)
-	nb, err := json.Marshal(reply)
+	reply["choices"], _ = marshalPlain(choices)
+	nb, err := marshalPlain(reply)
 	if err != nil {
 		return b
 	}
@@ -346,17 +385,30 @@ func reasoningText(m map[string]json.RawMessage) string {
 const noReasoning = " "
 
 // withReasoningOnToolTurns gives each assistant message of a Chat request
-// that has tool calls and no reasoning_content one: the thinking it sent
-// back in another field (reasoning, reasoning_details), else noReasoning.
-// A message with reasoning_content of its own keeps it, a reply without
-// tool calls is left as it is (DeepSeek doesn't ask for its thinking), and
-// a body with no tool calls comes back byte for byte.
+// that has tool calls, or that follows a tool message of its turn, and no
+// reasoning_content one: the thinking it sent back in another field
+// (reasoning, reasoning_details), else noReasoning. DeepSeek turns away a
+// reply after a tool result with none as it does a call (checked against
+// api.deepseek.com on 2026-10-12, #1822). A message with reasoning_content
+// of its own keeps it, any other reply is left as it is (DeepSeek doesn't
+// ask for its thinking), and a body with no tool calls comes back byte for
+// byte.
 func withReasoningOnToolTurns(body []byte) []byte {
+	afterTool := false
 	return editMessages(body, []string{"tool_calls"}, func(m map[string]json.RawMessage) bool {
 		var role string
 		var calls []json.RawMessage
-		if decodeJSON(m["role"], &role) != nil || role != "assistant" ||
-			decodeJSON(m["tool_calls"], &calls) != nil || len(calls) == 0 {
+		decodeJSON(m["role"], &role)
+		switch role {
+		case "tool":
+			afterTool = true
+		case "user":
+			afterTool = false
+		}
+		if raw, ok := m["tool_calls"]; ok && decodeJSON(raw, &calls) != nil {
+			return false
+		}
+		if role != "assistant" || len(calls) == 0 && !afterTool {
 			return false
 		}
 		var own *string
@@ -370,6 +422,70 @@ func withReasoningOnToolTurns(body []byte) []byte {
 		m["reasoning_content"], _ = marshalPlain(think)
 		return true
 	})
+}
+
+// silentAssistantsOut is withoutSilentAssistants for a Chat request
+// relayed as the client sent it (#2599): an agent that speaks Chat keeps
+// the turn it cut off as {"role":"assistant","content":""} (or null, with
+// reasoning_content alone) and sends it again on every later turn. A body
+// without such a turn comes back byte for byte.
+func silentAssistantsOut(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"assistant"`)) {
+		return body
+	}
+	var q map[string]json.RawMessage
+	if decodeJSON(body, &q) != nil {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(q["messages"]))
+	dec.UseNumber()
+	var msgs []map[string]any
+	if dec.Decode(&msgs) != nil {
+		return body
+	}
+	msgs, changed := withoutSilentAssistants(msgs)
+	if !changed {
+		return body
+	}
+	q["messages"], _ = marshalPlain(msgs)
+	nb, err := marshalPlain(q)
+	if err != nil {
+		return body
+	}
+	return nb
+}
+
+// reasoningDetailsAsContent leaves reasoning_details out of every message
+// of a Chat request, its thinking kept in reasoning_content when the
+// message has none: Kimi's API turns reasoning_details away in whatever
+// shape it comes, OpenRouter's reasoning.text with a stream's index in it
+// (as another vendor's turn has it) or without ("the reasoning_details at
+// position 2 entry 0 must not contain streaming index", "… has an invalid
+// type", #1765), and takes reasoning_content.
+func reasoningDetailsAsContent(body []byte) []byte {
+	return editMessages(body, []string{"reasoning_details"}, func(m map[string]json.RawMessage) bool {
+		if _, ok := m["reasoning_details"]; !ok {
+			return false
+		}
+		var own string
+		if decodeJSON(m["reasoning_content"], &own) != nil || own == "" {
+			if think := reasoningText(m); think != "" {
+				m["reasoning_content"], _ = marshalPlain(think)
+			}
+		}
+		delete(m, "reasoning_details")
+		return true
+	})
+}
+
+// withoutMessageReasoning leaves the thinking fields an upstream refused
+// out of every message of a Chat request; reasoning_details' thinking
+// stays in reasoning_content unless that was refused too.
+func withoutMessageReasoning(body []byte, fields []string) []byte {
+	if slices.Contains(fields, "reasoning_details") && !slices.Contains(fields, "reasoning_content") {
+		body = reasoningDetailsAsContent(body)
+	}
+	return withoutMessageFields(body, fields...)
 }
 
 // editMessages hands each message of a Chat request whose JSON names any

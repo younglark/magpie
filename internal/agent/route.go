@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"cmp"
 	"slices"
 	"strings"
 
@@ -47,7 +48,28 @@ func viaMagpie(agent, prefix string) []Option {
 			own[e.Provider.ID] = a.User == provider.AgentUser(agent)
 		}
 	}
-	fast := provider.FastPicks(agent)
+	// firstUser: the account a request for a subscription's model goes to
+	// first, which the note names. A Codex or Claude Code subscription is
+	// the account the agent is signed in to (Account.User), but its
+	// requests go to the first in magpie's order: another one when that
+	// one is paused, or when the agent is kept signed in to an account
+	// that isn't first (#1957, parkavenue9639: every codex/gpt-* read
+	// "A · via magpie" while each went to B). Asked once a provider.
+	firsts := map[string]string{}
+	firstUser := func(p provider.Provider) string {
+		a := p.Account
+		if a.Agent != p.ID || a.StandIn() {
+			return a.User
+		}
+		u, ok := firsts[p.ID]
+		if !ok {
+			u = cmp.Or(provider.FirstLogin(a.Agent), a.User)
+			firsts[p.ID] = u
+		}
+		return u
+	}
+	fast, ultra := provider.FastPicks(agent), provider.UltraPicks(agent)
+	var tiered map[string]bool // provider.UltraModels, read at the first fast model
 	for _, e := range shown {
 		if e.Group != "" {
 			groups = append(groups, Option{Value: prefix + e.ID, Label: e.Name, Note: "routing group · via magpie",
@@ -56,7 +78,7 @@ func viaMagpie(agent, prefix string) []Option {
 		}
 		note := e.Provider.Name + " · via magpie"
 		if a := e.Provider.Account; a != nil {
-			note = a.User + " · via magpie"
+			note = firstUser(e.Provider) + " · via magpie"
 		}
 		o := Option{Value: prefix + e.ID, Label: e.Name, Note: note,
 			Icon: e.Provider.Icon, Group: e.Provider.Name, Ref: e.ID, Free: e.Free, Rate: e.Rate, RateWas: e.RateWas, Context: e.Context, own: own[e.Provider.ID],
@@ -65,10 +87,29 @@ func viaMagpie(agent, prefix string) []Option {
 		if provider.CanFast(e.Provider, e.Model) {
 			o.FastFor, o.Fast = agent, slices.Contains(fast, e.ID)
 			o.OwnFast = provider.OwnFast(e.Provider, e.Model)
+			if tiered == nil {
+				tiered = provider.UltraModels()
+			}
+			if provider.UltraOn(e.Provider, e.Model, tiered) {
+				o.UltraOK, o.Ultra = true, o.Fast && slices.Contains(ultra, e.ID)
+			}
 		}
 		out = append(out, o)
 	}
 	return append(groups, out...)
+}
+
+// listLabels are the names the agent's own list calls the catalog's models
+// by, by id: provider.Labels, which follows the Provider in model names
+// setting, where an Option's Label is the name alone for magpie's picker.
+func listLabels(agent string) map[string]string {
+	shown, _ := provider.CatalogFor(agent)
+	labels := provider.Labels(shown)
+	out := make(map[string]string, len(shown))
+	for i, e := range shown {
+		out[e.ID] = labels[i]
+	}
+	return out
 }
 
 // viaMagpieFor is viaMagpie without the agent's own account: Codex CLI going
@@ -116,11 +157,12 @@ func magpieModels(agent string) []catalog.Model {
 		return ms
 	}
 	for i, e := range shown {
-		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: e.Efforts, Images: e.Images || seen, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output, AgentsV2: e.AgentsV2, Reasoning: e.Reasoning}
+		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: e.Efforts, Images: e.Images || seen, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output, OutputSet: e.OutputSet, AgentsV2: e.AgentsV2, Reasoning: e.Thinks()}
 		// where Codex and Claude Code compact it (#876): a threshold the
-		// user set on the model or on its provider, else the one for every
-		// model, which codexcat answers from the settings it is given
-		m.Compact = provider.CompactSetIn(st, e.ID, find)
+		// user set on the model or on its provider, else a window they
+		// typed whole (#1809), else the one for every model, which codexcat
+		// answers from the settings it is given
+		m.Compact = provider.CompactFor(st, e, find)
 		// what a call costs the user (Pi's cost, #781)
 		if pr, ok := provider.EntryPriceIn(st, find, e); ok {
 			m.Price = &pr
@@ -146,6 +188,12 @@ func magpieModels(agent string) []catalog.Model {
 		// lists offer them: Fast in the Codex CLI magpie writes
 		// magpie-models.json for (#1530)
 		provider.CodexTiers(&m, e, members)
+		// Codex's /fast on a ChatGPT account's own GPT model, which
+		// OpenCode has no command for and takes as variants (#2379); a
+		// group is sent fast as the group says, as a fast pick is
+		if a := e.Provider.Account; e.Group == "" && a != nil && a.Agent == "codex" {
+			m.CodexFast = provider.CanFast(e.Provider, e.Model)
+		}
 		out = append(out, m)
 	}
 	return out
@@ -170,6 +218,18 @@ func allResponses(ms []provider.Member) bool {
 // above their window (deepseek-chat's 384000 against 128000). An unknown
 // window leaves the output as it is.
 func maxTokens(m catalog.Model) int { return provider.OutputWithin(m.Context, m.Output) }
+
+// outputOr is the output limit an agent is handed for m: the Max output the
+// user set for it (catalog.Model.OutputSet), kept within its window, else
+// capped, the agent's own trim of the vendor's figure. A cap of magpie's
+// never overrides the user's number: DeepSeek V4.1 Flash set to 384k reached
+// VS Code as 250000 and WorkBuddy as 128000 (#2064).
+func outputOr(m catalog.Model, capped int) int {
+	if n := maxTokens(m); m.OutputSet && n > 0 {
+		return n
+	}
+	return capped
+}
 
 // group tags every option with a group name.
 func group(name string, opts []Option) []Option {

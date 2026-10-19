@@ -150,10 +150,10 @@ func openRouterDecisions(base string) string {
 }
 
 // listsDecisions reports whether p's decision models are a list of their
-// own, OpenRouter's or oMLX's (omlxDecides), rather than Jev's ids among
-// its chat models.
+// own, OpenRouter's, oMLX's (omlxDecides) or MLX-Serve's (mlxServeDecides),
+// rather than Jev's ids among its chat models.
 func (p Provider) listsDecisions() bool {
-	return openRouterDecisions(p.Decide) != "" || p.omlxDecides()
+	return openRouterDecisions(p.Decide) != "" || p.omlxDecides() || p.mlxServeDecides()
 }
 
 // decisionsID is where a provider that serves conversations too keeps the
@@ -195,7 +195,7 @@ func (p Provider) decideListDue() bool {
 		return false
 	}
 	live, _, ok := catalog.Live(id)
-	if p.omlxDecides() {
+	if p.omlxDecides() || p.mlxServeDecides() {
 		// a server with no decision model loaded lists none, for good
 		return !ok
 	}
@@ -281,8 +281,9 @@ func (p Provider) Jev() string {
 	}
 	// OpenRouter's Jev is ~typesafe/jev-latest, in its list of decision
 	// models; its Jev Router is a chat model
-	if p.omlxDecides() {
-		// oMLX has no Jev of its own: its first decision model, if any
+	if p.omlxDecides() || p.mlxServeDecides() {
+		// oMLX and MLX-Serve have no Jev of their own: their first decision
+		// model, if any
 		if ms := p.decideListed(); len(ms) > 0 {
 			return ms[0].ID
 		}
@@ -388,7 +389,7 @@ func (p Provider) decideListed() []catalog.Model {
 		if live, _, ok := catalog.Live(decisionsID(p.ID)); ok && len(live) > 0 {
 			return live
 		}
-		if p.omlxDecides() {
+		if p.omlxDecides() || p.mlxServeDecides() {
 			return nil // none until its server says which
 		}
 		return []catalog.Model{{ID: OpenRouterJev, Name: "Jev"}}
@@ -542,20 +543,48 @@ func (p Provider) cloudflareAccount(ctx context.Context) (string, error) {
 }
 
 // Deciders are the models of the decision providers ready now, as a
-// group's classifier names them.
+// group's classifier names them: every one the gateway answers.
 func Deciders() []Entry {
+	return deciders(nil)
+}
+
+// OfferedDeciders are the Deciders a routing group's pickers and templates
+// offer: of a provider whose decision models are listed beside its chat
+// models (OpenRouter's, a Bailian plan's, a plugin's, a remote magpie's),
+// with picks saved, those among the picks alone, as its editor shows the
+// rest unpicked (coeo91 on Discord: two OpenRouter models picked, and a
+// new group's picker listed OpenRouter's twenty-odd decision models after
+// them). With none picked every one is offered, as before. keep, when
+// given, says a decision model a group names already, offered whatever
+// the picks, so a group made of one before reads as it did.
+func OfferedDeciders(keep func(id string) bool) []Entry {
+	if keep == nil {
+		keep = func(string) bool { return false }
+	}
+	return deciders(keep)
+}
+
+// deciders are Deciders, less the unpicked ones keep doesn't name when
+// keep is given.
+func deciders(keep func(id string) bool) []Entry {
 	var out []Entry
 	s := settings.Load()
+	off := disabledNow()
 	for _, p := range All() {
-		if !p.Decides() || !p.On() {
+		if !p.Decides() || !p.On() || p.ServesNone() && !p.DecideOnly() {
 			continue
 		}
 		ms := p.Exposed()
 		if !p.DecideOnly() && (len(p.Models) == 0 || p.listsDecisions() || p.bailianApart() || p.IsRemoteMagpie() || p.IsPlugin()) {
 			ms = p.decideModels() // the conversation picker's limit does not hide Jev
+			if keep != nil && len(p.Models) > 0 {
+				ms = slices.DeleteFunc(slices.Clone(ms), func(m catalog.Model) bool {
+					return !slices.Contains(p.Models, m.ID) && !keep(p.ID+"/"+m.ID)
+				})
+			}
 		}
 		for _, m := range ms {
-			if p.isDecision(m) {
+			if p.isDecision(m) && !off(p.ID, m.ID) { // a disabled one isn't offered (#1867)
 				if p.IsRemoteMagpie() {
 					out = append(out, entryFor(p, m, s))
 				} else {
@@ -787,6 +816,8 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 		list, all = u, true
 	} else if p.omlxDecides() {
 		list = omlxDecisions(p.Decide)
+	} else if p.mlxServeDecides() {
+		list = mlxServeDecisions(p.Decide)
 	} else if bailianDecides(p.Decide) {
 		// Bailian lists its chat models only: its decision model is asked
 		return p.decideAsked(ctx)
@@ -816,6 +847,14 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 	if p.omlxDecides() {
 		// none is an answer too: the server has no decision model now
 		ms, err := listedOMLXDecide(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %s", p.Name, err)
+		}
+		return ms, catalog.SaveLive(decisionsID(p.ID), p.Decide, ms)
+	}
+	if p.mlxServeDecides() {
+		// none is an answer too: the server has no decision model now
+		ms, err := listedMLXServeDecide(b)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %s", p.Name, err)
 		}
@@ -860,6 +899,9 @@ func (p Provider) decideAsked(ctx context.Context) ([]catalog.Model, error) {
 // AskSystemOne sends model the smallest System One question at p's
 // decision API, and says why it wasn't answered.
 func (p Provider) AskSystemOne(ctx context.Context, model string) error {
+	if pat, off := ModelDisabled(p.ID, model); off { // never asked (#1867)
+		return fmt.Errorf("model %s/%s is disabled in magpie (it matches %q)", p.ID, model, pat)
+	}
 	u, err := p.DecideModelURL(ctx, model)
 	if err != nil {
 		return err

@@ -50,14 +50,14 @@ func canSearchFor(p provider.Provider) bool {
 }
 
 // searchesOwn is whether p searches for its own models: by its Kimi Code
-// plan's search service or a Google sign-in's own Gemini. Never with
-// provider search Off in Settings (#1483), which leaves the search APIs
-// alone.
+// plan's or WorkBuddy plan's search service (#1798), or a Google sign-in's
+// own Gemini. Never with provider search Off in Settings (#1483), which
+// leaves the search APIs alone, nor with plugins/search off.
 func searchesOwn(p provider.Provider) bool {
-	if settings.Load().Searcher == "off" {
+	if !searchServed() || settings.Load().Searcher == "off" {
 		return false
 	}
-	return provider.KimiCodeSearch(p) != "" || googleAccount(p) && searcherModel(p) != ""
+	return provider.KimiCodeSearch(p) != "" || wbSearches(p) || googleAccount(p) && searcherModel(p) != ""
 }
 
 // searchingOn is ctx for the searches made for a model of p.
@@ -80,18 +80,21 @@ func (s *Server) ownSearch(ctx context.Context, p provider.Provider, query strin
 	if provider.KimiCodeSearch(p) != "" {
 		return s.kimiSearch(ctx, p, query)
 	}
+	if wbSearches(p) {
+		return s.wbSearch(ctx, p, query)
+	}
 	ctx, cancel := context.WithTimeout(context.WithValue(ctx, searchingKey{}, true), searchTimeout)
 	defer cancel()
-	return s.searchWith(ctx, p, searcherModel(p), query)
+	return s.searchWith(ctx, p, searcherModel(p), query, "")
 }
 
 // searchBy searches with one searcher: a Kimi Code plan by its search
 // service, any other by its model.
-func (s *Server) searchBy(ctx context.Context, p provider.Provider, model, query string) (string, []Hit, error) {
+func (s *Server) searchBy(ctx context.Context, p provider.Provider, model, query, effort string) (string, []Hit, error) {
 	if provider.KimiCodeSearch(p) != "" {
 		return s.kimiSearch(ctx, p, query)
 	}
-	return s.searchWith(ctx, p, model, query)
+	return s.searchWith(ctx, p, model, query, effort)
 }
 
 // kimiSearch asks a Kimi Code plan's search service.
@@ -100,7 +103,11 @@ func (s *Server) kimiSearch(ctx context.Context, p provider.Provider, query stri
 	// through the plan's own proxy, if it has one (#237, #1522)
 	ctx, cancel := context.WithTimeout(s.metered(p.Via(ctx), p, ""), searchTimeout/2)
 	defer cancel()
-	body, _ := json.Marshal(map[string]any{"text_query": query, "limit": searchHits, "enable_page_crawling": false, "timeout_seconds": 30})
+	q, err := maskedQuery(query, &p)
+	if err != nil {
+		return "", nil, err
+	}
+	body, _ := json.Marshal(map[string]any{"text_query": q, "limit": searchHits, "enable_page_crawling": false, "timeout_seconds": 30})
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.KimiCodeSearch(p), bytes.NewReader(body))
 	if err != nil {
 		return "", nil, err
@@ -155,7 +162,7 @@ func (s *Server) kimiSearch(ctx context.Context, p provider.Provider, query stri
 		}
 	}
 	if len(pages) == 0 {
-		return "", nil, fmt.Errorf("%s found nothing", p.Name)
+		return "", nil, fmt.Errorf("%s %w", p.Name, errFoundNothing)
 	}
 	said, hits := pagesSaid(pages)
 	return said, hits, nil

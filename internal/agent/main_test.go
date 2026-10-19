@@ -32,6 +32,15 @@ func TestMain(m *testing.M) {
 	// Pi's and omp's model registries are read from their installs; never
 	// this machine's
 	nodeModulesOf = func(string, []string) []string { return nil }
+	// Microsoft Store apps are read from the current user's AppX registry;
+	// never this machine's (a Windows box with the Codex app installed)
+	windowsStorePackages = func() []string { return nil }
+	// nor what an installer registered there (DeepSeek Harness Desktop's
+	// folder, #2279)
+	windowsRegisteredApp = func(string) (string, string) { return "", "" }
+	// nor where this Mac's Spotlight has an app (DeepSeek Harness.app
+	// outside /Applications, #2325)
+	spotlightApps = func(string) []string { return nil }
 	// Aside's default is changed through the aside binary, which answers for
 	// the account the developer is actually running: a test that picks a
 	// model would change the real Aside's default, and the running one would
@@ -45,7 +54,14 @@ func TestMain(m *testing.M) {
 	// nor is the way Codex goes there read from this machine's proxy
 	// settings, or a proxy tried; the proxy tests say both
 	codexProxyEnv = func(string) string { return "" }
+	// nor Claude Code's provider switches read from the login shell; the
+	// cloud tests say what one there does
+	claudeShellEnv = func(string) string { return "" }
 	codexSystemProxy = func() netproxy.Proxy { return netproxy.Proxy{} }
 	proxyProbe = func(string, string) bool { return true }
+	// nor an address of the agent's own asked whether magpie answers
+	// there (a reverse proxy, #1985): known, and not magpie, as for a
+	// relay; the proxy-kept tests answer it
+	magpieAt = func(string) (bool, bool) { return false, true }
 	os.Exit(testenv.Run(m))
 }

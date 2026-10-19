@@ -20,6 +20,7 @@ import (
 	"github.com/tidwall/jsonc"
 	"gopkg.in/yaml.v3"
 
+	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/imagemcp"
@@ -41,6 +42,22 @@ type Server struct {
 	// names the server gives them, written in each agent's own way where
 	// it has one (mcp_tools_off.go)
 	DisabledTools []string `json:"disabledTools,omitempty"`
+	// OAuth is an OAuth app of the user's own that magpie signs in to the
+	// server as, for one whose sign-in doesn't let magpie register itself
+	// (GitHub's, 新v学员 on Discord). It is magpie's alone: the agents are
+	// given the server as before.
+	OAuth *OAuthApp `json:"oauth,omitempty"`
+}
+
+// OAuthApp is an OAuth app made with a server's vendor, by the names
+// Claude Code gives one (--client-id, --client-secret, --callback-port;
+// "oauth": {"clientId", "callbackPort"}).
+type OAuthApp struct {
+	ClientID     string `json:"clientId"`
+	ClientSecret string `json:"clientSecret,omitempty"`
+	// CallbackPort is the port of the callback URL the app was made with;
+	// 0 for one made with http://localhost/callback, which takes any
+	CallbackPort int `json:"callbackPort,omitempty"`
 }
 
 // Remote reports whether the server is reached by URL.
@@ -82,6 +99,23 @@ func (s *Server) check() error {
 		s.Command, s.Args, s.Env = "", nil, nil
 	default:
 		return fmt.Errorf("%s: unknown transport %q", s.Name, s.Transport)
+	}
+	// magpie signs in only to a streamable HTTP server
+	if s.Transport != "http" {
+		s.OAuth = nil
+	} else if s.OAuth != nil {
+		a := *s.OAuth
+		a.ClientID, a.ClientSecret = strings.TrimSpace(a.ClientID), strings.TrimSpace(a.ClientSecret)
+		if a.CallbackPort < 0 || a.CallbackPort > 65535 {
+			return fmt.Errorf("%s: the callback port has to be from 1 to 65535", s.Name)
+		}
+		s.OAuth = &a
+		if a.ClientID == "" {
+			if a.ClientSecret != "" || a.CallbackPort != 0 {
+				return fmt.Errorf("%s: the OAuth app needs its client ID", s.Name)
+			}
+			s.OAuth = nil
+		}
 	}
 	for k := range s.Env {
 		if strings.TrimSpace(k) == "" {
@@ -1300,17 +1334,39 @@ type Found struct {
 	Own bool `json:"own,omitempty"`
 }
 
-// appOwned is whether a server runs from inside an app's own install — a
-// Mac app bundle, a Microsoft Store app, the Codex app's runtimes — as the
-// servers an agent's app writes into its config itself do.
-func appOwned(s *Server) bool {
-	if s.Remote() {
+// appOwned is whether a server runs from inside the agent's own app
+// install — its Mac app bundle, its Microsoft Store app, the Codex app's
+// runtimes — as the servers an agent's app writes into its config itself
+// do. Another app's server in the agent's config (Netcatty's, #2635) is
+// one the user added there: it is brought in like any other.
+func appOwned(s *Server, a *agent.Agent) bool {
+	if s.Remote() || a == nil {
 		return false
 	}
 	cmd := strings.ToLower(strings.ReplaceAll(s.Command, `\`, "/"))
-	for _, in := range []string{".app/contents/", "/windowsapps/", "/cua_node/", "/openai/codex/runtimes/"} {
-		if strings.Contains(cmd, in) {
-			return true
+	if a.ID == "codex" && (strings.Contains(cmd, "/cua_node/") || strings.Contains(cmd, "/openai/codex/runtimes/")) {
+		return true
+	}
+	names := []string{strings.ToLower(a.ID), strings.ToLower(a.Name)}
+	if id, _, ok := strings.Cut(names[0], "-"); ok {
+		names = append(names, id)
+	}
+	if n, _, ok := strings.Cut(names[1], " "); ok {
+		names = append(names, n)
+	}
+	segs := strings.Split(cmd, "/")
+	for i, seg := range segs {
+		// an app is a bundle (Codex.app) or a Store package
+		// (WindowsApps/OpenAI.Codex_1.0_x64) the command is inside
+		app := strings.HasSuffix(seg, ".app") && i+1 < len(segs) && segs[i+1] == "contents"
+		app = app || (i > 0 && segs[i-1] == "windowsapps" && i+1 < len(segs))
+		if !app {
+			continue
+		}
+		for _, n := range names {
+			if n != "" && strings.Contains(seg, n) {
+				return true
+			}
 		}
 	}
 	return false
@@ -1339,7 +1395,7 @@ func foundServersOf(l *Library, targets []*Target) []Found {
 			switch {
 			case f == nil:
 				s.Agents = []string{t.Agent.ID}
-				byName[name] = &Found{Server: s, Own: appOwned(s)}
+				byName[name] = &Found{Server: s, Own: appOwned(s, t.Agent)}
 				names = append(names, name)
 			case f.Server.same(s):
 				f.Server.Agents = append(f.Server.Agents, t.Agent.ID)

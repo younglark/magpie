@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -56,7 +58,19 @@ type groupJSON struct {
 	// Decides: it is a group of decision models, asked at /v1/systemone
 	// and by a group's classifier, never by an agent
 	Decides bool `json:"decides,omitempty"`
+	// ClassifierFailed: its classifier couldn't say the last time it was
+	// asked, and why (gateway.ClassifierFailure), which its card says
+	// (#1929): otherwise only each request's details did
+	ClassifierFailed *classifierFailedJSON `json:"classifierFailed,omitempty"`
 }
+
+type classifierFailedJSON struct {
+	Error string    `json:"error"`
+	At    time.Time `json:"at"`
+}
+
+// classifierFailure is gateway.ClassifierFailure, which a test stands in for
+var classifierFailure = gateway.ClassifierFailure
 
 type memberJSON struct {
 	ID       string `json:"id"`
@@ -120,6 +134,19 @@ type modelRef struct {
 	// sent only when true
 	Images        bool `json:"images,omitempty"`
 	ImagesUnknown bool `json:"imagesUnknown,omitempty"`
+	// Sub: a subscription account serves it (Provider.Account), so a
+	// group's classifier set to it asks that subscription at every turn,
+	// which the Routing page says (#1839)
+	Sub bool `json:"sub,omitempty"`
+	// VendorPicks: an image model whose vendor picks the model itself,
+	// whichever is named (a ChatGPT account's, #1865), which Settings ›
+	// Images says
+	VendorPicks bool `json:"vendorPicks,omitempty"`
+}
+
+// servedRef is a served model as the Routing page lists it
+func servedRef(e provider.Entry) modelRef {
+	return modelRef{ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon, Context: e.Context, Efforts: e.Efforts, CanFast: provider.CanFast(e.Provider, e.Model), OwnFast: provider.OwnFast(e.Provider, e.Model), Images: seesImages(e), ImagesUnknown: imagesUnknown(e), Sub: e.Provider.Account != nil}
 }
 
 type poolJSON struct {
@@ -197,16 +224,29 @@ func groupsState() groupsJSON {
 			out.Templates[i].Group.Members = []string{} // one that can't be made has none
 		}
 	}
-	for _, e := range provider.Deciders() {
-		out.Deciders = append(out.Deciders, modelRef{ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon})
+	// the decision models a group's pickers offer: a provider's picks, and
+	// any a group names already, whatever the picks, so its card still
+	// reads it as a decision model
+	named, all := map[string]bool{}, provider.Groups()
+	for _, g := range all {
+		for _, m := range g.Members {
+			named[m] = true
+		}
+		named[g.Classifier] = true
+	}
+	for _, e := range provider.OfferedDeciders(func(id string) bool { return named[id] }) {
+		out.Deciders = append(out.Deciders, modelRef{ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon, Sub: e.Provider.Account != nil})
 	}
 	served := provider.Served()
 	for _, e := range served {
 		if e.Group == "" {
-			out.Models = append(out.Models, modelRef{ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon, Context: e.Context, Efforts: e.Efforts, CanFast: provider.CanFast(e.Provider, e.Model), OwnFast: provider.OwnFast(e.Provider, e.Model), Images: seesImages(e), ImagesUnknown: imagesUnknown(e)})
+			out.Models = append(out.Models, servedRef(e))
 		}
 	}
-	for _, g := range provider.Groups() {
+	// every provider's models read once for the groups, not once a group
+	// (#1762)
+	find := provider.GroupFinder()
+	for _, g := range all {
 		gj := groupJSON{Group: g, Info: []memberJSON{}, Holds: []string{}, Offers: []string{}, Shared: []string{}, Patterns: []provider.PatternHit{}}
 		if gj.Members == nil {
 			// a group of patterns that match nothing now — a plugin's
@@ -216,13 +256,18 @@ func groupsState() groupsJSON {
 		}
 		gj.Patterns = append(gj.Patterns, provider.PatternHits(g)...)
 		gj.Decides = g.Decides()
+		if g.Classifier != "" {
+			if why, at, ok := classifierFailure(g.Classifier); ok {
+				gj.ClassifierFailed = &classifierFailedJSON{Error: why, At: at}
+			}
+		}
 		for _, e := range served {
 			if e.ID == provider.GroupPrefix+g.ID {
 				gj.Offers, gj.Shared = append(gj.Offers, e.Efforts...), append(gj.Shared, e.Shared...)
 				break
 			}
 		}
-		if _, ms, ok := provider.FindGroup(provider.GroupPrefix + g.ID); ok {
+		if _, ms, ok := find(provider.GroupPrefix + g.ID); ok {
 			for _, m := range ms {
 				for _, v := range m.Groups() {
 					if !slices.Contains(gj.Holds, v) {
@@ -238,7 +283,7 @@ func groupsState() groupsJSON {
 				m.Group = true
 				for _, e := range served {
 					if e.ID == id {
-						_, ms, _ := provider.FindGroup(id)
+						_, ms, _ := find(id)
 						m.Ready, m.Name, m.Icon, m.On = true, e.Name, e.Provider.Icon, len(ms)
 						m.Context, m.Images, m.ImagesUnknown = e.Context, seesImages(e), imagesUnknown(e)
 						// the levels it offers agents: those every model in
@@ -382,6 +427,10 @@ func groupRoutes(mux *http.ServeMux) {
 			err = provider.SwitchGroup(in.ID, body.On)
 		case "arrange":
 			err = provider.SetGroupOrder(body.Order)
+		case "pick":
+			// a Manual group's member every request goes to, and nothing
+			// else of it (#2489: the tray panel switches it)
+			err = provider.PickGroup(in.ID, in.Pick)
 		default:
 			http.NotFound(rw, r)
 			return

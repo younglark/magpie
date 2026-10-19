@@ -210,6 +210,39 @@ func TestHowInstalled(t *testing.T) {
 	if u := howInstalled(cliSpecs["atomcode"], atomcode); u == nil || !u.cask || !reflect.DeepEqual(u.cmd, []string{brew, "upgrade", "--cask", "atomcode"}) {
 		t.Errorf("AtomCode brew cask: %+v", u)
 	}
+	// Node formulae keep the npm package in their keg, as brew's gemini-cli
+	// 0.35.3 does on this Mac: bin/gemini → ../Cellar/gemini-cli/0.35.3/
+	// bin/gemini → ../libexec/bin/gemini → ../lib/node_modules/
+	// @google/gemini-cli/bundle/gemini.js. That is brew's, not npm's: npm
+	// install -g --prefix …/libexec would change the keg behind brew's back.
+	for _, k := range []struct{ id, formula, pkg, js, name string }{
+		{"gemini", "gemini-cli", "@google/gemini-cli", "bundle/gemini.js", "gemini"},
+		{"pi", "pi-coding-agent", "@earendil-works/pi-coding-agent", "dist/cli.js", "pi"},
+		{"cline", "cline", "cline", "bin/cline.js", "cline"},
+	} {
+		keg := filepath.Join(brewDir, "Cellar", k.formula, "1.0.0")
+		file(t, filepath.Join(keg, "libexec/lib/node_modules", k.pkg, k.js), "")
+		link(t, "../lib/node_modules/"+k.pkg+"/"+k.js, filepath.Join(keg, "libexec/bin", k.name))
+		link(t, "../libexec/bin/"+k.name, filepath.Join(keg, "bin", k.name))
+		bin := link(t, "../Cellar/"+k.formula+"/1.0.0/bin/"+k.name, filepath.Join(brewDir, "bin", k.name))
+		if u := howInstalled(cliSpecs[k.id], bin); u == nil || u.via != "brew" || u.cask || !reflect.DeepEqual(u.cmd, []string{brew, "upgrade", k.formula}) {
+			t.Errorf("%s's Node formula %s: %+v", k.id, k.formula, u)
+		}
+	}
+	// npm under a keg-only node's Cellar (node@20) is still npm's
+	nodeKeg := filepath.Join(brewDir, "Cellar/node@20/20.19.0")
+	file(t, filepath.Join(nodeKeg, "lib/node_modules/@github/copilot/npm-loader.js"), "")
+	file(t, filepath.Join(nodeKeg, "bin/npm"), "#!/bin/sh\n")
+	if u := howInstalled(cliSpecs["copilot"], link(t, "../lib/node_modules/@github/copilot/npm-loader.js", filepath.Join(nodeKeg, "bin/copilot"))); u == nil || u.via != "npm" {
+		t.Errorf("npm under node@20's keg: %+v", u)
+	}
+	// Grok Build's cask: bin/grok → Caskroom/grok-build/1.0.52/grok-1.0.52-macos-aarch64
+	file(t, filepath.Join(brewDir, "Caskroom/grok-build/1.0.52/grok-1.0.52-macos-aarch64"), "")
+	grokBin := link(t, "../Caskroom/grok-build/1.0.52/grok-1.0.52-macos-aarch64", filepath.Join(brewDir, "bin/grok"))
+	if u := howInstalled(cliSpecs["grok"], grokBin); u == nil || !u.cask || !reflect.DeepEqual(u.cmd, []string{brew, "upgrade", "--cask", "grok-build"}) {
+		t.Errorf("Grok Build's cask: %+v", u)
+	}
+	os.Remove(filepath.Join(brewDir, "bin/gemini"))
 	file(t, filepath.Join(brewDir, "Cellar/something/1.0/bin/gemini"), "")
 	if u := howInstalled(cliSpecs["gemini"], link(t, "../Cellar/something/1.0/bin/gemini", filepath.Join(brewDir, "bin/gemini"))); u != nil {
 		t.Errorf("another formula: %+v", u)
@@ -229,6 +262,12 @@ func TestHowInstalled(t *testing.T) {
 	oc := file(t, filepath.Join(home, ".opencode/bin/opencode"), "")
 	if u := howInstalled(cliSpecs["opencode"], oc); u == nil || u.shown() != "opencode upgrade" {
 		t.Errorf("opencode's installer: %+v", u)
+	}
+	// DevEco Code's install: ~/.local/bin/deveco → its versions folder
+	file(t, filepath.Join(home, ".local/share/deveco/versions/0.2.3/deveco"), "")
+	deveco := link(t, filepath.Join(home, ".local/share/deveco/versions/0.2.3/deveco"), filepath.Join(home, ".local/bin/deveco"))
+	if u := howInstalled(cliSpecs["deveco"], deveco); u == nil || u.via != "self" || u.pkg != "@deveco/deveco-code" || !reflect.DeepEqual(u.cmd, []string{deveco, "upgrade"}) {
+		t.Errorf("deveco's installer: %+v", u)
 	}
 
 	// a binary that says nothing of how it got there: the version only
@@ -323,6 +362,100 @@ func TestUpdateCLI(t *testing.T) {
 	}
 	if _, ok := (&Agent{ID: "codex", Bin: "codex", WSL: "Ubuntu"}).CLI(); ok {
 		t.Error("a WSL codex has a CLI here")
+	}
+}
+
+// An opencode 1.19.0's upgrade asks GitHub's API for the newest release,
+// which answers an address 60 times an hour without a token before a 403
+// (ggbdpq: "opencode upgrade: ... 403 GET https://api.github.com/repos/
+// anomalyco/opencode/releases/latest"). magpie gives it the version the row
+// promised, which its installer downloads from the release itself.
+func TestUpdateCLIOpenCodeTakesVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script as the CLI")
+	}
+	tmp, _ := filepath.EvalSymlinks(t.TempDir())
+	verFile := filepath.Join(tmp, "version")
+	os.WriteFile(verFile, []byte("1.19.2\n"), 0o644)
+	oc := file(t, filepath.Join(tmp, "home/.opencode/bin/opencode"), "#!/bin/sh\n/bin/cat "+verFile+"\n")
+	bin := link(t, oc, filepath.Join(tmp, "bin/opencode"))
+	t.Setenv("PATH", filepath.Dir(bin))
+
+	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/opencode-ai/latest" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`{"name":"opencode-ai","version":"1.19.3"}`))
+	}))
+	defer reg.Close()
+	oldReg, oldRun := npmRegistry, runUpdate
+	npmRegistry = reg.URL + "/"
+	versions, latests = memo{}, memo{}
+	var ran [][]string
+	runUpdate = func(_ context.Context, u *updater) ([]byte, error) {
+		ran = append(ran, u.cmd)
+		os.WriteFile(verFile, []byte("1.19.3\n"), 0o644)
+		return nil, nil
+	}
+	t.Cleanup(func() { npmRegistry, runUpdate = oldReg, oldRun; versions, latests = memo{}, memo{} })
+
+	a := &Agent{ID: "opencode", Name: "OpenCode", Bin: "opencode"}
+	if c, ok := a.CLI(); !ok || c.Via != "self" || c.Version != "1.19.2" || c.Latest != "1.19.3" || !c.Update {
+		t.Fatalf("before: %+v", c)
+	}
+	if c, err := a.UpdateCLI(); err != nil || c.Version != "1.19.3" || c.Update {
+		t.Fatalf("after: %+v, %v", c, err)
+	}
+	if len(ran) != 1 || !reflect.DeepEqual(ran[0], []string{bin, "upgrade", "1.19.3"}) {
+		t.Errorf("ran %q", ran)
+	}
+}
+
+// An opencode npm installed is updated by npm as it was: the version
+// opencode's own upgrade takes is never put after npm's install, where npm
+// would read it as one more package to install.
+func TestUpdateCLIOpenCodeByNpmTakesNoVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script as the CLI")
+	}
+	tmp, _ := filepath.EvalSymlinks(t.TempDir())
+	prefix := filepath.Join(tmp, "node")
+	verFile := filepath.Join(tmp, "version")
+	os.WriteFile(verFile, []byte("1.19.2\n"), 0o644)
+	file(t, filepath.Join(prefix, "lib/node_modules/opencode-ai/bin/opencode"), "#!/bin/sh\n/bin/cat "+verFile+"\n")
+	file(t, filepath.Join(prefix, "bin/npm"), "#!/bin/sh\nexit 1\n")
+	link(t, "../lib/node_modules/opencode-ai/bin/opencode", filepath.Join(prefix, "bin/opencode"))
+	t.Setenv("PATH", filepath.Join(prefix, "bin"))
+
+	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/opencode-ai/latest" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`{"name":"opencode-ai","version":"1.19.3"}`))
+	}))
+	defer reg.Close()
+	oldReg, oldRun := npmRegistry, runUpdate
+	npmRegistry = reg.URL + "/"
+	versions, latests = memo{}, memo{}
+	var ran [][]string
+	runUpdate = func(_ context.Context, u *updater) ([]byte, error) {
+		ran = append(ran, u.cmd)
+		os.WriteFile(verFile, []byte("1.19.3\n"), 0o644)
+		return nil, nil
+	}
+	t.Cleanup(func() { npmRegistry, runUpdate = oldReg, oldRun; versions, latests = memo{}, memo{} })
+
+	a := &Agent{ID: "opencode", Name: "OpenCode", Bin: "opencode"}
+	if c, ok := a.CLI(); !ok || c.Via != "npm" || c.Latest != "1.19.3" || !c.Update {
+		t.Fatalf("before: %+v", c)
+	}
+	if _, err := a.UpdateCLI(); err != nil {
+		t.Fatal(err)
+	}
+	if len(ran) != 1 || !strings.HasSuffix(strings.Join(ran[0], " "), "install -g --prefix "+prefix+" opencode-ai@latest") {
+		t.Errorf("ran %q", ran)
 	}
 }
 
@@ -466,5 +599,116 @@ func TestGrokInstalled(t *testing.T) {
 	file(t, filepath.Join(home, ".grok", "config.toml"), "[cli]\ninstaller = \"internal\"\nchannel = \"alpha\"\n")
 	if c, _ := a.CLI(); c.Latest != "1.0.51-alpha.2" {
 		t.Errorf("alpha: %+v", c)
+	}
+}
+
+// Grok Build from Homebrew's grok-build cask (Will on Discord): grok on PATH
+// leads into Caskroom/grok-build, with no ~/.grok/bin/grok. It is found,
+// detected before grok first runs, and updated with brew; Homebrew's grok
+// formula, a regular-expression tool, never is.
+func TestGrokBrewCask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Homebrew's links")
+	}
+	home, _ := filepath.EvalSymlinks(t.TempDir())
+	t.Setenv("HOME", home)
+	t.Setenv("GROK_HOME", "")
+	brewDir := filepath.Join(home, "homebrew")
+	t.Setenv("PATH", filepath.Join(brewDir, "bin"))
+	file(t, filepath.Join(brewDir, "bin/brew"), "#!/bin/sh\n")
+
+	oldVer, oldLatest := runVersion, brewLatest
+	says := "grok 1.0.46 (2765805b9442)"
+	runVersion = func(string) string { return says }
+	brewLatest = func(u *updater) (string, error) { return "1.0.52", nil }
+	versions, latests = memo{}, memo{}
+	t.Cleanup(func() {
+		runVersion, brewLatest = oldVer, oldLatest
+		versions, latests = memo{}, memo{}
+	})
+
+	// the regular-expression tool's grok, the formula of that name
+	file(t, filepath.Join(brewDir, "Cellar/grok/0.9.2/bin/grok"), "")
+	link(t, "../Cellar/grok/0.9.2/bin/grok", filepath.Join(brewDir, "bin/grok"))
+	a := grok(home)
+	if a.Detected() {
+		t.Error("Homebrew's grok formula detected as Grok Build")
+	}
+	if c, ok := a.CLI(); ok {
+		t.Errorf("Homebrew's grok formula taken for Grok Build: %+v", c)
+	}
+
+	// the cask, as formulae.brew.sh/api/cask/grok-build.json has it: binary
+	// grok-1.0.46-macos-aarch64, target grok
+	os.Remove(filepath.Join(brewDir, "bin/grok"))
+	file(t, filepath.Join(brewDir, "Caskroom/grok-build/1.0.46/grok-1.0.46-macos-aarch64"), "")
+	bin := link(t, "../Caskroom/grok-build/1.0.46/grok-1.0.46-macos-aarch64", filepath.Join(brewDir, "bin/grok"))
+	if !a.Detected() {
+		t.Error("the grok-build cask, before grok has run, not detected")
+	}
+	c, ok := a.CLI()
+	if !ok || c.Path != bin || c.Version != "1.0.46" || c.Via != "brew" || c.Command != "brew upgrade --cask grok-build" || c.Latest != "1.0.52" || !c.Update {
+		t.Fatalf("the grok-build cask: %+v %v", c, ok)
+	}
+
+	// with an old ~/.grok/bin/grok from x.ai's installer beside it, the
+	// cask PATH runs is the one shown and updated
+	file(t, filepath.Join(home, ".grok/downloads/grok-macos-aarch64"), "")
+	link(t, "../downloads/grok-macos-aarch64", filepath.Join(home, ".grok/bin/grok"))
+	if c, _ := a.CLI(); c.Path != bin || c.Via != "brew" {
+		t.Errorf("cask and installer: %+v", c)
+	}
+	// PATH running the installer's instead: that one, updated by grok update
+	os.Remove(bin)
+	if c, _ := a.CLI(); c.Path != filepath.Join(home, ".grok/bin/grok") || c.Via != "self" {
+		t.Errorf("installer only: %+v", c)
+	}
+}
+
+// bunxOf is a .bunx as bun 1.4.3 wrote it beside its Windows shims, on the
+// Windows box after bun add -g opencode-ai @oh-my-pi/pi-coding-agent: the
+// program's path from bun's folder in UTF-16, a quote, then bun's own
+// bytes (omp's names bun as its runner).
+func bunxOf(t *testing.T, path string, tail []byte) string {
+	t.Helper()
+	var b []byte
+	for _, r := range path + `"` {
+		b = append(b, byte(r), 0)
+	}
+	return string(append(append(b, 0, 0), tail...))
+}
+
+// opencode and omp bun installed on Windows are updated with bun: bun's
+// shim there is an .exe naming no package, and the .bunx beside it names
+// it (#2192, xiaozhu1337: opencode 2.0.24 and omp 18.6.1 with newer out,
+// no update offered). omp's own -Binary install updates itself.
+func TestHowInstalledBunWindowsShim(t *testing.T) {
+	bunDir := filepath.Join(t.TempDir(), "bun-home") // a BUN_INSTALL with no .bun in it
+	bun := file(t, filepath.Join(bunDir, "bin", exe("bun")), "MZ")
+	file(t, filepath.Join(bunDir, "install/global/node_modules/opencode-ai/bin/opencode.exe"), "MZ")
+	file(t, filepath.Join(bunDir, "install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"), "")
+	opencode := file(t, filepath.Join(bunDir, "bin/opencode.exe"), "MZ\x90\x00 node_modules") // bun's 8 KB shim
+	file(t, filepath.Join(bunDir, "bin/opencode.bunx"), bunxOf(t, `install\global\node_modules\opencode-ai\bin\opencode.exe`, []byte{0x30, 0xab}))
+	omp := file(t, filepath.Join(bunDir, "bin/omp.exe"), "MZ\x90\x00 node_modules")
+	file(t, filepath.Join(bunDir, "bin/omp.bunx"), bunxOf(t, `install\global\node_modules\@oh-my-pi\pi-coding-agent\dist\cli.js`,
+		[]byte{'b', 0, 'u', 0, 'n', 0, ' ', 0, 0x82, 0, 0, 0, 8, 0, 0, 0, 0x35, 0xab}))
+	if u := howInstalled(cliSpecs["opencode"], opencode); u == nil || u.via != "bun" || !reflect.DeepEqual(u.cmd, []string{bun, "add", "-g", "opencode-ai@latest"}) {
+		t.Errorf("opencode's bun shim: %+v", u)
+	}
+	if u := howInstalled(cliSpecs["omp"], omp); u == nil || u.via != "bun" || !reflect.DeepEqual(u.cmd, []string{bun, "add", "-g", "@oh-my-pi/pi-coding-agent@latest"}) {
+		t.Errorf("omp's bun shim: %+v", u)
+	}
+	// a .bunx naming another package is not this one's
+	if u := howInstalled(cliSpecs["omp"], opencode); u != nil {
+		t.Errorf("opencode's shim taken as omp's: %+v", u)
+	}
+
+	// omp.sh's binary install: %LOCALAPPDATA%\omp\omp.exe, ~/.local/bin/omp
+	home := t.TempDir()
+	for _, p := range []string{"AppData/Local/omp/omp.exe", ".local/bin/omp"} {
+		bin := file(t, filepath.Join(home, p), "MZ")
+		if u := howInstalled(cliSpecs["omp"], bin); u == nil || u.via != "self" || !reflect.DeepEqual(u.cmd, []string{bin, "update"}) || u.pkg != "@oh-my-pi/pi-coding-agent" {
+			t.Errorf("omp's binary at %s: %+v", p, u)
+		}
 	}
 }

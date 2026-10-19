@@ -35,28 +35,8 @@ func SetLoginOn(agent, user string, on bool) error {
 		return setPluginLoginOn(pp, user, on)
 	}
 	switch agent {
-	case "grok":
-		return setGrokLoginOn(user, on)
 	case "copilot":
 		return setCopilotLoginOn(user, on)
-	case "zcode":
-		return setZCodeLoginOn(user, on)
-	case "kiro":
-		return setKiroLoginOn(user, on)
-	case "devin":
-		return setDevinLoginOn(user, on)
-	case "workbuddy", WorkBuddyAIID:
-		return setWorkBuddyLoginOn(wbSiteOf(agent), user, on)
-	case CommandCodePlanID:
-		return setCommandCodeLoginOn(user, on)
-	case "qoder", QoderCNID:
-		return setSideLoginOn(agent, user, on, qoderLoginsOf(agent))
-	case "zed":
-		return setZedLoginOn(user, on)
-	case "factory":
-		return setFactoryLoginOn(user, on)
-	case MiMoID:
-		return setMiMoLoginOn(user, on)
 	case ChatGPTAPIID:
 		return setSIWCLoginOn(user, on)
 	case "gemini", "antigravity":
@@ -132,43 +112,28 @@ func (p Provider) OwnPaused() bool {
 }
 
 // AlsoOn is a signed-in agent's other accounts that are on, each as a
-// provider of its own, in the order they were saved.
+// provider of its own, in the order they were saved. Each keeps what the
+// user set on the provider, as p has it from All: its queue, limits,
+// routing and models (withPicks). A Claude or Codex account is p with
+// another sign-in, and had them always; one a sign-in of its own makes
+// afresh had none, and a second WorkBuddy AI account queued 62s with the
+// wait set to 1s (#1899).
 func (p Provider) AlsoOn() []Provider {
+	out := p.alsoOn()
+	for i, q := range out {
+		out[i] = withPicks(q, p)
+	}
+	return out
+}
+
+// alsoOn is AlsoOn as each sign-in makes its accounts, without the
+// provider's settings.
+func (p Provider) alsoOn() []Provider {
 	if p.IsPlugin() {
 		return pluginAlsoOn(*p.Account.plugin)
 	}
-	if p.Account != nil && p.Account.Agent == "grok" && p.Account.token == nil {
-		return grokAlsoOn(p)
-	}
 	if p.Account != nil && p.Account.Agent == "copilot" {
 		return copilotAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == "zcode" {
-		return zcodeAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == "kiro" {
-		return kiroAlsoOn(p)
-	}
-	if p.Account != nil && p.Account.Agent == "devin" {
-		return devinAlsoOn()
-	}
-	if p.Account != nil && wbSiteOf(p.Account.Agent) != nil {
-		return workBuddyAlsoOn(wbSiteOf(p.Account.Agent))
-	}
-	if p.Account != nil && p.Account.Agent == CommandCodePlanID {
-		return commandCodeAlsoOn()
-	}
-	if p.Account != nil && (p.Account.Agent == "qoder" || p.Account.Agent == QoderCNID) {
-		return qoderAlsoOn(p.Account.Agent)
-	}
-	if p.Account != nil && p.Account.Agent == "zed" {
-		return zedAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == "factory" {
-		return factoryAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == MiMoID {
-		return mimoAlsoOn()
 	}
 	if p.Account != nil && p.Account.Agent == ChatGPTAPIID {
 		return siwcAlsoOn()

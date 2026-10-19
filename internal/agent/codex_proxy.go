@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"encoding/json"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/proc"
 )
 
 // Codex sends its requests to magpie's gateway, http://127.0.0.1:3425, the
@@ -20,8 +20,10 @@ import (
 // on X: every project and every new chat 502, "a local gateway config and a
 // proxy switch, two pitfalls stacked"). Its HTTP client is reqwest with its
 // default features (codex-rs Cargo.toml), whose proxy is hyper-util's
-// Matcher::from_system: HTTP_PROXY/ALL_PROXY, else the system's proxy
-// (Windows' Internet Options, macOS' network settings), and nothing goes
+// Matcher::from_system: HTTP_PROXY, else the system's proxy for http://
+// (Windows' Internet Options when it names one proxy for all, macOS' "Web
+// proxy (HTTP)" entry alone: never its HTTPS or SOCKS one), else ALL_PROXY,
+// and nothing goes
 // around it but what NO_PROXY names — or, with no NO_PROXY, Windows'
 // ProxyOverride — as an IP, a CIDR or "*" for an address: "127.*" and
 // "localhost" there don't keep 127.0.0.1 off it, and macOS' exceptions
@@ -31,7 +33,15 @@ import (
 // them. With [features] respect_system_proxy (codex-rs outbound_proxy),
 // Codex asks the system alone: Windows' bypass list is matched with its
 // wildcards and <local>, macOS' exceptions likewise, and with no proxy set
-// there it goes direct.
+// there it goes direct; a SOCKS one alone on macOS it can't use, and takes
+// HTTP_PROXY/ALL_PROXY then. reqwest is built without SOCKS (codex-rs'
+// Cargo.lock has no tokio-socks), so a socks5:// proxy in ALL_PROXY is
+// spoken to as an HTTP one.
+//
+// The environment is the one Codex runs with: a terminal's, or, for the
+// ChatGPT app's Codex, the login shell's, which the app takes as it opens.
+// magpie opened from the Dock has neither, so the login shell's are asked
+// (proc.LoginEnv), over magpie's own.
 //
 // So before magpie hands Codex's requests to the gateway uninvited (account
 // failover), and while it has them, it asks the way Codex would go: through
@@ -39,12 +49,21 @@ import (
 // kind "proxied").
 
 // codexProxyEnv, codexSystemProxy and codexProxyOS are what codexProxyFor
-// reads; vars so tests can say.
+// reads, and loginEnv what codexEnv does; vars so tests can say.
 var (
-	codexProxyEnv    = os.Getenv
+	codexProxyEnv    = codexEnv
 	codexSystemProxy = netproxy.System
 	codexProxyOS     = runtime.GOOS
+	loginEnv         = proc.LoginEnv
 )
+
+// codexEnv is k as Codex has it: the login shell's, else magpie's own.
+func codexEnv(k string) string {
+	if v := loginEnv(k); v != "" {
+		return v
+	}
+	return os.Getenv(k)
+}
 
 // codexProxyFor is the proxy this machine's Codex, configured by the
 // config.toml at cfg, sends a request for base through, and where that
@@ -56,13 +75,15 @@ func codexProxyFor(cfg, base string) (proxy, from string) {
 		return "", ""
 	}
 	host := u.Hostname()
-	env := func(keys ...string) string {
+	// env is the first of keys set, and which one it is: the detail names
+	// the variable the value is in, http_proxy or HTTP_PROXY (#2627)
+	env := func(keys ...string) (string, string) {
 		for _, k := range keys {
 			if v := strings.TrimSpace(codexProxyEnv(k)); v != "" {
-				return v
+				return v, k
 			}
 		}
-		return ""
+		return "", ""
 	}
 	httpKeys := []string{"HTTP_PROXY", "http_proxy"}
 	if u.Scheme == "https" {
@@ -77,19 +98,39 @@ func codexProxyFor(cfg, base string) (proxy, from string) {
 		if sys.URL == "" || systemBypassed(host, sys.Bypass) {
 			return "", ""
 		}
-		return sys.URL, systemProxyName()
+		if codexProxyOS != "darwin" {
+			return sys.URL, systemProxyName()
+		}
+		// CFNetwork's answer for an http:// URL: the HTTP entry (the HTTPS
+		// one is for https:// alone); a SOCKS one Codex can't use, and
+		// takes HTTP_PROXY/ALL_PROXY instead (codex-rs outbound_proxy:
+		// UnsupportedProxyScheme, then resolve_env_proxy_route)
+		switch {
+		case sys.HTTP != "":
+			return sys.HTTP, systemProxyName()
+		case sys.SOCKS == "":
+			return "", ""
+		}
+		p, k := env(httpKeys...)
+		if p == "" {
+			p, k = env("ALL_PROXY", "all_proxy")
+		}
+		if no, _ := env("NO_PROXY", "no_proxy"); p == "" || reqwestNoProxy(host, no) {
+			return "", ""
+		}
+		return p, k
 	}
-	// reqwest's: each of the environment's first, the system's where it
-	// names none, then ALL_PROXY; NO_PROXY, or Windows' bypass list without
-	// it, goes around them
-	p, k := env(httpKeys...), httpKeys[0]
-	no := env("NO_PROXY", "no_proxy")
+	// reqwest's: each of the environment's first, the system's for
+	// http:// where it names none, then ALL_PROXY; NO_PROXY, or Windows'
+	// bypass list without it, goes around them
+	p, k := env(httpKeys...)
+	no, _ := env("NO_PROXY", "no_proxy")
 	sys := codexSystemProxy()
-	if p == "" && sys.URL != "" {
-		p, k = sys.URL, systemProxyName()
+	if p == "" && sys.HTTP != "" {
+		p, k = sys.HTTP, systemProxyName()
 	}
 	if p == "" {
-		p, k = env("ALL_PROXY", "all_proxy"), "ALL_PROXY"
+		p, k = env("ALL_PROXY", "all_proxy")
 	}
 	if no == "" && codexProxyOS == "windows" && sys.URL != "" {
 		no = strings.ReplaceAll(strings.Join(sys.Bypass, ","), "*.", "")
@@ -170,7 +211,9 @@ func systemBypassed(host string, bypass []string) bool {
 
 // proxyProbe says whether a request for base sent through proxy is answered
 // by magpie: its gateway's GET / names it. A proxy's own 502, or anything
-// else that isn't magpie, is not. A var for tests.
+// else that isn't magpie, is not. A socks proxy is asked as Codex asks it:
+// as an HTTP one at the same address, since its reqwest has no SOCKS. A var
+// for tests.
 var proxyProbe = realProxyProbe
 
 func realProxyProbe(base, proxy string) bool {
@@ -178,16 +221,15 @@ func realProxyProbe(base, proxy string) bool {
 	if err != nil {
 		return false
 	}
+	if strings.HasPrefix(strings.ToLower(p.Scheme), "socks") {
+		p.Scheme = "http"
+	}
 	c := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(p)}}
 	res, err := c.Get(strings.TrimSuffix(base, "/") + "/")
 	if err != nil {
 		return false
 	}
-	defer res.Body.Close()
-	var info struct {
-		Name string `json:"name"`
-	}
-	return res.StatusCode == http.StatusOK && json.NewDecoder(res.Body).Decode(&info) == nil && info.Name == "magpie"
+	return answersAsMagpie(res)
 }
 
 // codexThroughProxy says whether Codex, configured by cfg, gets to the
@@ -214,15 +256,15 @@ func codexProxyOK(cfg, base string) bool {
 // how to get it there.
 func codexProxiedDetail(base, proxy, from string) string {
 	host := strings.TrimPrefix(base, "http://")
-	d := "Codex sends its requests for magpie (" + host + ") through the proxy at " + proxy + ", set in " + from + ", and that proxy doesn't pass them on to magpie: every turn fails, with 502 Bad Gateway, whichever model it is on. " +
+	d := "Codex sends its requests for magpie (" + host + ") through the proxy at " + netproxy.Redact(proxy) + ", set in " + from + ", and that proxy doesn't pass them on to magpie: every turn fails, with 502 Bad Gateway, whichever model it is on. " +
 		"Have the proxy send 127.0.0.1 direct (a DIRECT rule for 127.0.0.0/8, or rule mode rather than global), "
 	switch {
-	case strings.Contains(from, "PROXY"):
-		d += "or add 127.0.0.1 to NO_PROXY, "
+	case strings.Contains(strings.ToUpper(from), "_PROXY"):
+		d += "or add 127.0.0.1 to NO_PROXY where " + from + " is set (your shell profile, such as ~/.zshrc, if it's there), "
 	case codexProxyOS == "windows":
 		d += "or add 127.0.0.1 to \"Don't use the proxy server for addresses beginning with\" in Windows' proxy settings (127.* there is not enough for Codex), "
 	default:
-		d += "or set NO_PROXY=127.0.0.1 for Codex, "
+		d += "or add export NO_PROXY=127.0.0.1 to your shell profile (~/.zshrc): Codex in a terminal and the ChatGPT app's Codex both read it, "
 	}
 	return d + "then quit and reopen Codex. Until then, Disconnect from magpie puts Codex's config back as it was."
 }

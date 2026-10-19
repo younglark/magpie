@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -490,4 +491,130 @@ func TestZCodeKeepsUserFormat(t *testing.T) {
 	if k, api := formats(); k != "anthropic" || api != "anthropic-messages" {
 		t.Fatalf("unknown format: %q %q", k, api)
 	}
+}
+
+// A ZCode whose data the user moved in its settings (数据存储路径) reads its
+// providers from the new folder: magpie's provider goes there, and the home
+// folder's .zcode, where only setting.json is left, gets none (flower on
+// Discord: magpie said connected, and ZCode's settings had no magpie).
+func TestZCodeMovedDataFolder(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(t.TempDir(), "ZCodeData")
+	homeV2, movedV2 := filepath.Join(home, ".zcode", "v2"), filepath.Join(moved, ".zcode", "v2")
+	os.MkdirAll(homeV2, 0o755)
+	os.MkdirAll(movedV2, 0o755)
+	// what ZCode writes when the folder is moved: the choice stays at home,
+	// the data (an empty provider list among it) is copied over
+	setting, _ := json.Marshal(map[string]any{"locale": "zh-CN", "dataBaseDir": moved})
+	os.WriteFile(filepath.Join(homeV2, "setting.json"), setting, 0o644)
+	empty := `{"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[]},"modelConfigRules":{"providerModelRules":[],"manualProviderModelRules":[]}}}`
+	os.WriteFile(filepath.Join(movedV2, "provider_config.json"), []byte(empty), 0o600)
+
+	a := zcode(home)
+	f := a.Field("provider")
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if !zcodeRuled(filepath.Join(movedV2, "provider_config.json")) {
+		b, _ := os.ReadFile(filepath.Join(movedV2, "provider_config.json"))
+		t.Fatalf("no magpie in the moved folder's provider_config.json: %s", b)
+	}
+	if _, ok := edit.GetJSON(filepath.Join(movedV2, "config.json"), "provider.magpie"); !ok {
+		t.Fatal("no magpie in the moved folder's config.json")
+	}
+	for _, n := range []string{"provider_config.json", "config.json"} {
+		if _, err := os.Stat(filepath.Join(homeV2, n)); err == nil {
+			t.Fatalf("%s written in the home folder ZCode no longer reads", n)
+		}
+	}
+	if f.Get() != "magpie" {
+		t.Fatalf("get: %q", f.Get())
+	}
+
+	// a relative or empty dataBaseDir is not a folder ZCode moved to
+	for _, d := range []string{"", "  ", "ZCodeData"} {
+		setting, _ := json.Marshal(map[string]any{"dataBaseDir": d})
+		os.WriteFile(filepath.Join(homeV2, "setting.json"), setting, 0o644)
+		if got := zcode(home).Dir; got != filepath.Join(home, ".zcode") {
+			t.Fatalf("dataBaseDir %q: %s", d, got)
+		}
+	}
+}
+
+// What the user set on magpie's provider rule in ZCode's provider_config.json
+// stays through every sync and pick (#2030's siblings): its name, logo,
+// visibility, a header, the key's management link. The address, key, format
+// and model lists stay magpie's.
+func TestZCodeKeepsTheUsersSettings(t *testing.T) {
+	home := syncHome(t)
+	rules := filepath.Join(home, ".zcode", "v2", "provider_config.json")
+	os.MkdirAll(filepath.Dir(rules), 0o755)
+	os.WriteFile(filepath.Join(filepath.Dir(rules), "config.json"), []byte(`{}`), 0o644)
+	a := zcode(home)
+	f := a.Field("provider")
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	type rule = map[string]any
+	load := func() (map[string]any, rule) {
+		var d map[string]any
+		raw := readFile(rules)
+		if err := json.Unmarshal([]byte(raw), &d); err != nil {
+			t.Fatalf("%v\n%s", err, raw)
+		}
+		for _, r := range zcodeList(zcodeObj(zcodeObj(d, "config"), "providerConfigRules"), "providerRules") {
+			if m := r.(map[string]any); m["providerId"] == magpieID {
+				return d, m
+			}
+		}
+		t.Fatalf("no rule:\n%s", raw)
+		return nil, nil
+	}
+	d, r := load()
+	cfg := r["config"].(map[string]any)
+	r["providerName"] = "My GW"
+	cfg["logo"] = map[string]any{"type": "builtin", "key": "openai"}
+	cfg["visibility"] = "visible"
+	cfg["api"].(map[string]any)["headers"] = map[string]any{"X-Mine": "1"}
+	cfg["api"].(map[string]any)["baseUrl"] = "http://127.0.0.1:1/v1"
+	cfg["access"].(map[string]any)["apiKeyManagementUrl"] = "https://x/keys"
+	cfg["personalModelIds"] = []any{"gone/old"}
+	b, _ := json.Marshal(d)
+	os.WriteFile(rules, b, 0o600)
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := a.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(when string) {
+		t.Helper()
+		_, r := load()
+		cfg := r["config"].(map[string]any)
+		api, access := cfg["api"].(map[string]any), cfg["access"].(map[string]any)
+		headers, _ := api["headers"].(map[string]any)
+		logo, _ := cfg["logo"].(map[string]any)
+		if r["providerName"] != "My GW" || logo["key"] != "openai" || cfg["visibility"] != "visible" || headers["X-Mine"] != "1" ||
+			access["apiKeyManagementUrl"] != "https://x/keys" {
+			t.Errorf("%s: the user's settings not kept:\n%s", when, readFile(rules))
+		}
+		ids, _ := cfg["personalModelIds"].([]any)
+		if api["baseUrl"] == "http://127.0.0.1:1/v1" || access["apiKey"] == "" || slices.Contains(ids, any("gone/old")) || !slices.Contains(ids, any("deepseek/pro")) {
+			t.Errorf("%s: magpie's own parts not written:\n%s", when, readFile(rules))
+		}
+	}
+	check("sync")
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	check("pick")
 }

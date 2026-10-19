@@ -34,7 +34,7 @@ func (m *model) reloadGroups() {
 	m.grow = clamp(m.grow, len(m.groups))
 }
 
-var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed, provider.Pace, provider.Manual}
+var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed, provider.Pace, provider.Weighted, provider.Manual}
 
 func routingName(v string) string {
 	switch v {
@@ -70,6 +70,8 @@ func staysName(v string) string {
 		return "stays a turn"
 	case provider.AffinityOff:
 		return "never stays"
+	case provider.AffinityStrict:
+		return "stays strictly"
 	}
 	return "stays auto"
 }
@@ -193,7 +195,10 @@ func memberOptions(skip []string, self string) []agent.Option {
 	g, _ := findGroup(self)
 	decides := self != "" && g.Decides()
 	if !decides {
-		for _, e := range provider.Catalog() {
+		// every model a group can be made of: those kept out of the lists
+		// agents see too (a provider kept for routing groups, a group's
+		// with listed=no, #1783), as the Routing view's picker offers
+		for _, e := range provider.Served() {
 			if slices.Contains(skip, e.ID) || e.ID == provider.GroupPrefix+self {
 				continue
 			}
@@ -205,7 +210,8 @@ func memberOptions(skip []string, self string) []agent.Option {
 		}
 	}
 	if self == "" || decides {
-		for _, e := range provider.Deciders() {
+		// those of a provider's picks, as the Routing view's picker offers
+		for _, e := range provider.OfferedDeciders(nil) {
 			if !slices.Contains(skip, e.ID) {
 				out = append(out, agent.Option{Value: e.ID, Note: e.Name + " · decision model"})
 			}
@@ -227,6 +233,7 @@ func (m *model) openMemberPicker(p pickMsg) {
 		crumbs: crumbs,
 		input:  newInput("filter models and groups"),
 		items:  memberOptions(skip, p.group),
+		relist: func() []agent.Option { return memberOptions(skip, p.group) },
 		empty:  empty,
 		onPick: func(id string) tea.Cmd {
 			if p.group != "" {
@@ -254,21 +261,25 @@ func (m *model) openMemberPicker(p pickMsg) {
 // openClassifier picks the model that tells which intent a message is:
 // a model, or another group whose models are tried in turn.
 func (m *model) openClassifier(g provider.Group) {
-	var items []agent.Option
-	for _, e := range provider.Catalog() {
-		if e.Group == g.ID {
-			continue // it can't classify for itself
+	list := func() []agent.Option {
+		var items []agent.Option
+		for _, e := range provider.Catalog() {
+			if e.Group == g.ID {
+				continue // it can't classify for itself
+			}
+			note := e.Name
+			if e.ID == g.Classifier {
+				note = "● now · " + note
+			}
+			items = append(items, agent.Option{Value: e.ID, Note: note})
 		}
-		note := e.Name
-		if e.ID == g.Classifier {
-			note = "● now · " + note
-		}
-		items = append(items, agent.Option{Value: e.ID, Note: note})
+		return items
 	}
 	m.pk = picker{
 		crumbs: []string{"routing", g.Name, "classifier"},
 		input:  newInput("filter models · best a small fast one without reasoning"),
-		items:  items,
+		items:  list(),
+		relist: list,
 		empty:  "magpie has no models yet · add a provider first",
 		onPick: func(id string) tea.Cmd {
 			return saveGroup(g.ID, func(g *provider.Group) error { g.Classifier = id; return nil }, g.Name+" classifies with "+id)
@@ -283,6 +294,7 @@ func (m *model) openClassifier(g provider.Group) {
 const ruleHint = `use=<model>, and any of: tokens=200k · images · effort=on|low|medium|high|xhigh|max · agents=codex,claude
 intent="a quick question" (the group's classifier=<model> tells it) · compact
 time=09:00-18:00 (local; 22:00-08:00 runs past midnight) · days=mon-fri · folders=~/work/acme,~/oss · except-folders=~/old · at=<n> for its place
+use-effort=low|medium|high|xhigh|max: the reasoning the model is asked for, whatever the agent asked
 or pause=<model> time=… days=… agents=… folders=… except-folders=…: the model is left out of the group then, not even a fallback`
 
 // openRule asks for a rule: a new one, or rule i (from 0) typed again.
@@ -615,7 +627,10 @@ func (m model) viewGroup() string {
 	}
 	b.WriteString(pad + "  " + sMuted.Render(strings.Join(head, " · ")) + "\n\n")
 	b.WriteString(pad + "  " + sFaint.Render("models · the first that can take a request gets it") + "\n")
-	for i, id := range g.Members {
+	hits := provider.PatternHits(g)
+	memFrom, memTo, ruleFrom, ruleTo := groupWindow(len(g.Members), len(g.Rules), m.gsel, m.groupRows(g, len(hits)))
+	for i := memFrom; i < memTo; i++ {
+		id := g.Members[i]
 		marker, name := "  ", sText.Render(id)
 		if i == m.gsel {
 			marker, name = sCursor.Render("▸ "), sNameOn.Render(id)
@@ -630,7 +645,7 @@ func (m model) viewGroup() string {
 	}
 	// patterns find models in the catalog each time (#766): how many now,
 	// and one that finds none said so rather than left an empty list
-	if hits := provider.PatternHits(g); len(hits) > 0 {
+	if len(hits) > 0 {
 		b.WriteString("\n" + pad + "  " + sFaint.Render("patterns · every model they match now, after those named") + "\n")
 		for _, h := range hits {
 			n := sMuted.Render(fmt.Sprintf(" · %d model%s", h.Models, plural(h.Models)))
@@ -644,7 +659,8 @@ func (m model) viewGroup() string {
 	if len(g.Rules) == 0 {
 		b.WriteString(pad + "  " + sMuted.Render("none · n adds one") + "\n")
 	}
-	for i, r := range g.Rules {
+	for i := ruleFrom; i < ruleTo; i++ {
+		r := g.Rules[i]
 		marker, use := "  ", sText.Render(r.Use)
 		if len(g.Members)+i == m.gsel {
 			marker, use = sCursor.Render("▸ "), sNameOn.Render(r.Use)
@@ -653,10 +669,54 @@ func (m model) viewGroup() string {
 		if r.Pause {
 			arrow = " → pause "
 		}
+		if r.UseEffort != "" {
+			use += sMuted.Render(" at ") + sText.Render(r.UseEffort)
+		}
 		b.WriteString(pad + marker + sFaint.Render(fmt.Sprintf("%d  ", i+1)) + sMuted.Render(strings.Join(r.Conditions(), " · ")+arrow) + use + "\n")
 	}
 	if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { return r.Intent != "" }) {
 		b.WriteString("\n" + pad + "  " + sFaint.Render("classifier ") + sText.Render(dash(g.Classifier)) + sFaint.Render(" · tells which intent a message is") + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// groupRows is how many members and rules the group page has room for:
+// the terminal's height less every other line View draws around them —
+// the header, the group's line, the section titles, the patterns, the
+// classifier, and the blank line, the status and the two lines of keys
+// under them, as a short group's page has. A group with
+// more than that would otherwise scroll its header and the row picked
+// off the top and freeze the page, as the library page did (#2220) and
+// the agents page before it (#2428).
+func (m model) groupRows(g provider.Group, hits int) int {
+	fixed := 7 + 6 // above the members and between them and the rules; below the body
+	if hits > 0 {
+		fixed += 2 + hits
+	}
+	if len(g.Rules) == 0 {
+		fixed++
+	}
+	if slices.ContainsFunc(g.Rules, func(r provider.Rule) bool { return r.Intent != "" }) {
+		fixed += 2
+	}
+	return max(3, m.h-fixed)
+}
+
+// groupWindow picks the members [memFrom, memTo) and rules [ruleFrom,
+// ruleTo) to draw in rows lines, the row picked among them: a pick among
+// the members keeps the first rules below it as room allows, a pick
+// among the rules keeps the members' tail above it. Members and rules
+// share one cursor, sel, the rules counted after the members.
+func groupWindow(members, rules, sel, rows int) (memFrom, memTo, ruleFrom, ruleTo int) {
+	if members+rules <= rows {
+		return 0, members, 0, rules
+	}
+	if sel < members {
+		memFrom = max(0, sel+1-rows)
+		memTo = min(members, memFrom+rows)
+		return memFrom, memTo, 0, min(rules, rows-(memTo-memFrom))
+	}
+	ruleTo = min(rules, sel-members+1)
+	ruleFrom = max(0, ruleTo-rows)
+	return max(0, members-(rows-(ruleTo-ruleFrom))), members, ruleFrom, ruleTo
 }

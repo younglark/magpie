@@ -14,6 +14,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -61,10 +62,13 @@ func (a *Agent) Source() string {
 		if codexChatGPT(dir) {
 			return "chatgpt"
 		}
-		if v, _ := edit.GetJSON(filepath.Join(dir, "auth.json"), "OPENAI_API_KEY"); v != "" {
+		var k struct {
+			Key string `json:"OPENAI_API_KEY"`
+		}
+		if b, ok := provider.CodexSignIn(dir); ok && json.Unmarshal(b, &k) == nil && k.Key != "" {
 			return "key"
 		}
-	case "opencode", "mimocode":
+	case "opencode", "mimocode", "deveco":
 		// the providers in its config, and those signed in through it
 		n := map[string]bool{}
 		var cfg map[string]json.RawMessage
@@ -97,7 +101,7 @@ func (a *Agent) FailoverSaid() string {
 	if a.FailingOver == nil || !a.FailingOver() {
 		return ""
 	}
-	return "not connected · goes through magpie only to fail over to your other ChatGPT accounts; switch them off under Providers › Codex to stop it"
+	return "not connected · goes through magpie only to fail over to your other ChatGPT accounts; tick Only switch Codex's sign-in under Providers › Codex (magpie accounts switch-only codex on), or switch them off, to stop it"
 }
 
 // startsWith is, for an agent that reads magpie's models only as it

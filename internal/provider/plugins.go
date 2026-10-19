@@ -48,7 +48,7 @@ const (
 // installed (zenmux, #867), when it is id-plugin — but for a built-in moved
 // onto the plugin, whose id the plugin has now.
 func PluginID(id string) string {
-	if Moved(id) {
+	if PluginServes(id) {
 		return id
 	}
 	if slices.Contains(accountIDs, id) || Preset(id) != nil || id == "magpie" || customIDs()[id] {
@@ -175,26 +175,53 @@ func pluginModel(pp plugin.Provider, id string) (plugin.Model, bool) {
 	return plugin.Model{}, false
 }
 
+// PluginTiers are the service tiers p's plugin says its vendor serves
+// model at (m.serviceTiers, #2514): none for a provider not a plugin's, or
+// a model it doesn't list.
+func PluginTiers(p Provider, model string) []string {
+	if !p.IsPlugin() {
+		return nil
+	}
+	pp, ok := PluginOf(p.ID)
+	if !ok {
+		return nil
+	}
+	m, _ := pluginModel(pp, model)
+	return m.ServiceTiers
+}
+
+// pluginTierOn reports whether the plugin says its vendor serves m at tier,
+// on a Chat or Responses API, where the gateway sends it as service_tier
+// (forwardTranslated); a model on another API is sent no tier.
+func pluginTierOn(provider string, m plugin.Model, tier string) bool {
+	to := pluginProtocol(provider, m)
+	return (to == Chat || to == Responses) && slices.Contains(m.ServiceTiers, tier)
+}
+
 func pluginCatalog(pp plugin.Provider) []catalog.Model {
 	out := make([]catalog.Model, 0, len(pp.Models))
 	for _, m := range pp.Models {
 		c := catalog.Model{
 			ID: m.ID, Name: m.Name, Provider: pp.ID, Released: m.Released,
 			APIs: []string{string(pluginProtocol(pp.ID, m))}, Images: m.Image,
-			Context: m.Input, Output: m.Output, Free: m.Free,
+			Context: catalog.Window(m.Input), Output: m.Output, Free: m.Free,
 			Rate: m.Rate, RateWas: m.RateWas,
 			// a decision model the plugin marked counts only where it
 			// serves a decision API (pp.Decide)
 			Decides: pp.Decide && m.Decides,
+			// the tiers it says its vendor serves the model at (#2514)
+			Tiers: m.ServiceTiers,
 		}
-		if c.Context == 0 {
-			c.Context = m.Context
-		} else if m.Context > 0 && m.Context < c.Context {
+		// a limit under catalog.LeastWindow (512, H20 on Discord) is none:
+		// the other one, or models.dev, answers (ListedWindow)
+		if window := catalog.Window(m.Context); c.Context == 0 {
+			c.Context = window
+		} else if window > 0 && window < c.Context {
 			// the prompt cap a plugin names wins, but never above the
 			// window it also names: a row with input over context
 			// (opencode/hy3-free's 192K over 190K) was served past its
 			// window (#1286)
-			c.Context = m.Context
+			c.Context = window
 		}
 		// Cursor's own ids no catalog knows: one not named a 1M model
 		// holds what the catalog knows its base to, as the built-in's did
@@ -214,13 +241,13 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 		// So does Cline's plugin, which resells others' models as the
 		// ClinePass built-in does and gives no levels of its own: signed in
 		// through it, ClinePass showed none where its API key showed them
-		if len(c.Efforts) == 0 && (Moved(pp.ID) || pp.ID == "cline") {
+		if len(c.Efforts) == 0 && (PluginServes(pp.ID) || pp.ID == "cline") {
 			c.Efforts = borrowedEfforts(m.ID)
 		}
 		// OpenCode's price of a model it has none for is 0, as the
 		// plugins give a plan's models: a price is only one above it
-		if m.Cost != nil && (m.Cost.Input > 0 || m.Cost.Output > 0) {
-			c.Price = &catalog.Price{Input: m.Cost.Input, Output: m.Cost.Output}
+		if pr, ok := pluginPrice(m); ok {
+			c.Price = &pr
 		}
 		if m.ImageSaid {
 			c.ImageInput = &m.Image
@@ -233,6 +260,16 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 		out = append(out, c)
 	}
 	return out
+}
+
+// pluginPrice is m's price as its plugin gives it (m.Cost), if it gives
+// one: OpenCode's price of a model it has none for is 0, so only an input
+// or output price above it is one. A cache price of 0 is none given.
+func pluginPrice(m plugin.Model) (catalog.Price, bool) {
+	if m.Cost == nil || (m.Cost.Input <= 0 && m.Cost.Output <= 0) {
+		return catalog.Price{}, false
+	}
+	return catalog.Price{Input: m.Cost.Input, Output: m.Cost.Output, CacheRead: m.Cost.Cache.Read, CacheWrite: m.Cost.Cache.Write}, true
 }
 
 // pluginAccountCatalog is what the account at key serves: its own list
@@ -339,7 +376,7 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 	a.sign = func(ctx context.Context, req *http.Request, body []byte) error { return nil }
 	a.transport = func(req *http.Request) (*http.Response, error) { return pluginFetch(pp, acct.Key, req) }
 	p := Provider{ID: id, Name: name, Icon: PluginIcon(pp), Account: a}
-	if c, ok := movedCards[pp.ID]; ok && Moved(pp.ID) {
+	if c, ok := movedCards[pp.ID]; ok && PluginServes(pp.ID) {
 		p.Name, p.Icon, p.Website = c.name, c.icon, c.site // as the built-in was
 		m, _ := MigrationOf(pp.ID)
 		a.moved, a.wasHost = true, m.Host
@@ -369,6 +406,10 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 		// couldn't be reached (#1514)
 		p.Decide = pluginBase + pp.ID + "/v1"
 	}
+	// a plugin in front of Anthropic's or OpenAI's API says its upstream
+	// searches, as a relay is said to (#2027): its client's web_search goes
+	// to it as sent, on the APIs it has an address for (searchesItself)
+	p.Searches = pp.Searches
 	return p
 }
 

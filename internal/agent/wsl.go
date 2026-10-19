@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
@@ -85,6 +87,26 @@ func (p place) claudeDir() string {
 		return filepath.Join(p.home, ".claude")
 	}
 	return appdir.ClaudeDirIn(p.home)
+}
+
+// hermesHome is Hermes Agent's folder at the place: $HERMES_HOME, else
+// %LOCALAPPDATA%\hermes on Windows and ~/.hermes elsewhere, on this machine
+// (appdir.HermesHome); ~/.hermes in a distro, which is Linux and whose
+// variables magpie can't read.
+func (p place) hermesHome() string {
+	if p.spell != nil {
+		return filepath.Join(p.home, ".hermes")
+	}
+	return appdir.HermesHomeIn(p.home)
+}
+
+// hermesDefault is Hermes's default folder at the place, whatever
+// HERMES_HOME says: the root of its profiles.
+func (p place) hermesDefault() string {
+	if p.spell != nil {
+		return filepath.Join(p.home, ".hermes")
+	}
+	return appdir.HermesDefaultIn(p.home)
 }
 
 // exists is whether there is a file or folder at path, as an agent looks
@@ -511,6 +533,10 @@ var wslKinds = []wslKind{
 	// Reasonix's native CLI (1.39 on), by its command and the version it
 	// gives: the historical npm client is reasonix too, and ~/.reasonix is
 	// both's
+	// MothX's ~/.mothx in the distro: its MOTHX_DIR there isn't read
+	{id: "mothx", name: "MothX", dir: ".mothx", bin: "mothx", in: mothxIn,
+		restart: newNotice("{agent} in WSL {distro} reads its settings at start-up — restart open mothx sessions to use this."),
+		asleep:  wslOwnAsleep("mothx", "model")},
 	{id: "reasonix", name: "Reasonix", bin: "reasonix", in: reasonixIn, version: true,
 		accept: func(d distro) bool {
 			v := d.Versions["reasonix"]
@@ -721,7 +747,7 @@ func wslAgent(k wslKind, d distro) *Agent {
 // files, which starts the distro.
 func asleep(live *Agent, k wslKind, d distro) *Agent {
 	started := false
-	a := &Agent{ID: live.ID, Name: live.Name, Icon: live.Icon, WSL: d.Name, detect: live.detect, Spelled: live.Spelled,
+	a := &Agent{ID: live.ID, Name: live.Name, Icon: live.Icon, WSL: d.Name, detect: live.detect, Spelled: live.Spelled, ModelAliases: live.ModelAliases, NoNames: live.NoNames,
 		Notice: func() string {
 			if started {
 				return live.Notice()
@@ -730,7 +756,7 @@ func asleep(live *Agent, k wslKind, d distro) *Agent {
 		}}
 	for _, lf := range live.Fields {
 		key := lf.Key
-		f := Field{Key: key, Label: lf.Label, Quiet: lf.Quiet, Follows: lf.Follows, Options: lf.Options,
+		f := Field{Key: key, Label: lf.Label, Quiet: lf.Quiet, Live: lf.Live, Follows: lf.Follows, Options: lf.Options,
 			Get: func() string { return wslLastSeen(d.Name, k.memo(key)) },
 			Set: func(v string) error {
 				// opening a stopped distro's files is aborted rather than
@@ -860,6 +886,7 @@ var wsl struct {
 	names   []string        // every distro installed
 	running map[string]bool // those running
 	runAt   time.Time       // when running was listed
+	runOK   bool            // running is wsl.exe's answer, not a failure
 	listed  bool            // names is a real answer, and may forget distros
 	seen    map[string]*distro
 	probed  map[string]bool
@@ -875,6 +902,10 @@ const (
 	// WSL) is seen stopped within it, before anything opens its files,
 	// which would start it again (TJHHHH on Discord)
 	wslRunningAge = 3 * time.Second
+	// wslRunningFailedAge is how long wsl.exe failing to say is kept: each
+	// ask that times out holds wsl's lock, and so the GUI, for 10s, and
+	// leaves a wsl.exe behind (#2341)
+	wslRunningFailedAge = 30 * time.Second
 )
 
 // wslOn is whether there is WSL to look in: on Windows, or in tests.
@@ -1013,10 +1044,15 @@ func wslForgetOldBins() {
 // wsl.exe can't say, none is taken to run: a distro is never opened on a
 // guess.
 func wslRunningLocked() {
-	if !wsl.runAt.IsZero() && time.Since(wsl.runAt) <= wslRunningAge {
+	age := wslRunningAge
+	if !wsl.runOK {
+		age = wslRunningFailedAge
+	}
+	if !wsl.runAt.IsZero() && time.Since(wsl.runAt) <= age {
 		return
 	}
-	run, _ := wslList("-l", "--running", "-q")
+	run, ok := wslList("-l", "--running", "-q")
+	wsl.runOK = ok
 	wsl.running = map[string]bool{}
 	for _, n := range run {
 		wsl.running[n] = true
@@ -1047,11 +1083,20 @@ func wslSave() {
 	wslSaveLocked()
 }
 
+// wslSaveLocked writes wsl.seen when it changed. wsl.json holds every
+// distro's last probe, and wslDistros reads a file that doesn't parse as
+// no distro: such a file is copied aside first, and one that can't be
+// copied isn't written over (#2263).
 func wslSaveLocked() {
-	if wsl.dirty {
-		if b, err := json.MarshalIndent(wsl.seen, "", "  "); err == nil && edit.WriteAtomic(wslStatePath(), b) == nil {
-			wsl.dirty = false
-		}
+	if !wsl.dirty {
+		return
+	}
+	if err := lastgood.KeepUnparsed(wslStatePath(), lastgood.Into[map[string]*distro]); err != nil {
+		log.Printf("wsl.json wasn't written over: %v", err)
+		return
+	}
+	if b, err := json.MarshalIndent(wsl.seen, "", "  "); err == nil && edit.WriteAtomic(wslStatePath(), b) == nil {
+		wsl.dirty = false
 	}
 }
 

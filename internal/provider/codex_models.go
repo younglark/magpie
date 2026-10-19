@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -164,7 +163,7 @@ func SawCodexClient(h http.Header) {
 // PATH it looks where npm, nvm, bun, volta, pnpm, mise and the standalone
 // installer put it, which a desktop app's PATH lacks.
 var codexExecutable = func() string {
-	if p, err := exec.LookPath("codex"); err == nil {
+	if p, err := proc.LookPath("codex"); err == nil {
 		return p
 	}
 	names := []string{"codex"}
@@ -430,6 +429,28 @@ func CodexNativeHidden() map[string]bool {
 	return out
 }
 
+// CodexNativeUnlisted is the ChatGPT account's own models kept out of the
+// lists agents see, which the backend lists to Codex all the same: every
+// one (all) when the codex provider serves only through routing groups
+// (Provider.Unlisted), and by slug those a routing group keeps out of the
+// lists (Group.Unlists). The gateway drops them from its /models answer as
+// it does the ones hidden; Codex then reaches them only through its groups
+// (#1602). A provider switched off keeps none out: it serves nothing, and
+// its setting is kept for when it is switched on again.
+func CodexNativeUnlisted() (all bool, slugs map[string]bool) {
+	p, ok := find(All(), "codex")
+	all = ok && !p.Off && p.Unlisted
+	for _, e := range Unlisted() {
+		if CodexOwn(e) {
+			if slugs == nil {
+				slugs = map[string]bool{}
+			}
+			slugs[e.Model] = true
+		}
+	}
+	return all, slugs
+}
+
 // CodexOrder is where each model of Codex's list goes when the user put
 // them in an order of their own on the Agents page (#855), by the slug
 // Codex knows it by — a ChatGPT account's own by its bare one, as the
@@ -479,6 +500,18 @@ func codexListTag(kind string) string {
 	for _, slug := range off {
 		ms = append(ms, catalog.Model{ID: "-" + slug})
 	}
+	// and those kept out of the lists for routing groups (#1602)
+	all, unlisted := CodexNativeUnlisted()
+	if all {
+		ms = append(ms, catalog.Model{ID: "~unlisted"})
+	}
+	for _, slug := range slices.Sorted(maps.Keys(unlisted)) {
+		ms = append(ms, catalog.Model{ID: "~unlisted:" + slug})
+	}
+	// and the models the user disabled (#1867)
+	for _, pat := range DisabledModels() {
+		ms = append(ms, catalog.Model{ID: "!" + pat})
+	}
 	// and the order the user put them in, the account's own among them
 	for _, id := range ModelOrder("codex") {
 		ms = append(ms, catalog.Model{ID: "^" + id})
@@ -492,6 +525,12 @@ func codexListTag(kind string) string {
 	// and the model Codex's auto-review runs on (#938)
 	if v := settings.Load().CodexAutoReview; v != "" {
 		ms = append(ms, catalog.Model{ID: "~autoreview:" + v})
+	}
+	// and the effort new sessions start at, which magpie's models take as
+	// their default (codexcat.ModelDefault): another one set, Codex asks
+	// for the list again
+	if v := codexcat.NewSessionEffort(); v != "" {
+		ms = append(ms, catalog.Model{ID: "~effort:" + v})
 	}
 	return codexcat.PolicyTag(kind + codexcat.Tag(ms))
 }
@@ -547,6 +586,40 @@ func CodexNativeWindow(restore bool) func(slug string) (n, most int, ok bool) {
 	}
 }
 
+// CodexWindow is the context window Codex works in for one of its own
+// models, by the backend's slug, for a request to the ChatGPT backend or
+// OpenAI's API that Codex sent through magpie: the window the user set on
+// the codex provider, else the one the account's own list gives (user, ""
+// for any), else magpie's Codex subscription's, else Codex CLI's
+// models_cache.json's; 0 when none says. models.dev's input limit for the
+// same id is OpenAI's API's (gpt-5.5's 922K), not the window Codex holds
+// a conversation to (272K): netube on Discord saw Routing say 922K for a
+// Codex Plus account.
+func CodexWindow(user, slug string) int {
+	p, _ := find(All(), "codex")
+	if n := p.ContextOf(slug); n > 0 {
+		return n
+	}
+	var lists [][]catalog.Model
+	if user != "" {
+		if live, _, ok := catalog.Live(accountModels("codex", user)); ok {
+			lists = append(lists, live)
+		}
+	}
+	if live, _, ok := catalog.Live("codex"); ok {
+		lists = append(lists, live)
+	}
+	lists = append(lists, catalog.Codex())
+	for _, ms := range lists {
+		for _, m := range ms {
+			if n := catalog.Window(m.Context); m.ID == slug && n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
 // codexWindowsTag is the windows the user set on the codex provider, for
 // the ETag of Codex's list: setting one, or taking it away, has Codex ask
 // for the list again.
@@ -576,7 +649,7 @@ func codexListed(shown []Entry, members func(id string) []Member, own bool) []ca
 			continue
 		}
 		m := catalog.Model{ID: e.ID, Name: labels[i], Efforts: e.Efforts, Images: e.Images || seen, Context: e.Context, AgentsV2: e.AgentsV2}
-		m.Compact = compactSet(s, e.ID, find)
+		m.Compact = CompactFor(s, e, find)
 		CodexTiers(&m, e, members)
 		ms = append(ms, m)
 	}
@@ -592,8 +665,10 @@ func CodexTiers(m *catalog.Model, e Entry, members func(id string) []Member) {
 	// asks for as it is (hsiangron on X)
 	m.OwnTier = e.Group == "" && e.Provider.Preset == "" && e.Provider.Account == nil && e.Provider.ID != ""
 	// another magpie offers the tiers its own Codex is offered on the
-	// model, and is sent the one Codex asks for as it is (#1234)
-	if e.Group == "" && e.Provider.IsRemoteMagpie() {
+	// model, and is sent the one Codex asks for as it is (#1234); a
+	// provider plugin, those it says its vendor serves the model at, and
+	// is sent the one Codex asks for when it is among them (#2514)
+	if e.Group == "" && (e.Provider.IsRemoteMagpie() || e.Provider.IsPlugin() && len(e.Tiers) > 0) {
 		m.Tiers = e.Tiers
 	}
 	if e.Group != "" {

@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
+	"net/http/httputil"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -242,6 +243,7 @@ func TestViaFor(t *testing.T) {
 	}{
 		{google, "gemini-2.5-flash-image", viaGemini},
 		{google, "imagen-4.0-generate-001", viaImages},
+		{router, "openai/gpt-image-2", viaImages},
 		{router, "openai/gpt-5-image", viaChat},
 		{router, "google/gemini-2.5-flash-image", viaChat},
 		{openai, "gpt-image-1", viaImages},
@@ -251,6 +253,68 @@ func TestViaFor(t *testing.T) {
 		if got := viaFor(tc.p, tc.model); got != tc.want {
 			t.Errorf("%s at %s: %s, want %s", tc.model, tc.p.Chat, got, tc.want)
 		}
+	}
+}
+
+func TestOpenRouterImagesAPIDrawsImageModels(t *testing.T) {
+	fresh(t)
+	p := provider.Provider{ID: "openrouter", Name: "OpenRouter", Chat: "https://openrouter.ai/api/v1", Key: "key", Models: []string{"openai/gpt-image-2"}}
+	if err := provider.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	var path, requestBody string
+	s := New()
+	s.client = &http.Client{Transport: countTransport(func(r *http.Request) (*http.Response, error) {
+		path = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		requestBody = string(b)
+		response := `{"data":[{"b64_json":"` + base64.StdEncoding.EncodeToString(pngBytes) + `","media_type":"image/png"}],"usage":{"prompt_tokens":3,"completion_tokens":7}}`
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(response))}, nil
+	})}
+	ref := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
+	code, answer, raw := postImages(t, s, "/v1/images/generations", "application/json", `{"model":"openrouter/openai/gpt-image-2","prompt":"a magpie","images":["`+ref+`"]}`)
+	if code != http.StatusOK || len(answer.Data) != 1 || answer.Usage.Input != 3 || answer.Usage.Output != 7 {
+		t.Fatalf("%d %s", code, raw)
+	}
+	if path != "/api/v1/images" {
+		t.Fatalf("OpenRouter was asked at %q, want /api/v1/images", path)
+	}
+	var got struct {
+		Model           string `json:"model"`
+		Prompt          string `json:"prompt"`
+		InputReferences []struct {
+			Type     string `json:"type"`
+			ImageURL struct {
+				URL string `json:"url"`
+			} `json:"image_url"`
+		} `json:"input_references"`
+	}
+	if err := json.Unmarshal([]byte(requestBody), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "openai/gpt-image-2" || got.Prompt != "a magpie" || len(got.InputReferences) != 1 || got.InputReferences[0].Type != "image_url" || got.InputReferences[0].ImageURL.URL != ref {
+		t.Fatalf("OpenRouter request: %s", requestBody)
+	}
+}
+
+func TestOpenRouterImagesAPIFailureIsReturnedWithoutChatRetry(t *testing.T) {
+	fresh(t)
+	if err := provider.Save(provider.Provider{ID: "openrouter", Name: "OpenRouter", Chat: "https://openrouter.ai/api/v1", Key: "key", Models: []string{"openai/gpt-image-2"}}); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	s := New()
+	s.client = &http.Client{Transport: countTransport(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		message := `{"error":{"message":"image model is unavailable on the images endpoint"}}`
+		return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(message))}, nil
+	})}
+	code, _, raw := postImages(t, s, "/v1/images/generations", "application/json", `{"model":"openrouter/openai/gpt-image-2","prompt":"a magpie"}`)
+	if code != http.StatusNotFound || !strings.Contains(raw, "images endpoint") {
+		t.Fatalf("%d %s", code, raw)
+	}
+	if len(paths) != 1 || paths[0] != "/api/v1/images" {
+		t.Fatalf("OpenRouter image request paths: %v", paths)
 	}
 }
 
@@ -341,10 +405,11 @@ func TestCodexAccountDraws(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ds := Drawers(*p); len(ds) != 2 || ds[0].ID != "gpt-image-2" || ds[1].ID != "gpt-image-2.5" {
+	// one: the backend picks the model itself (#1865)
+	if ds := Drawers(*p); len(ds) != 1 || ds[0].ID != "gpt-image-2" || ds[0].Name != "GPT Image" {
 		t.Fatalf("drawers %v", ds)
 	}
-	// Automatic asks for what Codex CLI asks for: a plan may be refused 2.5
+	// Automatic asks for what Codex CLI asks for
 	if m, ok := drawer(); !ok || m != "codex/gpt-image-2" {
 		t.Fatalf("drawer = %q %v", m, ok)
 	}
@@ -447,21 +512,31 @@ func TestCodexDrawMovesToNextAccount(t *testing.T) {
 	}
 }
 
-// grokSignedIn gives the test's HOME the Grok CLI's sign-in, and a CLI to find.
+// grokSignedIn gives the test Grok served the way it is now that its built-in
+// is retired: the fake plugin moved onto "grok", its requests sent on to
+// provider.GrokBase as it is when each arrives, so a test points GrokBase at
+// its upstream as it did for the built-in.
 func grokSignedIn(t *testing.T) {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
-	t.Setenv("GROK_HOME", filepath.Join(home, ".grok"))
-	os.MkdirAll(filepath.Join(home, ".grok"), 0o755)
-	os.WriteFile(filepath.Join(home, ".grok", "auth.json"), mustJSON(map[string]any{
-		"https://auth.x.ai": map[string]any{"key": "k-me", "email": "me@x.ai", "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)}}), 0o600)
-	was := provider.GrokExecutable
-	provider.GrokExecutable = func() string { return "/nonexistent/grok" }
-	t.Cleanup(func() { provider.GrokExecutable = was })
+	t.Setenv("FAKE_RESPONSES", "1")
+	movedFake(t, "grok", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		to, err := url.Parse(provider.GrokBase + strings.TrimPrefix(r.URL.Path, "/v1"))
+		if err == nil && to.Hostname() != "127.0.0.1" {
+			err = fmt.Errorf("GrokBase %s isn't the test's: a test never reaches the network", provider.GrokBase)
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		to.RawQuery = r.URL.RawQuery
+		(&httputil.ReverseProxy{Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL, pr.Out.Host = to, to.Host
+		}}).ServeHTTP(w, r)
+	}))
+	// the vendor's own host was the built-in's, whose video it fetched from
+	// there; the plugin's host is the fake's, so the test's upstream on
+	// loopback is named as a user names a private host
+	allowPrivate(t, "127.0.0.1")
 }
 
 // A Grok subscription draws at the Imagine API of the backend Grok Build talks
@@ -505,7 +580,9 @@ func TestGrokAccountDraws(t *testing.T) {
 		!strings.Contains(bodies[0], `"response_format":"b64_json"`) || !strings.Contains(bodies[0], `"aspect_ratio":"16:9"`) || strings.Contains(bodies[0], `"size"`) {
 		t.Fatalf("asked %v %v", paths, bodies)
 	}
-	if head.Get("Authorization") != "Bearer k-me" || head.Get("x-grok-client-identifier") != "grok-shell" || !strings.HasPrefix(head.Get("User-Agent"), "grok-shell/") {
+	// the plugin signs the request (the fake with its own key); the real
+	// one's headers are the plugin's to test
+	if head.Get("Authorization") != "Bearer k1" {
 		t.Fatalf("headers %v", head)
 	}
 	mu.Unlock()
@@ -572,5 +649,162 @@ func TestGrokVendorFailuresAreSaid(t *testing.T) {
 		if code != c.code || !strings.Contains(raw, c.want) {
 			t.Errorf("%s: %d %s", c.prompt, code, raw)
 		}
+	}
+}
+
+// #1857: grok-imagine-image-2.0 named bare, as the vendor names it, drew
+// nothing ("magpie knows no model ... to draw with") while
+// grok/grok-imagine-image-2.0 drew: the bare name was looked up in
+// grokDrawers alone. Any grok-imagine-image* goes to the Grok subscription
+// now, as any grok-imagine-video* does for videos; a name of no image
+// family is still turned away.
+func TestGrokDrawsANewerModelByItsBareName(t *testing.T) {
+	grokSignedIn(t)
+	up := newGrokMedia(t)
+	s := New()
+	code, a, raw := postImages(t, s, "/v1/images/generations", "application/json", `{"model":"grok-imagine-image-2.0","prompt":"a red apple on a table","n":1,"size":"1024x1024"}`)
+	if code != 200 || len(a.Data) != 1 {
+		t.Fatalf("%d %s", code, raw)
+	}
+	if sent := up.body("/v1/images/generations", 0); !strings.Contains(sent, `"model":"grok-imagine-image-2.0"`) {
+		t.Fatalf("asked %s", sent)
+	}
+	code, _, raw = postImages(t, s, "/v1/images/generations", "application/json", `{"model":"grok-imagine-nothing","prompt":"a red apple"}`)
+	if code != 404 || !strings.Contains(raw, "knows no model") {
+		t.Fatalf("a name of no image family: %d %s", code, raw)
+	}
+}
+
+// The ChatGPT account's sibling of #1857: a gpt-image-* magpie doesn't list
+// yet, named bare, is asked of the account, not turned away by magpie.
+func TestCodexDrawsANewerModelByItsBareName(t *testing.T) {
+	codexSignedIn(t)
+	var mu sync.Mutex
+	var bodies []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"created":1,"output_format":"png","data":[{"b64_json":"`+base64.StdEncoding.EncodeToString(pngBytes)+`"}]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	code, a, raw := postImages(t, New(), "/v1/images/generations", "application/json", `{"model":"gpt-image-3","prompt":"a magpie"}`)
+	if code != 200 || len(a.Data) != 1 {
+		t.Fatalf("%d %s", code, raw)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 1 || !strings.Contains(bodies[0], `"model":"gpt-image-3"`) {
+		t.Fatalf("asked %v", bodies)
+	}
+}
+
+// #1837: Agnes answers its image model on chat completions with 400 "is an
+// image model. Use /v1/images/generations" (the reporter's words, as omp
+// showed them). Its name reads like gemini's -flash image models, which
+// chat, so magpie asks chat first; the vendor's refusal sends it to the
+// images API, where it draws. The other way round, a refusal on the images
+// API naming chat completions sends it to chat.
+func TestDrawGoesWhereTheVendorPointsIt(t *testing.T) {
+	fresh(t)
+	b64 := base64.StdEncoding.EncodeToString(pngBytes)
+	var mu sync.Mutex
+	var paths []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		chatOnly := strings.Contains(string(body), "chat-drawer")
+		switch r.URL.Path {
+		case "/v1/chat/completions":
+			if !chatOnly {
+				w.WriteHeader(400)
+				io.WriteString(w, `{"error":{"message":"Model agnes-image-2.5-flash is an image model. Use /v1/images/generations","type":"invalid_request_error"}}`)
+				return
+			}
+			io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok","images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,`+b64+`"}}]}}]}`)
+		case "/v1/images/generations":
+			if chatOnly {
+				w.WriteHeader(400)
+				io.WriteString(w, `{"error":{"message":"seedream-chat-drawer draws on /v1/chat/completions"}}`)
+				return
+			}
+			io.WriteString(w, `{"created":1,"data":[{"b64_json":"`+b64+`"}]}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	t.Cleanup(up.Close)
+	if err := provider.Save(provider.Provider{ID: "agnes", Name: "Agnes", Chat: up.URL + "/v1", Key: "key", Models: []string{"agnes-image-2.5-flash", "seedream-chat-drawer"}}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	for _, tc := range []struct {
+		model string
+		want  []string
+	}{
+		{"agnes/agnes-image-2.5-flash", []string{"/v1/chat/completions", "/v1/images/generations"}},
+		{"agnes/seedream-chat-drawer", []string{"/v1/images/generations", "/v1/chat/completions"}},
+	} {
+		mu.Lock()
+		paths = nil
+		mu.Unlock()
+		code, a, raw := postImages(t, s, "/v1/images/generations", "application/json", `{"model":"`+tc.model+`","prompt":"a magpie"}`)
+		if code != 200 || len(a.Data) != 1 {
+			t.Fatalf("%s: %d %s", tc.model, code, raw)
+		}
+		mu.Lock()
+		got := slices.Clone(paths)
+		mu.Unlock()
+		if !slices.Equal(got, tc.want) {
+			t.Fatalf("%s asked %v, want %v", tc.model, got, tc.want)
+		}
+	}
+}
+
+// An account's own list of models (#474) is picked from the chat models
+// its editor shows, which a ChatGPT account's GPT Image is never among: a
+// list kept for some chat models doesn't turn its drawing away as "set
+// not to be served by any account" (heyiwei5 on X). Each account draws
+// as it did with no list.
+func TestCodexDrawsPastAccountModelLists(t *testing.T) {
+	codexSignedIn(t, "plus@example.com")
+	var mu sync.Mutex
+	var tried []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		tried = append(tried, r.Header.Get("chatgpt-account-id"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"created":1,"data":[{"b64_json":"`+base64.StdEncoding.EncodeToString(pngBytes)+`"}]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	for _, u := range []string{"me@example.com", "plus@example.com"} {
+		if err := provider.SetAccountModels("codex", u, []string{"gpt-5.5"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := New()
+	for _, model := range []string{"codex/gpt-image-2", "codex/gpt-image-2.5"} {
+		code, a, raw := postImages(t, s, "/v1/images/generations", "application/json", `{"model":"`+model+`","prompt":"a magpie"}`)
+		if code != 200 || len(a.Data) != 1 {
+			t.Fatalf("%s: %d %s", model, code, raw)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tried) != 2 {
+		t.Fatalf("asked %v", tried)
 	}
 }

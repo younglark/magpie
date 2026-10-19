@@ -5,11 +5,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/yetone/magpie/internal/edit"
 )
@@ -66,10 +69,61 @@ func (l *Library) active() string {
 }
 
 // sharedPath is where the text the agents get is kept.
-func (l *Library) sharedPath() string { return setPath(l.active()) }
+func (l *Library) sharedPath() string { return l.textPath(l.active()) }
+
+// textPath is where a set's text is kept: the user's own file, for a set
+// linked to one, or setPath.
+func (l *Library) textPath(id string) string {
+	if s := l.instrSet(id); s != nil && s.File != "" {
+		return s.File
+	}
+	return setPath(id)
+}
+
+// linked reports whether p is a file of the user's a set is linked to.
+func (l *Library) linked(p string) bool {
+	return slices.ContainsFunc(l.Instructions.Sets, func(s InstrSet) bool { return s.File != "" && s.File == p })
+}
+
+// putText writes a set's or an agent's text to p. A file of the user's a
+// set is linked to is kept aside first and written, never removed: an
+// emptied set leaves it empty, and a text it has already is no write.
+func (l *Library) putText(p, text string) error {
+	if !l.linked(p) {
+		return writeText(p, text)
+	}
+	text = strings.TrimSpace(text)
+	if readText(p) == text {
+		return nil
+	}
+	if l.kept == nil {
+		l.kept = newBackups()
+	}
+	if err := l.kept.keep("library", p); err != nil {
+		return err
+	}
+	if text != "" {
+		text += "\n"
+	}
+	return edit.WriteAtomic(p, []byte(text))
+}
 
 func extraPath(agent string) string {
 	return filepath.Join(Dir(), "instructions", fileName(agent)+".md")
+}
+
+// setText is a set's text as kept at p. Magpie's part is left out of it:
+// that part is what magpie wrote from the set, never the set. A set kept in
+// the file an agent reads (instructions.md linked to ~/.claude/CLAUDE.md, or
+// both linked to one file of the user's, #2349) has one, and read with it
+// every write put the whole file into its own part again, so the file
+// doubled at each one, to gigabytes.
+func setText(p string) string { return own(readText(p)) }
+
+// isSetFile reports whether p, links followed, is the file the agents' set
+// is kept in.
+func (l *Library) isSetFile(p string) bool {
+	return p != "" && realBelow(p) == realBelow(l.sharedPath())
 }
 
 func readText(path string) string {
@@ -95,7 +149,7 @@ func (l *Library) wanted(agent string) string {
 		return ""
 	}
 	parts := []string{}
-	for _, s := range []string{readText(l.sharedPath()), readText(extraPath(agent))} {
+	for _, s := range []string{setText(l.sharedPath()), readText(extraPath(agent))} {
 		if s != "" {
 			parts = append(parts, s)
 		}
@@ -119,9 +173,25 @@ func split(file string) (before, block, after string, ok bool) {
 }
 
 // own is the file without magpie's part: the user's own instructions.
+// Every part goes, and an end line left over: a part written into itself
+// (#2349) holds others, each ended after the first end.
 func own(file string) string {
-	before, _, after, _ := split(file)
-	return strings.TrimSpace(strings.TrimSpace(before) + "\n\n" + strings.TrimSpace(after))
+	for {
+		before, _, after, ok := split(file)
+		if !ok {
+			break
+		}
+		file = strings.TrimSpace(before) + "\n\n" + strings.TrimSpace(after)
+	}
+	if strings.Contains(file, blockEnd) {
+		lines := strings.Split(file, "\n")
+		lines = slices.DeleteFunc(lines, func(s string) bool { return strings.TrimSpace(s) == blockEnd })
+		file = strings.Join(lines, "\n")
+		for strings.Contains(file, "\n\n\n") {
+			file = strings.ReplaceAll(file, "\n\n\n", "\n\n")
+		}
+	}
+	return strings.TrimSpace(file)
 }
 
 // withBlock is the file with magpie's part set to text, or taken out for "".
@@ -170,6 +240,29 @@ func (l *Library) syncInstructions(t *Target, b *backups, res *Result) {
 		return
 	}
 	file := string(raw)
+	if l.isSetFile(t.Instructions) {
+		// the agent reads the set's own file, so it has the text already:
+		// magpie writes no part into it, and takes out one written before
+		a.Instructions, a.InstrHash = false, ""
+		file = strings.ReplaceAll(file, "\r\n", "\n")
+		if !strings.Contains(file, blockBegin) && !strings.Contains(file, blockEnd) {
+			return
+		}
+		if err := b.keep(id, t.Instructions); err != nil {
+			res.fail(id, "instructions", err)
+			return
+		}
+		next := own(file)
+		if next != "" {
+			next += "\n"
+		}
+		if err := edit.WriteAtomic(t.Instructions, []byte(next)); err != nil {
+			res.fail(id, "instructions", err)
+			return
+		}
+		res.changed(id)
+		return
+	}
 	_, have, _, ok := split(file)
 	if want == "" && !ok {
 		a.Instructions, a.InstrHash = false, ""
@@ -211,6 +304,7 @@ type AgentInstructions struct {
 	Own      int    `json:"own"`                // lines of the user's own in the file
 	Edited   bool   `json:"edited,omitempty"`   // magpie's part was changed in the file
 	Override string `json:"override,omitempty"` // a file the agent reads instead
+	Profile  bool   `json:"profile,omitempty"`  // the file is the user's profile to the agent (Target.Profile)
 }
 
 // InstructionsView is the Instructions page.
@@ -226,6 +320,7 @@ type SetView struct {
 	Name   string `json:"name"`
 	Text   string `json:"text"`
 	Active bool   `json:"active,omitempty"`
+	File   string `json:"file,omitempty"` // the user's own file it is kept in
 }
 
 // ReadInstructions is the shared text and each agent's file.
@@ -243,9 +338,9 @@ func ReadInstructions() (*InstructionsView, error) {
 // passed in: finding them looks through every agent's folders, in WSL too,
 // which one read of the Library did three times over (#1624).
 func (l *Library) instructionsView(targets []*Target) *InstructionsView {
-	v := &InstructionsView{Shared: readText(l.sharedPath()), Agents: []AgentInstructions{}}
+	v := &InstructionsView{Shared: setText(l.sharedPath()), Agents: []AgentInstructions{}}
 	for _, s := range l.sets() {
-		v.Sets = append(v.Sets, SetView{ID: s.ID, Name: s.Name, Text: readText(setPath(s.ID)), Active: s.ID == l.active()})
+		v.Sets = append(v.Sets, SetView{ID: s.ID, Name: s.Name, Text: setText(l.textPath(s.ID)), Active: s.ID == l.active(), File: s.File})
 	}
 	for _, t := range targets {
 		if t.Instructions == "" {
@@ -253,12 +348,12 @@ func (l *Library) instructionsView(targets []*Target) *InstructionsView {
 		}
 		id := t.Agent.ID
 		ai := AgentInstructions{Agent: id, Name: t.Agent.Name, Icon: t.Agent.Icon, Path: t.Instructions,
-			On: slices.Contains(l.Instructions.Agents, id), Extra: readText(extraPath(id))}
+			On: slices.Contains(l.Instructions.Agents, id), Extra: readText(extraPath(id)), Profile: t.Profile}
 		file := readText(t.Instructions)
 		if o := own(file); o != "" {
 			ai.Own = strings.Count(o, "\n") + 1
 		}
-		if _, have, _, ok := split(file); ok && have != l.wanted(id) {
+		if _, have, _, ok := split(file); ok && have != l.wanted(id) && !l.isSetFile(t.Instructions) {
 			ai.Edited = true
 		}
 		if t.Override != "" && readText(t.Override) != "" {
@@ -328,7 +423,7 @@ func SaveInstructions(c InstructionsChange) (*Result, error) {
 			return err
 		}
 		if c.Shared != nil {
-			if err := writeText(l.sharedPath(), *c.Shared); err != nil {
+			if err := l.putText(l.sharedPath(), *c.Shared); err != nil {
 				return err
 			}
 		}
@@ -362,7 +457,15 @@ func ImportInstructions(id string) (*Result, error) {
 	if t == nil || t.Instructions == "" {
 		return nil, fmt.Errorf("%s has no instructions file magpie knows", id)
 	}
+	if t.Profile {
+		// moved out, the profile would go into every agent's file, and the
+		// agent would lose who its owner is (Alma's USER.md, #2315)
+		return nil, fmt.Errorf("%s is %s's profile of its owner, not instructions alone: what is in it stays there", t.Instructions, t.Agent.Name)
+	}
 	return changeInstructions(func(l *Library) error {
+		if l.isSetFile(t.Instructions) {
+			return fmt.Errorf("%s is the file the instructions set is kept in already", t.Instructions)
+		}
 		raw, err := edit.Read(t.Instructions)
 		if err != nil {
 			return err
@@ -372,11 +475,11 @@ func ImportInstructions(id string) (*Result, error) {
 		if mine == "" {
 			return fmt.Errorf("%s has nothing of its own to import", t.Instructions)
 		}
-		shared := readText(l.sharedPath())
+		shared := setText(l.sharedPath())
 		if !strings.Contains(shared, mine) {
 			shared = strings.TrimSpace(shared + "\n\n" + mine)
 		}
-		if err := writeText(l.sharedPath(), shared); err != nil {
+		if err := l.putText(l.sharedPath(), shared); err != nil {
 			return err
 		}
 		b := newBackups()
@@ -414,7 +517,14 @@ func (l *Library) changeSets(c InstructionsChange) error {
 		if strings.TrimSpace(x.Name) == "" {
 			return errors.New("a new set needs a name")
 		}
-		l.Instructions.Sets = append(l.Instructions.Sets, InstrSet{ID: x.ID, Name: strings.TrimSpace(x.Name)})
+		file := ""
+		if x.File != "" {
+			var err error
+			if file, err = l.linkable(x.File); err != nil {
+				return err
+			}
+		}
+		l.Instructions.Sets = append(l.Instructions.Sets, InstrSet{ID: x.ID, Name: strings.TrimSpace(x.Name), File: file})
 	}
 	if x := c.Rename; x != nil {
 		if !l.hasSet(x.ID) {
@@ -433,7 +543,7 @@ func (l *Library) changeSets(c InstructionsChange) error {
 		if !l.hasSet(id) {
 			return fmt.Errorf("there is no set %q", id)
 		}
-		if err := writeText(setPath(id), *text); err != nil {
+		if err := l.putText(l.textPath(id), *text); err != nil {
 			return err
 		}
 	}
@@ -446,15 +556,18 @@ func (l *Library) changeSets(c InstructionsChange) error {
 		case id == l.active():
 			return errors.New("the set the agents get can't be removed: switch them to another first")
 		}
-		if err := writeText(setPath(id), ""); err != nil {
-			return err
+		// a linked file is the user's: the set lets go of it, and it stays
+		if l.instrSet(id).File == "" {
+			if err := writeText(setPath(id), ""); err != nil {
+				return err
+			}
 		}
 		l.Instructions.Sets = slices.DeleteFunc(l.Instructions.Sets, func(s InstrSet) bool { return s.ID == id })
 	}
 	// an empty set in use gives the agents nothing, so a set added, or one
 	// given text, is the one they read from then on (Fate on Discord: a new
 	// set was written into no agent while the Default set read was empty)
-	if c.Activate == "" && c.Shared == nil && readText(setPath(l.active())) == "" {
+	if c.Activate == "" && c.Shared == nil && setText(l.sharedPath()) == "" {
 		if x := c.Create; x != nil {
 			l.Instructions.Active = x.ID
 		}
@@ -478,4 +591,100 @@ func (l *Library) changeSets(c InstructionsChange) error {
 		}
 	}
 	return nil
+}
+
+// linkable is the file a new set can be linked to, made absolute, or why
+// not: a file magpie writes into (an agent's own instructions, where the
+// set would be read from the text written from it), one of the library's
+// own, a folder, or one another set has.
+func (l *Library) linkable(file string) (string, error) {
+	file = strings.TrimSpace(file)
+	if rest, ok := strings.CutPrefix(file, "~"); ok && (rest == "" || rest[0] == '/' || rest[0] == filepath.Separator) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		file = home + rest
+	}
+	if !filepath.IsAbs(file) {
+		return "", fmt.Errorf("%s: give the file's full path", file)
+	}
+	file = filepath.Clean(file)
+	real := realBelow(file)
+	if st, err := os.Stat(file); err == nil && st.IsDir() {
+		return "", fmt.Errorf("%s is a folder: give a file", file)
+	}
+	if strings.Contains(readText(file), blockBegin) {
+		return "", fmt.Errorf("magpie writes its instructions into %s: a set can't be kept there too", file)
+	}
+	if lib := realBelow(Dir()); real == lib || strings.HasPrefix(real, lib+string(filepath.Separator)) || real == realBelow(path()) {
+		return "", fmt.Errorf("%s is the library's own", file)
+	}
+	for _, s := range l.Instructions.Sets {
+		if s.File != "" && realBelow(s.File) == real {
+			return "", fmt.Errorf("the set %q is kept in %s already", s.Name, file)
+		}
+	}
+	for _, t := range everyTarget() {
+		for _, p := range []string{t.Instructions, t.Override} {
+			if p != "" && realBelow(p) == real {
+				return "", fmt.Errorf("%s is %s's own instructions, which magpie writes into: a set can't be kept there", file, t.Agent.Name)
+			}
+		}
+	}
+	return file, nil
+}
+
+// linkSeen is the linked file SyncLinked last looked at, as it was then.
+var linkSeen struct {
+	sync.Mutex
+	file string
+	mod  time.Time
+	size int64
+}
+
+// SyncLinked writes the instructions into the agents again when the set
+// they get is kept in a file of the user's that changed since it was last
+// looked at — edited by hand, or by another tool that keeps it — and not
+// otherwise: nil, nil. The first look at a file only notes it.
+func SyncLinked() (*Result, error) {
+	mu.Lock()
+	l, err := load()
+	file := ""
+	if err == nil {
+		if s := l.instrSet(l.active()); s != nil {
+			file = s.File
+		}
+	}
+	mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	var mod time.Time
+	var size int64 = -1
+	if st, err := os.Stat(file); file != "" && err == nil {
+		mod, size = st.ModTime(), st.Size()
+	}
+	linkSeen.Lock()
+	changed := file != "" && linkSeen.file == file && (!linkSeen.mod.Equal(mod) || linkSeen.size != size)
+	linkSeen.file, linkSeen.mod, linkSeen.size = file, mod, size
+	linkSeen.Unlock()
+	if !changed {
+		return nil, nil
+	}
+	return changeInstructions(func(*Library) error { return nil })
+}
+
+// KeepLinked runs SyncLinked every interval, for as long as the app runs.
+func KeepLinked(interval time.Duration) {
+	for {
+		if res, err := SyncLinked(); err != nil {
+			log.Println("library: linked instructions:", err)
+		} else if res != nil {
+			for _, p := range res.Problems {
+				log.Println("library: linked instructions:", p.Agent, p.What, p.Error)
+			}
+		}
+		time.Sleep(interval)
+	}
 }

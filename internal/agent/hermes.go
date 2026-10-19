@@ -1,7 +1,8 @@
 package agent
 
 // Hermes Agent (Nous Research) keeps its settings in $HERMES_HOME/config.yaml,
-// ~/.hermes/config.yaml by default: the model under model.default, served by
+// by default %LOCALAPPDATA%\hermes\config.yaml on Windows and
+// ~/.hermes/config.yaml elsewhere (place.hermesHome): the model under model.default, served by
 // model.provider, which may name an entry of providers. magpie adds itself
 // there as the provider "magpie" (the gateway, spoken to as chat completions,
 // with the catalog as its models) and points model.provider at it; a model
@@ -28,6 +29,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/yetone/magpie/internal/dirent"
 	"github.com/yetone/magpie/internal/edit"
 )
 
@@ -37,21 +39,18 @@ func hermes(home string) *Agent { return hermesIn(here(home)) }
 // (see wsl.go), where HERMES_HOME isn't read and its provider names the
 // gateway as the distro reaches it.
 func hermesIn(at place) *Agent {
-	dir := at.getenv("HERMES_HOME")
-	if dir == "" {
-		dir = filepath.Join(at.home, ".hermes")
-	}
+	dir := at.hermesHome()
 	path := filepath.Join(dir, "config.yaml")
-	hermesProvider := func() hermesProviderEntry { return hermesProviderAt(at.gw()) }
+	hermesProvider := func(p string) any { return hermesKept(p, hermesProviderAt(at.gw())) }
 	// spread puts magpie's provider, as it is now, into every other
 	// profile's config beside the one magpie connects
 	spread := func() error {
 		var errs []error
 		for _, p := range hermesOthers(at, dir) {
 			if edit.GetYAMLMap(p, "providers."+magpieID) != nil {
-				errs = append(errs, syncYAML(p, "providers."+magpieID, func() any { return hermesProvider() }))
+				errs = append(errs, syncYAML(p, "providers."+magpieID, func() any { return hermesProvider(p) }))
 			} else {
-				errs = append(errs, edit.SetYAML(p, edit.KV{Path: "providers." + magpieID, Value: hermesProvider()}))
+				errs = append(errs, edit.SetYAML(p, edit.KV{Path: "providers." + magpieID, Value: hermesProvider(p)}))
 			}
 		}
 		return errors.Join(errs...)
@@ -85,11 +84,11 @@ func hermesIn(at place) *Agent {
 		return edit.SetYAML(path, kvs...)
 	}
 	return &Agent{
-		ID: "hermes", Name: "Hermes Agent", Icon: "hermes", Aliases: []string{"hermes-agent"}, Spelled: prefixed,
+		ID: "hermes", Name: "Hermes Agent", Icon: "hermes", Aliases: []string{"hermes-agent"}, Spelled: prefixed, NoNames: true,
 		UA:  []string{"hermes-agent"},
 		Bin: "hermes", Dir: dir, Path: path,
 		Sync: func() error {
-			if err := syncYAML(path, "providers."+magpieID, func() any { return hermesProvider() }); err != nil || !joined() {
+			if err := syncYAML(path, "providers."+magpieID, func() any { return hermesProvider(path) }); err != nil || !joined() {
 				return err
 			}
 			return spread()
@@ -147,7 +146,7 @@ func hermesIn(at place) *Agent {
 						})
 					}
 					if err := edit.SetYAML(path,
-						edit.KV{Path: "providers." + magpieID, Value: hermesProvider()},
+						edit.KV{Path: "providers." + magpieID, Value: hermesProvider(path)},
 						edit.KV{Path: "model.provider", Value: magpieID},
 						edit.KV{Path: "model.default", Value: ref},
 					); err != nil {
@@ -191,12 +190,13 @@ var hermesProfileID = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 // bots), as Hermes lists them (hermes_cli/profiles.py): the root's own, and
 // <root>/profiles/<name>'s for each name Hermes allows that holds a file
 // only a profile has and isn't deleted (a tombstone at
-// profiles/.deleted/<name>). The root is ~/.hermes, which HERMES_HOME under
-// it is a profile of; a HERMES_HOME elsewhere is the root itself, or, as
+// profiles/.deleted/<name>). The root is Hermes's default folder
+// (%LOCALAPPDATA%\hermes on Windows, ~/.hermes elsewhere), which a
+// HERMES_HOME under it is a profile of; a HERMES_HOME elsewhere is the root itself, or, as
 // <root>/profiles/<name>, a profile of <root> (get_default_hermes_root).
 // A profile with no config.yaml yet is left out: magpie doesn't make one.
 func hermesProfiles(at place) []string {
-	root := filepath.Join(at.home, ".hermes")
+	root := at.hermesDefault()
 	if env := at.getenv("HERMES_HOME"); env != "" {
 		if rel, err := filepath.Rel(root, env); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			root = env
@@ -210,7 +210,7 @@ func hermesProfiles(at place) []string {
 	es, _ := os.ReadDir(ps)
 	for _, e := range es {
 		name := e.Name()
-		if !e.IsDir() || name == "default" || !hermesProfileID.MatchString(name) {
+		if !dirent.IsFolder(ps, e) || name == "default" || !hermesProfileID.MatchString(name) {
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(ps, ".deleted", name)); err == nil {
@@ -276,6 +276,20 @@ func hermesProviderAt(gw string) hermesProviderEntry {
 		Name: magpieID, BaseURL: gw + "/v1", APIKey: keyAt(gw), APIMode: "chat_completions",
 		Headers: map[string]string{"User-Agent": "hermes-agent"}, Models: ms,
 	}
+}
+
+// hermesKept is magpie's entry e laid over the one in the config at path.
+// Hermes keeps keys it doesn't know and writes into the entry itself: `hermes
+// model` sets default_model there, the dashboard key_env, and a user adds
+// key_cmd, request_timeout_seconds, extra_body, context_length, enabled or
+// ssl_* (hermes_cli/config_providers.py _KNOWN_PROVIDER_KEYS). Each stays,
+// as does a name of their own and a header beside magpie's User-Agent; the
+// address, key, API mode and model list are magpie's (#2030).
+func hermesKept(path string, e hermesProviderEntry) any {
+	if name, ok := edit.GetYAML(path, "providers."+magpieID+".name"); ok && strings.TrimSpace(name) != "" {
+		e.Name = name
+	}
+	return yamlKept(path, "providers."+magpieID, e, "base_url", "api_key", "api_mode", "models")
 }
 
 // what hermes says after a change (notice.go)

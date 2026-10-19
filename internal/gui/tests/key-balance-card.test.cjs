@@ -14,7 +14,14 @@ const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
 const soon = new Date(Date.now() + 2 * 3600e3).toISOString();
-const week = new Date(Date.now() + 3 * 86400e3).toISOString();
+// a reset more than a week out is written as a date, and Sept. 28 is about
+// the widest one ("28. Sept. 02:37" in German), so the narrow-window checks
+// below see the longest line every day of the year, not only on days when
+// three days ahead falls in next week (#2443)
+const week = (() => {
+  const y = new Date().getFullYear(), at = (y) => new Date(y, 8, 28, 2, 37);
+  return (at(y) - Date.now() > 8 * 86400e3 ? at(y) : at(y + 1)).toISOString();
+})();
 
 // the reporter's (magpie quota's lines): one Command Code key with a plan
 // and credits, and other providers' balances
@@ -120,9 +127,18 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           assert.equal(cc.bal, (await balanceWord(page)) + "$63.78");
           assert.equal(cc.of, c.focus);
           assert.equal(await page.evaluate(() => [...document.querySelectorAll("#panelQuota .pq-gn")].filter((x) => /command code/i.test(x.textContent)).length), 1, "Command Code is named once");
-          // a menu bar cell for the balance opens the plan's card
+          // a menu bar cell for the balance opens the plan's card. Watched
+          // as it happens, not polled for: under reduced motion the flash
+          // lasts .01ms, its class gone at the next frame, and a poll on a
+          // busy WebKit missed it (a timeout, most runs at --test-concurrency=4)
+          await page.evaluate(() => {
+            window.flashed = false;
+            new MutationObserver(() => {
+              if (document.querySelector('#panelQuota .pq-card[data-card="commandcode"]')?.classList.contains("flash")) window.flashed = true;
+            }).observe(document.querySelector("#panelQuota"), { subtree: true, attributes: true, attributeFilter: ["class"] });
+          });
           await page.evaluate((id) => panelQuotaFocus(id), c.focus);
-          await page.waitForFunction(() => document.querySelector('#panelQuota .pq-card[data-card="commandcode"]')?.classList.contains("flash"));
+          await page.waitForFunction(() => window.flashed);
           assert.deepEqual(await page.evaluate(sideways), [], "nothing runs off sideways at 380px");
           await page.close();
         }

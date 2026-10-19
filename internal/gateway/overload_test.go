@@ -218,12 +218,17 @@ func (s *slowFrames) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // past its 300s with no event. Now, once Codex has gone agentQuietMost
 // with none, the try held goes to it as it is, and the next one's reply
 // follows; a group's pause that would run past it isn't waited.
+//
+// Room on both sides (#1800): a fails 1.3s before Codex's quiet limit
+// here, so a busy machine's lag doesn't carry a's failure past it to go
+// as it is; the bounds sit over a second from both what is expected and
+// what the old waits would take.
 func TestCodexHeardWithinItsIdleTimeout(t *testing.T) {
 	k, w, q := keepHeldAfter, watchEvery, agentQuietMost
-	keepHeldAfter, watchEvery, agentQuietMost = 50*time.Millisecond, 10*time.Millisecond, time.Second
+	keepHeldAfter, watchEvery, agentQuietMost = 50*time.Millisecond, 10*time.Millisecond, 2*time.Second
 	t.Cleanup(func() { keepHeldAfter, watchEvery, agentQuietMost = k, w, q })
 	fresh(t)
-	const wait = 1500 * time.Millisecond
+	const wait = 4 * time.Second
 	a := &slowFrames{wait: 700 * time.Millisecond, then: func(int) string { return sse(overloadedFailed) }}
 	b := &slowFrames{wait: wait, then: func(int) string {
 		return sse(`event: response.output_text.delta`+"\n"+`data: {"type":"response.output_text.delta","delta":"hello"}`,
@@ -260,9 +265,9 @@ func TestCodexHeardWithinItsIdleTimeout(t *testing.T) {
 			break
 		}
 	}
-	// a failed at 0.7s and b, held, would have gone at 2.2s: b's frames
-	// go at 1s, Codex's idle timeout here, and its reply after them
-	if first == 0 || first > 1600*time.Millisecond {
+	// a failed at 0.7s and b, held, would have gone at 4.7s: b's frames
+	// go at 2s, Codex's idle timeout here, and its reply after them
+	if first == 0 || first > 3500*time.Millisecond {
 		t.Fatalf("Codex's first event came after %s:\n%s", first, got.String())
 	}
 	if !strings.Contains(got.String(), "hello") || strings.Contains(got.String(), "server_is_overloaded") {
@@ -275,7 +280,7 @@ func TestCodexHeardWithinItsIdleTimeout(t *testing.T) {
 	a.wait, b.wait = 600*time.Millisecond, 600*time.Millisecond
 	b.then = a.then
 	k2 := retryPause
-	retryPause = 2 * time.Second
+	retryPause = 10 * time.Second
 	t.Cleanup(func() { retryPause = k2 })
 	for id, up := range map[string]http.Handler{"a": a, "b": b} {
 		srv := httptest.NewServer(up)
@@ -296,7 +301,201 @@ func TestCodexHeardWithinItsIdleTimeout(t *testing.T) {
 	}
 	body, _ := io.ReadAll(res2.Body)
 	res2.Body.Close()
-	if took := time.Since(start); took > 3*time.Second || !strings.Contains(string(body), "server_is_overloaded") {
+	// a's failure at 0.6s and b's at 1.2s; the pause waited would make it
+	// 11.2s
+	if took := time.Since(start); took > 6*time.Second || !strings.Contains(string(body), "server_is_overloaded") {
 		t.Fatalf("after %s (a %d, b %d):\n%s", took, a.n, b.n, body)
+	}
+}
+
+// Aliceonly's trace on #1418: sub2api answered 502 "Upstream HTTP/2
+// stream failed", Codex account A a 200 that only framed a reply and then
+// failed server_is_overloaded, and five candidates after it were never
+// asked. An event streamEvent didn't know was taken for the reply's
+// content and let the stream through, so its failure came after the
+// reply had begun. Which event Codex's backend sent isn't in the trace;
+// these stand in for any it may add. Now only text, reasoning or a call
+// lets a stream through, and the third member answers.
+func TestFramesThenOverloadedGoesToTheNext(t *testing.T) {
+	fresh(t)
+	unknown := []string{
+		`event: keepalive` + "\n" + `data: {"type":"keepalive"}`,
+		`event: response.rate_limits.updated` + "\n" + `data: {"type":"response.rate_limits.updated","rate_limits":{"allowed":true}}`,
+		`event: response.output_item.added` + "\n" + `data: {"type":"response.output_item.added","item":{"type":"compaction_summary","id":"cs_1"}}`,
+	}
+	a := &scripted{replies: []reply{{502, "", `{"error":{"message":"Upstream HTTP/2 stream failed"}}`}}}
+	b := &scripted{replies: []reply{{200, "text/event-stream", sse(append(append(slices.Clone(overloadedLead), unknown...), overloadedFailed)...)}}}
+	c := &scripted{replies: []reply{{200, "text/event-stream", sse(
+		`event: response.output_text.delta`+"\n"+`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`event: response.completed`+"\n"+`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`)}}}
+	responsesOn(t, "a", a)
+	responsesOn(t, "b", b)
+	responsesOn(t, "c", c)
+	if err := provider.SaveGroup(provider.Group{Name: "G", Members: []string{"a/m", "b/m", "c/m"}, Routing: provider.Ordered, Patience: provider.PatienceOff}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	code, body := sendTo(s, "/v1/responses", codexAsk)
+	if code != 200 || !strings.Contains(body, "hello") || strings.Contains(body, "server_is_overloaded") || strings.Contains(body, "keepalive") || c.n != 1 {
+		t.Fatalf("%d %q (a %d, b %d, c %d)", code, body, a.n, b.n, c.n)
+	}
+	r := s.trace.routes[len(s.trace.routes)-1]
+	if len(r.Tries) != 3 || r.Tries[1].Fail == "" {
+		t.Fatalf("tries: %+v", r.Tries)
+	}
+}
+
+// What only frames a reply, or isn't known, doesn't let a stream through;
+// text, reasoning, a call or a reply's end does.
+func TestStreamEventUnknownOnlyFrames(t *testing.T) {
+	for _, x := range []struct {
+		ev   string
+		kind int
+	}{
+		{`data: {"type":"keepalive"}`, eventLead},
+		{`event: response.rate_limits.updated` + "\n" + `data: {"type":"response.rate_limits.updated"}`, eventLead},
+		{`data: {"type":"response.output_item.added","item":{"type":"compaction_summary"}}`, eventLead},
+		{`data: {"x":1}`, eventLead},
+		{`data: {}`, eventLead},
+		{`data: {"type":"response.output_item.added","item":{"type":"web_search_call","id":"ws"}}`, eventContent},
+		{`data: {"type":"response.output_item.added","item":{"type":"mcp_list_tools"}}`, eventContent},
+		{`data: {"type":"response.web_search_call.searching","item_id":"ws"}`, eventContent},
+		{`data: {"type":"response.function_call_arguments.delta","delta":"{"}`, eventContent},
+		{`data: {"type":"response.custom_tool_call_input.delta","delta":"x"}`, eventContent},
+		{`data: {"type":"response.output_text.annotation.added"}`, eventContent},
+		{`data: {"type":"response.refusal.delta","delta":"no"}`, eventContent},
+		{`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"s","name":"web_search"}}`, eventContent},
+		{`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"container_upload"}}`, eventLead},
+		{`event: message_stop` + "\n" + `data: {"type":"message_stop"}`, eventContent},
+		{`data: [DONE]`, eventContent},
+	} {
+		if k, _, _ := streamEvent([]byte(x.ev)); k != x.kind {
+			t.Errorf("streamEvent(%s) = %d, want %d", x.ev, k, x.kind)
+		}
+	}
+}
+
+// A group in a group waits out busy members by its own Patience (#2410):
+// the innermost that sets one, else the group asked for — same rule as
+// FirstToken (#2246) and Sink (#2255). Before, replan always read the
+// asked group's Waits, so an inner 10s under an outer 4s gave up at 4s.
+// The pauses are 2s, 4s, 8s (retryPause 1s); each budget is 2s or more
+// from where a pause ends, so a loaded runner's slower asks don't move a
+// round across it.
+func TestNestedGroupPatienceThroughOuter(t *testing.T) {
+	overloaded := reply{529, "", `{"error":{"message":"Our servers are currently overloaded. Please try again later.","code":"server_is_overloaded"}}`}
+	setup := func(t *testing.T, inner, outer int) *scripted {
+		t.Helper()
+		fresh(t)
+		k := retryPause
+		retryPause = time.Second
+		t.Cleanup(func() { retryPause = k })
+		a := &scripted{replies: []reply{overloaded, overloaded, overloaded, overloaded}}
+		b := &scripted{replies: []reply{overloaded, overloaded, overloaded, overloaded}}
+		scriptedOn(t, "a", provider.Chat, a)
+		scriptedOn(t, "b", provider.Chat, b)
+		if err := provider.SaveGroup(provider.Group{Name: "In", Members: []string{"a/m", "b/m"}, Routing: provider.Ordered, Patience: inner}); err != nil {
+			t.Fatal(err)
+		}
+		if err := provider.SaveGroup(provider.Group{Name: "G", Members: []string{"group/in"}, Routing: provider.Ordered, Patience: outer}); err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	ask := `{"model":"group/g","messages":[{"role":"user","content":"hi"}]}`
+
+	// inner 10s under outer 4s: the inner budget allows a second replan
+	// (2s+4s=6s < 10s, a third's 14s is past it); the outer's 4s would
+	// have stopped after one (6s > 4s).
+	a := setup(t, 10, 4)
+	s := New()
+	code, _ := postAs(t, s, "", ask)
+	if a.n != 3 {
+		t.Fatalf("asks: a.n=%d, want 3 — the inner group's 10s budget was not read", a.n)
+	}
+	if code != 529 {
+		t.Fatalf("code=%d", code)
+	}
+	r := s.trace.routes[len(s.trace.routes)-1]
+	var got int
+	for _, try := range r.Tries {
+		if try.Replan > 0 {
+			got = try.Patience
+		}
+	}
+	if got != 10 {
+		t.Fatalf("trace patience=%d, want 10 (inner): %+v", got, r.Tries)
+	}
+
+	// direct to the inner group: same 10s budget, three asks
+	fresh(t)
+	k := retryPause
+	retryPause = time.Second
+	t.Cleanup(func() { retryPause = k })
+	a = &scripted{replies: []reply{overloaded, overloaded, overloaded, overloaded}}
+	b := &scripted{replies: []reply{overloaded, overloaded, overloaded, overloaded}}
+	scriptedOn(t, "a", provider.Chat, a)
+	scriptedOn(t, "b", provider.Chat, b)
+	if err := provider.SaveGroup(provider.Group{Name: "In", Members: []string{"a/m", "b/m"}, Routing: provider.Ordered, Patience: 10}); err != nil {
+		t.Fatal(err)
+	}
+	code, _ = postAs(t, New(), "", `{"model":"group/in","messages":[{"role":"user","content":"hi"}]}`)
+	if a.n != 3 || code != 529 {
+		t.Fatalf("direct inner: a.n=%d code=%d", a.n, code)
+	}
+}
+
+// An inner PatienceOff under an outer default must not replan (#2410):
+// the inner Off is set, so it wins over the outer's 60s.
+func TestNestedGroupPatienceInnerOff(t *testing.T) {
+	fresh(t)
+	overloaded := reply{529, "", `{"error":{"message":"Our servers are currently overloaded. Please try again later.","code":"server_is_overloaded"}}`}
+	a := &scripted{replies: []reply{overloaded, overloaded}}
+	b := &scripted{replies: []reply{overloaded, overloaded}}
+	scriptedOn(t, "a", provider.Chat, a)
+	scriptedOn(t, "b", provider.Chat, b)
+	if err := provider.SaveGroup(provider.Group{Name: "In", Members: []string{"a/m", "b/m"}, Routing: provider.Ordered, Patience: provider.PatienceOff}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SaveGroup(provider.Group{Name: "G", Members: []string{"group/in"}, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+	code, _ := postAs(t, New(), "", `{"model":"group/g","messages":[{"role":"user","content":"hi"}]}`)
+	if code != 529 || a.n != 1 {
+		t.Fatalf("inner Off through outer: code=%d a.n=%d (want 529, 1 — no replan)", code, a.n)
+	}
+}
+
+// An inner that leaves Patience unset falls back to the asked group's (#2410).
+func TestNestedGroupPatienceFallsBackToOuter(t *testing.T) {
+	fresh(t)
+	k := retryPause
+	retryPause = time.Second
+	t.Cleanup(func() { retryPause = k })
+	overloaded := reply{529, "", `{"error":{"message":"Our servers are currently overloaded. Please try again later.","code":"server_is_overloaded"}}`}
+	a := &scripted{replies: []reply{overloaded, overloaded, overloaded, overloaded}}
+	b := &scripted{replies: []reply{overloaded, overloaded, overloaded, overloaded}}
+	scriptedOn(t, "a", provider.Chat, a)
+	scriptedOn(t, "b", provider.Chat, b)
+	if err := provider.SaveGroup(provider.Group{Name: "In", Members: []string{"a/m", "b/m"}, Routing: provider.Ordered}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SaveGroup(provider.Group{Name: "G", Members: []string{"group/in"}, Routing: provider.Ordered, Patience: 4}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	code, _ := postAs(t, s, "", `{"model":"group/g","messages":[{"role":"user","content":"hi"}]}`)
+	if a.n != 2 || code != 529 {
+		t.Fatalf("unset inner, outer 4s: a.n=%d code=%d (want 2, 529)", a.n, code)
+	}
+	r := s.trace.routes[len(s.trace.routes)-1]
+	var got int
+	for _, try := range r.Tries {
+		if try.Replan > 0 {
+			got = try.Patience
+		}
+	}
+	if got != 4 {
+		t.Fatalf("trace patience=%d, want 4 (outer fallback): %+v", got, r.Tries)
 	}
 }

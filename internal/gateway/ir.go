@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/yetone/magpie/internal/catalog"
 )
 
 // The APIs are close cousins; everything below is the shape they have
@@ -64,6 +67,8 @@ type Part struct {
 
 	// web_search: Text is the query
 	Hits []Hit
+
+	cache string // opted-in Claude bridge breakpoint TTL; empty for none
 }
 
 // The APIs a Part's Sealed reasoning is in.
@@ -139,6 +144,12 @@ type Tool struct {
 
 // Request is a call to a model, whichever API it arrived in.
 type Request struct {
+	// clientCache is non-nil only for the Claude bridge's explicit opt-in.
+	clientCache *clientCache
+	// leanPrompt has the Claude bridge give the caller's instructions as
+	// the run's system prompt, in place of Claude Code's (ClaudeLeanPrompt).
+	leanPrompt bool
+
 	Model      string
 	System     string
 	Messages   []Message
@@ -186,6 +197,15 @@ type Request struct {
 	// them. text's format is read into Format.
 	ClientMetadata json.RawMessage
 	Text           json.RawMessage
+	// AccessPrograms is a client's access_programs, the program a request
+	// asks the model under (OpenAI's Daybreak: {"cyber":"daybreak_blue"}),
+	// which Codex CLI sends the ChatGPT backend on every turn it picked one
+	// for (codex-rs's ResponsesApiRequest.access_programs). It goes on as it
+	// was sent, null and all, when the request is built again for a
+	// Responses upstream, whose answer to a value it doesn't take
+	// (invalid_access_program) is the client's to read; no other API takes
+	// it (magpie-releases#18).
+	AccessPrograms json.RawMessage
 	// Metadata is an Anthropic client's metadata (Claude Code's user_id),
 	// which goes on as it was sent when the request is built again for an
 	// Anthropic upstream: a relay that serves only Claude Code turns a
@@ -198,6 +218,9 @@ type Request struct {
 	// output: format.go), nil for plain text. Text, a Responses client's,
 	// holds it no more: it is asked for again in the upstream's own words.
 	Format *Format
+	// FormatTold is set when Format was told in the system prompt instead
+	// (inSystem): the client still wants the answer as JSON.
+	FormatTold bool
 	// GeminiCompat is the upstream being Gemini's OpenAI-compatible API
 	// (AI Studio's, or a proxy in front of it on this machine or the LAN),
 	// which gives the model's thoughts only when asked in thinking_config.
@@ -263,6 +286,11 @@ const (
 	KSealed
 	// KTextSig: Text is Gemini's thoughtSignature on the text before it
 	KTextSig
+	// KAlive: nothing of the reply, only that its provider is still heard
+	// from (a keepalive, an event with nothing for the client) after
+	// keepaliveGap of nothing else: a reply read in rounds (searchReply)
+	// keeps its client alive with it as a translated stream does (#2316)
+	KAlive
 )
 
 // Event is one thing a streaming reply said.
@@ -283,6 +311,17 @@ type Event struct {
 	Usage            Usage
 	Hits             []Hit
 	SafeguardResults json.RawMessage
+	// StopDetails: Anthropic's stop_details, what its classifier said of
+	// a refusal (#1768), carried to the client as it came
+	StopDetails json.RawMessage
+
+	// Wait: for KError, how long the vendor said to wait before asking
+	// again, when it said; sent on as Retry-After
+	Wait time.Duration
+	// Said: for KError, the vendor's own error as {"error":{…}}, when it
+	// said the request itself is at fault; its code and param go to a
+	// client answered whole (writeVendorError)
+	Said json.RawMessage
 }
 
 // Usage counts tokens.
@@ -296,7 +335,14 @@ type Usage struct {
 	// 5-minute write is 1.25×, when its usage says so (cache_creation's
 	// ephemeral_1h_input_tokens)
 	CacheWrite1h int `json:"cache_write_1h,omitempty"`
-	Reasoning    int `json:"reasoning"`
+	// cacheCreationReported distinguishes a reported zero or pure-5m split
+	// from usage that did not report TTLs. It is wire evidence, not a counter.
+	cacheCreationReported bool
+	// cacheCreationHasCounts describes the parsed update's own split.
+	// It is never accumulated from earlier usage.
+	cacheCreationHasCounts bool
+
+	Reasoning int `json:"reasoning"`
 	// Served: the model the vendor's reply says answered, when it named
 	// one — which may not be the one it was asked for
 	Served string `json:"served,omitempty"`
@@ -314,6 +360,32 @@ type Usage struct {
 	// (stop_reason, finish_reason, a Responses status): "" when it said
 	// none, as a stream that just stops does (upstreamStop)
 	Stop string `json:"stop,omitempty"`
+	// Tier is the service tier the reply says it ran at (upstreamTier),
+	// "" when it says none
+	Tier string `json:"tier,omitempty"`
+	// Deferred is what the reply counted of earlier requests of its
+	// conversation, which their own replies couldn't (cUsage's
+	// MagpieDeferred): billed with this one, never told as its prompt
+	Deferred *Usage `json:"deferred,omitempty"`
+	// Credits is what the reply said the request cost in its plan's own
+	// credits, nil when it said none: WorkBuddy's usage.credit, the
+	// figure its app shows on each reply as "Credits Consumed" (#2512)
+	Credits *float64 `json:"credits,omitempty"`
+}
+
+// billed is what the request is billed for: its own count, and what it
+// counted of earlier ones (Deferred).
+func (u Usage) billed() Usage {
+	if d := u.Deferred; d != nil {
+		u.Input += d.Input
+		u.Output += d.Output
+		u.CacheRead += d.CacheRead
+		u.CacheWrite += d.CacheWrite
+		u.CacheWrite1h += d.CacheWrite1h
+		u.Reasoning += d.Reasoning
+		u.Deferred = nil
+	}
+	return u
 }
 
 // prompt is every token the prompt came to, as OpenAI's and Gemini's
@@ -339,6 +411,7 @@ func (u *Usage) add(v Usage) {
 	if v.CacheWrite1h > 0 {
 		u.CacheWrite1h = v.CacheWrite1h
 	}
+	u.cacheCreationReported = u.cacheCreationReported || v.cacheCreationReported
 	if v.Reasoning > 0 {
 		u.Reasoning = v.Reasoning
 	}
@@ -347,6 +420,9 @@ func (u *Usage) add(v Usage) {
 	}
 	if v.Upstream != "" {
 		u.Upstream = v.Upstream
+	}
+	if v.Tier != "" {
+		u.Tier = v.Tier
 	}
 	if v.RequestID != "" {
 		u.RequestID = v.RequestID
@@ -360,6 +436,12 @@ func (u *Usage) add(v Usage) {
 	if v.Stop != "" {
 		u.Stop = v.Stop
 	}
+	if v.Deferred != nil {
+		u.Deferred = v.Deferred
+	}
+	if v.Credits != nil {
+		u.Credits = v.Credits
+	}
 }
 
 // Result is a whole reply, for non-streaming clients.
@@ -370,6 +452,7 @@ type Result struct {
 	Stop             string
 	Usage            Usage
 	SafeguardResults json.RawMessage
+	StopDetails      json.RawMessage
 }
 
 // collector assembles a Result from events. Encoders use the same logic to
@@ -377,12 +460,18 @@ type Result struct {
 type collector struct {
 	res  Result
 	args strings.Builder // arguments of the open tool call
+	// text is what the part at textAt-1 has had added to its text since,
+	// written into the part by flush: adding each delta to the part's
+	// string copied the whole reply so far every time
+	text   strings.Builder
+	textAt int
 	// fresh: a KThinkStart said the next reasoning is a block of its own
 	fresh bool
 	err   string
 	// the error's status and kind, as its event gave them
 	errStatus int
 	errCode   string
+	errSaid   json.RawMessage
 }
 
 func (c *collector) last(k Kind) *Part {
@@ -404,6 +493,25 @@ func (c *collector) open() *Part {
 	return nil
 }
 
+// grow adds s to the text of the part at i, the last one.
+func (c *collector) grow(i int, s string) {
+	if c.textAt != i+1 {
+		c.flush()
+		c.text.WriteString(c.res.Parts[i].Text)
+		c.textAt = i + 1
+	}
+	c.text.WriteString(s)
+}
+
+// flush writes the text grow gathered into its part.
+func (c *collector) flush() {
+	if c.textAt > 0 {
+		c.res.Parts[c.textAt-1].Text = c.text.String()
+		c.text = strings.Builder{}
+		c.textAt = 0
+	}
+}
+
 func (c *collector) closeTool() {
 	if p := c.last(ToolCall); p != nil && p.Args == nil {
 		s := strings.TrimSpace(c.args.String())
@@ -419,13 +527,16 @@ func (c *collector) add(ev Event) {
 	if len(ev.SafeguardResults) > 0 {
 		c.res.SafeguardResults = ev.SafeguardResults
 	}
+	if len(ev.StopDetails) > 0 {
+		c.res.StopDetails = ev.StopDetails
+	}
 	switch ev.Kind {
 	case KStart:
 		c.res.ID, c.res.Model = ev.MsgID, ev.Model
 		c.res.Usage.add(ev.Usage)
 	case KText:
 		if p := c.last(Text); p != nil {
-			p.Text += ev.Text
+			c.grow(len(c.res.Parts)-1, ev.Text)
 		} else {
 			c.closeTool()
 			c.res.Parts = append(c.res.Parts, Part{Kind: Text, Text: ev.Text})
@@ -435,7 +546,7 @@ func (c *collector) add(ev Event) {
 		return
 	case KThink:
 		if p := c.open(); p != nil {
-			p.Text += ev.Text
+			c.grow(len(c.res.Parts)-1, ev.Text)
 		} else {
 			c.closeTool()
 			c.res.Parts = append(c.res.Parts, Part{Kind: Thinking, Text: ev.Text})
@@ -477,7 +588,7 @@ func (c *collector) add(ev Event) {
 		c.res.Usage.add(ev.Usage)
 		c.res.Usage.add(Usage{RequestID: ev.RequestID})
 	case KError:
-		c.err, c.errStatus, c.errCode = ev.Text, ev.Status, ev.Code
+		c.err, c.errStatus, c.errCode, c.errSaid = ev.Text, ev.Status, ev.Code, ev.Said
 	case KSearch:
 		c.closeTool()
 		c.res.Parts = append(c.res.Parts, Part{Kind: Search, Text: ev.Text, Hits: ev.Hits})
@@ -486,7 +597,7 @@ func (c *collector) add(ev Event) {
 		c.res.Parts = append(c.res.Parts, Part{Kind: Image, MediaType: ev.Name, Data: ev.Text})
 	}
 	switch ev.Kind {
-	case KStart, KUsage, KError:
+	case KStart, KUsage, KError, KAlive:
 	default:
 		// what began has had its first content, or something else came
 		c.fresh = false
@@ -494,6 +605,7 @@ func (c *collector) add(ev Event) {
 }
 
 func (c *collector) finish() Result {
+	c.flush()
 	c.closeTool()
 	// a reply of tool calls ended "stop" (a relay's end_turn beside its
 	// tool_use blocks, 蓝猫 on Discord) is the client's to run the calls
@@ -585,7 +697,7 @@ func stringOrText(raw json.RawMessage) string {
 				if b.Len() > 0 {
 					b.WriteString("\n")
 				}
-				b.WriteString("Tool " + x.ToolName + " is loaded and can be called now.")
+				b.WriteString(toolLoadedText(x.ToolName))
 			}
 		}
 		return b.String()
@@ -652,7 +764,7 @@ func effortOf(s string) string {
 }
 
 // effortRank orders the reasoning levels agents and vendors name.
-var effortRank = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+var effortRank = catalog.EffortRank
 
 // ByStrength is efforts weakest first, in effortRank's order; a level it
 // doesn't know keeps its place among the others of its kind, after them.
@@ -682,28 +794,7 @@ func fitEffort(want string, levels []string) string {
 		want = "max"
 		levels = slices.DeleteFunc(slices.Clone(levels), func(l string) bool { return l == "ultra" })
 	}
-	if len(levels) == 0 || slices.Contains(levels, want) {
-		return want
-	}
-	at := slices.Index(effortRank, want)
-	if at < 0 {
-		return want
-	}
-	best, dist := want, len(effortRank)
-	for _, l := range levels {
-		i := slices.Index(effortRank, l)
-		if i < 0 || l == "none" {
-			continue
-		}
-		d := i - at
-		if d < 0 {
-			d = -d
-		}
-		if d < dist || d == dist && i > at {
-			best, dist = l, d
-		}
-	}
-	return best
+	return catalog.NearestEffort(want, levels)
 }
 
 // budgetOf is the Anthropic thinking budget for an effort level.

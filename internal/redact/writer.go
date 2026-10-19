@@ -90,6 +90,18 @@ func (rw *Writer) Write(p []byte) (int, error) {
 	rw.buf.Write(p)
 	for {
 		b := rw.buf.Bytes()
+		// a comment between two events (": keepalive") goes on as it
+		// comes: held for the event after it, an agent behind a proxy
+		// heard nothing while its vendor reasoned silently, and the
+		// proxy hung up (#2402). It carries nothing to put back, and an
+		// event held for its placeholder's tail goes on after it as well.
+		if c := commentLines(b); c > 0 {
+			if _, err := rw.w.Write(b[:c]); err != nil {
+				return len(p), err
+			}
+			rw.buf.Next(c)
+			continue
+		}
 		i, n := eventEnd(b)
 		if i < 0 {
 			break
@@ -101,6 +113,21 @@ func (rw *Writer) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// commentLines is how long the whole comment lines (": keepalive") and
+// blank lines at the start of b are: b starts where an event does, so none
+// of them is part of one.
+func commentLines(b []byte) int {
+	n := 0
+	for n < len(b) && (b[n] == ':' || b[n] == '\n' || b[n] == '\r') {
+		i := bytes.IndexByte(b[n:], '\n')
+		if i < 0 || b[n] == '\r' && i != 1 {
+			break
+		}
+		n += i + 1
+	}
+	return n
 }
 
 // eventEnd is where the first complete event in b ends, and the length of
@@ -170,7 +197,7 @@ func (rw *Writer) event(ev []byte) error {
 		rw.pending = nil
 	}
 	typ := ""
-	tailPath, tail := "", ""
+	tailPath, tail, cut := "", "", ""
 	restored, _ := walk(data, func(path, key, s string) string {
 		if path == "type" {
 			typ = s
@@ -181,11 +208,14 @@ func (rw *Writer) event(ev []byte) error {
 		if keep(key, s) {
 			return s
 		}
-		s = Restore(s, asJSON(key, typ))
+		// the tail is looked for before anything is put back, so a
+		// placeholder whose last brace is still to come isn't put back
+		// without it and the brace left behind
 		if n := partialTail(s); n > 0 {
 			tailPath, tail = path, s[len(s)-n:]
+			cut = Restore(s[:len(s)-n], asJSON(key, typ))
 		}
-		return s
+		return Restore(s, asJSON(key, typ))
 	})
 	full := rebuild(pre, restored, post)
 	if tail == "" {
@@ -194,7 +224,7 @@ func (rw *Writer) event(ev []byte) error {
 	}
 	cutData, _ := walk(restored, func(path, _, s string) string {
 		if path == tailPath {
-			return strings.TrimSuffix(s, tail)
+			return cut
 		}
 		return s
 	})

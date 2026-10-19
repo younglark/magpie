@@ -26,6 +26,8 @@ type usageSniffer struct {
 	// failed: what an explicit error event said; a terminal event can end
 	// the stream successfully or with a failure despite its HTTP 200.
 	failed string
+	// tail: what a Chat stream's chunks say of its end (chatTail)
+	tail chatTail
 }
 
 func newSniffer(proto provider.Protocol, contentType string) *usageSniffer {
@@ -130,6 +132,9 @@ func (s *usageSniffer) parse(b []byte) {
 	if st := upstreamStop(b); st != "" {
 		s.u.Stop = st
 	}
+	if t := upstreamTier(b); t != "" {
+		s.u.Tier = t
+	}
 	switch s.proto {
 	case provider.Gemini:
 		// a Gemini stream names no type and sends no [DONE]: its end is a
@@ -158,6 +163,7 @@ func (s *usageSniffer) parse(b []byte) {
 			}
 		}
 	case provider.Chat:
+		s.tail.see(b)
 		var v struct {
 			ID    string  `json:"id"`
 			Error any     `json:"error"`

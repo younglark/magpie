@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -24,7 +25,7 @@ func reseatHome(t *testing.T) string {
 		}
 	}
 	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".hermes"), 0o755)
+	os.MkdirAll(appdir.HermesHomeIn(home), 0o755)
 	return home
 }
 
@@ -172,7 +173,7 @@ func TestReseatUnmovable(t *testing.T) {
 	c, h := mustFind(t, "claude"), mustFind(t, "hermes")
 	mustApply(t, c, "model", "cop/only-here")
 	mustApply(t, h, "model", "magpie/cop/only-here")
-	dir := filepath.Join(home, ".hermes")
+	dir := appdir.HermesHomeIn(home)
 	if err := os.Chmod(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -234,5 +235,41 @@ func TestReseatFoundGroupsOff(t *testing.T) {
 	// on again, nobody is moved back or elsewhere
 	if moves, err = Reseat(func() error { return provider.SetAutoGroups(true) }); err != nil || len(moves) != 0 {
 		t.Fatalf("on again: %+v %v", moves, err)
+	}
+}
+
+// #2671 (timonwong): a provider switched off for a while leaves the found
+// group of a model another provider still serves, so an agent on that
+// group stays on it, rather than being rewritten to the one provider left
+// and not put back when the provider is on again. A model only the
+// switched-off provider served still moves.
+func TestReseatKeepsAFoundGroupWithAProviderOff(t *testing.T) {
+	reseatHome(t)
+	c, h := mustFind(t, "claude"), mustFind(t, "hermes")
+	mustApply(t, c, "model", "group/auto-gpt-5")
+	mustApply(t, c, "haiku", "cop/only-here")
+	mustApply(t, h, "model", "magpie/group/auto-gpt-5")
+	moves, err := Reseat(func() error { return provider.SetOff("cop", true) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Field("model").Get(); got != "group/auto-gpt-5" {
+		t.Errorf("claude model with cop off: %q", got)
+	}
+	if got := h.Field("model").Get(); got != "magpie/group/auto-gpt-5" {
+		t.Errorf("hermes with cop off: %q", got)
+	}
+	if len(moves) != 1 || moves[0].Field != "haiku" || moves[0].From != "cop/only-here" {
+		t.Errorf("moves with cop off: %+v", moves)
+	}
+	if _, _, ok := provider.Resolve("group/auto-gpt-5"); !ok {
+		t.Error("group/auto-gpt-5 gone with cop off")
+	}
+	// on again, nobody is moved, and the group has cop in it again
+	if moves, err = Reseat(func() error { return provider.SetOff("cop", false) }); err != nil || len(moves) != 0 {
+		t.Fatalf("on again: %+v %v", moves, err)
+	}
+	if got := c.Field("model").Get(); got != "group/auto-gpt-5" {
+		t.Errorf("claude model on again: %q", got)
 	}
 }

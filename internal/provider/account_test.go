@@ -66,30 +66,50 @@ func signIn(t *testing.T) string {
 	return home
 }
 
-// isolate keeps tests off the machine's own Claude Code and Cursor Keychain
+// isolate keeps tests off the machine's own Claude Code Keychain
 // logins and forgets anything a previous test cached.
-func isolate(t *testing.T) {
+func isolate(t testing.TB) {
 	t.Helper()
 	oldKeychain, oldBase, oldExe := claudeKeychain, claudeBase, claudeExecutable
-	oldCursor, oldDevin := cursorKeychain, DevinExecutable
-	claudeKeychain, cursorKeychain = false, false
+	oldDevin := DevinExecutable
+	claudeKeychain = false
 	claudeExecutable = func() string { return "" }
 	// the machine's own devin, if it has one, is no test's
 	DevinExecutable = func() string { return "" }
 	forgetClaudeCredential()
 	forgetClaudeStatus()
-	forgetDevinStatus()
+	devinStatus.forget()
+	// nor Codex's keychain item (#2367): a test's has nothing in it,
+	// whatever the system
+	oldCodexKeychain, oldCodexHere := codexKeychain, codexKeychainHere
+	codexKeychain = &fakeKeychain{}
+	resetCodexKeychain()
+	// a test's keychain answers at once: however loaded the machine, a
+	// read isn't taken for one waiting on a prompt
+	oldHold := keychainHold
+	keychainHold = time.Minute
 	// nor an account's allowance another test read, which LoginUsage and
 	// the Usage page share
 	loginUsageCache.Lock()
 	loginUsageCache.m, loginUsageCache.pending = nil, nil
 	loginUsageCache.Unlock()
+	// nor what Copilot refused an account, or its sessions and picks: they
+	// are kept by GitHub token, and every test signed in (signIn) has the
+	// same one
+	ForgetCopilotForTest()
+	// nor the plans' and keys' cards: PlanQuotas and KeyBalances keep them
+	// a minute, and CachedCards hands them on whatever their age
+	forgetPlanQuotas()
+	ForgetBalances()
 	t.Cleanup(func() {
 		claudeKeychain, claudeBase, claudeExecutable = oldKeychain, oldBase, oldExe
-		cursorKeychain, DevinExecutable = oldCursor, oldDevin
+		DevinExecutable = oldDevin
+		codexKeychain, codexKeychainHere = oldCodexKeychain, oldCodexHere
+		keychainHold = oldHold
+		resetCodexKeychain()
 		forgetClaudeCredential()
 		forgetClaudeStatus()
-		forgetDevinStatus()
+		devinStatus.forget()
 	})
 }
 

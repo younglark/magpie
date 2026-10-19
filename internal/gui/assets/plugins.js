@@ -14,6 +14,7 @@
   let mine = null;       // /api/plugins: what's installed
   let listings = null;   // /api/plugins/listings: the plugins suggested
   let tagged = null;     // /api/plugins/github: repositories their authors tagged magpie-plugin, as listings
+  let taggedErr = "";    // why they couldn't be asked for, while none were had
   let topic = "magpie-plugin";
   const npm = {};        // /api/plugins/npm: package → what npm says of it
   const heads = {};      // /api/plugins/git: a git plugin's spec → the commit its repository is at
@@ -39,11 +40,17 @@
   const PLUG = "M6 2v3 M10 2v3 M4.5 5h7v2.5a3.5 3.5 0 0 1-7 0z M8 11v3";
   const PIPE = "M1.5 8h3 M11.5 8h3 M4.5 4.5h7v7h-7z";
   const TERM = "M2 3.5h12v9H2z M4.5 6.5l2 1.5-2 1.5 M8 9.5h3";
+  const PAGE = "M2 3.5h12v9H2z M2 6h12 M4 4.75h.01";
+  const TOOL = "M10.6 2.4a3 3 0 0 0-3.4 4L2.6 11a1.2 1.2 0 0 0 1.7 1.7l4.6-4.6a3 3 0 0 0 4-3.4l-1.7 1.7-1.6-.3-.3-1.6z";
   const FOLDER = "M14.7 12.7a1.3 1.3 0 0 1-1.3 1.3H2.6a1.3 1.3 0 0 1-1.3-1.3V3.3A1.3 1.3 0 0 1 2.6 2h3.3l1.3 2h6.2a1.3 1.3 0 0 1 1.3 1.3z";
 
-  const name = (spec) => { const i = spec.lastIndexOf("@"); return i > 0 && !spec.startsWith(".") && !spec.includes("/", i) ? spec.slice(0, i) : spec; };
-  // a plugin added from a folder is a folder's path, not a package name
-  const isPath = (p) => /^file:\/\//.test(p) || /^\./.test(p) || /^\//.test(p) || /^[A-Za-z]:[\\/]/.test(p);
+  // a folder's path is its name whole, as plugin.Name: C:\Users\me@corp\…
+  // has an @ that is no version
+  const name = (spec) => { if (isPath(spec)) return spec; const i = spec.lastIndexOf("@"); return i > 0 && !spec.includes("/", i) ? spec.slice(0, i) : spec; };
+  // a plugin added from a folder is a folder's path, not a package name.
+  // a leading \ is one on every system, as plugin.IsPath (#2229): a UNC
+  // share (\\server\share\plugin) and a leading-backslash path
+  const isPath = (p) => /^file:\/\//.test(p) || /^\./.test(p) || /^[/\\]/.test(p) || /^[A-Za-z]:[\\/]/.test(p);
   // ...and is known by the folder's name, not its whole path
   const label = (spec) => { const n = name(spec); return isPath(n) ? n.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || n : n; };
   // one added from a git repository (github:owner/repo, git+https://…), as
@@ -108,13 +115,19 @@
   // subscription and serves its models; middleware ("mw") runs in the
   // gateway on every agent's requests and replies, whatever serves them;
   // an agent ("ag") is one magpie has no wiring of its own for, which it
-  // then connects as it does its own
+  // then connects as it does its own; tools ("tl") are given to every
+  // agent through magpie's plugin tools MCP server; a page ("pg") is a
+  // page of its own in the window's sidebar (pluginpages.js); panels
+  // ("pn") are its parts in magpie's own pages
   const KINDS = {
     pv: [PLUG, "Provider", "Signs in to a subscription and serves its models"],
     mw: [PIPE, "Middleware", "Runs in magpie's gateway on the requests your agents send and on the replies"],
     ag: [TERM, "Agent", "Adds an agent magpie has no setup of its own for: pick its model on the Agents page and it goes through magpie"],
+    tl: [TOOL, "Tools", "Gives every agent tools of its own, through magpie's MCP server"],
+    pg: [PAGE, "Page", "Adds a page of its own to the sidebar. It runs shut off from the rest of magpie and can read only what its row lists"],
+    pn: [PAGE, "Panels", "Adds panels to magpie's own pages. They run shut off from the rest of magpie and can read only what its row lists"],
   };
-  const kindOf = (l) => l.kind === "middleware" ? "mw" : l.kind === "agent" ? "ag" : "pv";
+  const kindOf = (l) => ({ middleware: "mw", agent: "ag", tools: "tl", page: "pg" })[l.kind] || "pv";
   function kindChip(kind) {
     const [d, word, tip] = KINDS[kind];
     const c = el("span", "pm-chip kind " + kind);
@@ -125,7 +138,7 @@
   function logo(ic, big, kind) {
     const box = el("span", "pm-logo" + (big ? " big" : ""));
     if (ic) box.append(icon(ic));
-    else box.append(glyph(kind === "mw" ? PIPE : kind === "ag" ? TERM : PUZZLE, big ? 22 : 17, 1.4));
+    else box.append(glyph({ mw: PIPE, ag: TERM, tl: TOOL, pg: PAGE }[kind] || PUZZLE, big ? 22 : 17, 1.4));
     return box;
   }
 
@@ -141,6 +154,8 @@
     try {
       mine = await api("plugins");
       failed = "";
+      // a plugin turned on or off brings its page's tab, or takes it
+      window.loadPluginPages?.();
     } catch (e) {
       failed = e.message;
     }
@@ -159,8 +174,12 @@
     try {
       const r = await api("plugins/github");
       tagged = (r.repos || []).map(ghListing);
+      taggedErr = "";
       if (r.topic) topic = r.topic;
-    } catch { tagged = tagged || []; }
+    } catch (e) {
+      if (!tagged) taggedErr = e.message || String(e);
+      tagged = tagged || [];
+    }
   }
   async function loadListings() {
     try {
@@ -206,6 +225,7 @@
       loadMine().then(() => { draw(); window.renderPluginDot?.(); }),
       loadListings().then(draw),
       loadTagged().then(drawBody),
+      loadBuiltins(),
       providers ? null : loadProviders().then(drawBody, () => {}),
     ];
     await Promise.all(parts);
@@ -213,6 +233,9 @@
     askGit();
   }
   window.loadPlugins = load;
+  // the sidebar's dot, followed: Plugins opens on Installed, where the
+  // plugins with an update are named at the top
+  window.pluginTabTo = (id) => { tab = id; };
   // pluginQuery: Discover, looking for q (the add sheet found nothing by it)
   window.pluginQuery = (q) => {
     if (q === query && !q) return;
@@ -281,7 +304,10 @@
       if (asked.length && unknown.length === asked.length) {
         status(t("Couldn't check for updates: {error}", { error: whyText(unknown[0]) }), "err", 8000);
       } else {
-        let msg = ups ? (ups === 1 ? t("1 plugin has an update") : t("{n} plugins have updates", { n: ups })) : t("Every plugin is up to date");
+        // with some not checked, "every plugin" isn't known to be up to
+        // date: only the ones checked are (#1942)
+        let msg = ups ? (ups === 1 ? t("1 plugin has an update") : t("{n} plugins have updates", { n: ups }))
+          : unknown.length ? t("No updates for the plugins checked") : t("Every plugin is up to date");
         if (unknown.length) {
           msg += " · " + t("{n} couldn't be checked: {error}", { n: unknown.length, error: whyText(unknown[0]) });
           status(msg, "warn", 8000);
@@ -297,7 +323,7 @@
   // why npm said nothing of a plugin, in the page's words; a git one's
   // repository, in its own
   function whyText(c) {
-    if (isGit(c.spec || "")) return t("Couldn't ask {repo} for its newest commit: {error}", { repo: c.spec, error: c.error || "" });
+    if (isGit(c.spec || "")) return t("Couldn't ask {repo} for its newest commit: {error}", { repo: c.spec, error: c.limited ? limitedText(c.limited) : c.error || "" });
     switch (c.why) {
       case "offline": return t("npm couldn't be reached — check your connection or proxy");
       case "limited": return t("npm is turning requests away for now (too many); try again in a few minutes");
@@ -305,7 +331,17 @@
       default: return t("npm answered with an error: {error}", { error: c.error || "" });
     }
   }
-  const checkedAt = () => checked ? new Date(checked.at).toLocaleTimeString(document.documentElement.lang || undefined, { hour: "2-digit", minute: "2-digit" }) : "";
+  // GitHub's rate limit used up, in the page's words as the library's
+  // skill check says it: when it lifts, and how a token raises it (#1942)
+  function limitedText(l) {
+    const d = l.until ? new Date(l.until) : null;
+    const time = d && !isNaN(d) ? d.toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }) : "";
+    if (l.token) return time ? t("GitHub's rate limit for your GitHub token is used up until {time}", { time })
+      : t("GitHub's rate limit for your GitHub token is used up for now");
+    return time ? t("GitHub allows 60 requests an hour without a token, used up until {time}. Add a GitHub token in Settings → Network and sharing to raise it to 5,000.", { time })
+      : t("GitHub allows 60 requests an hour without a token, used up for now. Add a GitHub token in Settings → Network and sharing to raise it to 5,000.");
+  }
+  const checkedAt = () => checked ? new Date(checked.at).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }) : "";
 
   // the built-ins with accounts this plugin could run in their place
   const movableOf = (pkg) => (mine?.movable || []).filter((c) => c.package === pkg);
@@ -434,7 +470,7 @@
       b.classList.add("go");
       b.textContent = t("Sign in");
       b.title = subs.length > 1 ? t("Sign in to {name}", { name: out.name }) : "";
-      b.onclick = (ev) => { ev.stopPropagation(); pluginSignIn(out.id); };
+      b.onclick = (ev) => { ev.stopPropagation(); pluginSignIn(out.id, ev); };
       return b;
     }
     // an update out: the one button says so in place of Signed in or
@@ -485,7 +521,7 @@
     if (l.npm?.weekly) {
       const d = el("span", "pm-dl");
       d.append(glyph(DOWN, 11, 1.5), el("span", "", t("{n}/week", { n: count(l.npm.weekly) })));
-      d.title = t("{n} downloads on npm last week", { n: l.npm.weekly.toLocaleString() });
+      d.title = t("{n} downloads on npm last week", { n: l.npm.weekly.toLocaleString(intlLang()) });
       meta.append(d);
     }
     if (l.npm?.version) {
@@ -497,8 +533,8 @@
     if (e?.error && !e.off) meta.append(el("span", "pm-chip bad", t("Didn't load")));
     else if (e?.off) meta.append(el("span", "pm-chip", t("Off")));
     if (l.replaces) {
-      const b = el("span", "pm-chip soft", t("Also built in"));
-      b.title = t("magpie also signs in to this itself, for now; the plugin keeps it working if the built-in one is retired");
+      const b = el("span", "pm-chip soft", t("Replaces built-in"));
+      b.title = t("magpie's own sign-in to this subscription is deprecated: this plugin takes its place, and accounts signed in there move to it");
       meta.append(b);
     }
     c.append(top, sum, meta);
@@ -517,15 +553,26 @@
   function stars(n) {
     const d = el("span", "pm-dl");
     d.append(glyph(STAR, 11, 1.4), el("span", "", count(n)));
-    d.title = t("{n} stars on GitHub", { n: (n || 0).toLocaleString() });
+    d.title = t("{n} stars on GitHub", { n: (n || 0).toLocaleString(intlLang()) });
     return d;
   }
 
+  // cards still to come, drawn as a card is laid out (its picture, name
+  // and author, two lines of summary, its facts) for a light to pass over,
+  // one card after the other
   function skeleton(n) {
     const g = el("div", "pm-grid");
+    g.setAttribute("aria-hidden", "true");
+    const bar = (c) => el("div", "sk " + c);
     for (let i = 0; i < n; i++) {
       const c = el("div", "pm-card ghost");
-      c.append(el("div", "g1"), el("div", "g2"), el("div", "g3"));
+      c.style.setProperty("--i", i);
+      const top = el("div", "gtop"), who = el("div", "gwho");
+      who.append(bar("gname"), bar("gby"));
+      top.append(bar("glogo"), who, bar("gact"));
+      const meta = el("div", "gmeta");
+      meta.append(bar("gchip"), bar("gchip short"));
+      c.append(top, bar("gline"), bar("gline short"), meta);
       g.append(c);
     }
     return g;
@@ -540,6 +587,152 @@
     for (const l of list) g.append(card(l));
     box.append(h, g);
     return box;
+  }
+
+  // The repositories on GitHub are many and of every kind (the owner: 这里
+  // 应该有分类以及搜索框方便用户筛选), so their section has its own kinds
+  // to pick from, each with how many there are, and a field that narrows
+  // them by name, author or description as it is typed, once there are
+  // more than a few to look through (counted before the page's search, so
+  // they don't go away under someone typing). Both narrow what the page's
+  // search has already found; only the section is drawn again.
+  // What's installed is the other question the section is read with (the
+  // owner: 加一个未安装), and it cuts across the kinds: a reader after a
+  // middleware they haven't got picks Middleware and Not installed. So it
+  // is a second strip beside the kinds, each counting what the other, the
+  // field and the page's search leave — the counts follow the picks as
+  // they are made — and the two narrow the grid together.
+  // The section, its head and its field are made once and kept in the
+  // page, as the page's search field is (#1055).
+  let ghKind = "";       // "" (all) | "pv" | "mw" | "ag"
+  let ghHave = "";       // "" (all) | "have" | "none"
+  let ghQuery = "";
+  let ghList = [];       // what the page's search left of the repositories
+  const ghSec = el("section", "pm-sec pm-ghsec");
+  const ghHead = el("div", "pm-sechead");
+  const ghBar = el("div", "pm-ghbar");
+  const ghGrid = el("div", "pm-grid");
+  const ghFind = el("label", "pm-find pm-ghfind");
+  const ghQ = el("input");
+  ghQ.type = "search";
+  ghQ.spellcheck = false;
+  ghQ.autocomplete = "off";
+  ghQ.oninput = () => { ghQuery = ghQ.value; drawGh(); };
+  ghQ.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === "Escape" && ghQ.value) { ghQ.value = ""; ghQ.oninput(); } };
+  ghFind.append(glyph(SEARCH, 13, 1.6), ghQ);
+  const ghMatch = (l) => {
+    const f = ghQuery.trim().toLowerCase();
+    return !f || [l.name, l.github.repo, l.github.owner, l.package, summary(l)].join(" ").toLowerCase().includes(f);
+  };
+  const ghTitle = () => [el("h3", "", t("Unofficial, on GitHub")), el("span", "", t("repositories their authors tagged {topic} — nobody has reviewed them; read the code before you install one", { topic }))];
+  // GitHub answers after the rest, seconds after on a slow line, and a
+  // section that wasn't there read as there being no such plugins (the
+  // owner: 网慢的用户以为没有非官方插件). Until it answers the section
+  // stands in its place with its head, a word that it is looking and
+  // cards still to come; its cards then come in where those were.
+  let ghArrive = false;
+  function ghWaiting() {
+    const look = el("span", "pm-ghlook");
+    look.setAttribute("role", "status");
+    const dots = el("span", "dots");
+    dots.setAttribute("aria-hidden", "true");
+    dots.append(el("i"), el("i"), el("i"));
+    look.append(dots, el("span", "", t("Looking on GitHub")));
+    ghHead.replaceChildren(...ghTitle(), look);
+    ghSec.setAttribute("aria-busy", "true");
+    ghArrive = true;
+    replaceKeeping(ghSec, [ghHead, skeleton(3)]);
+    return ghSec;
+  }
+  // and one GitHub couldn't be asked of says so, with another go
+  function ghFailed() {
+    ghHead.replaceChildren(...ghTitle());
+    ghSec.removeAttribute("aria-busy");
+    const box = el("div", "pm-ghnone");
+    const again = el("button", "text", t("Try again"));
+    again.type = "button";
+    again.onclick = () => {
+      tagged = null;
+      taggedErr = "";
+      drawBody();
+      loadTagged().then(drawBody);
+    };
+    box.append(el("span", "", t("Couldn't ask GitHub: {error}", { error: taggedErr })), again);
+    replaceKeeping(ghSec, [ghHead, box]);
+    return ghSec;
+  }
+  function ghSection(list) {
+    ghList = list;
+    ghHead.replaceChildren(...ghTitle());
+    ghSec.removeAttribute("aria-busy");
+    drawGh();
+    // the first cards after the wait come in, one after the other; the
+    // grid drawn again for a pick doesn't
+    if (ghArrive) {
+      ghArrive = false;
+      ghSec.classList.add("pm-arrive");
+      [...ghGrid.children].forEach((c, i) => c.style.setProperty("--i", Math.min(i, 9)));
+      setTimeout(() => ghSec.classList.remove("pm-arrive"), 900);
+    }
+    return ghSec;
+  }
+  function drawGh() {
+    if ((tagged || []).length <= 6) {
+      ghGrid.replaceChildren(...ghList.map(card));
+      replaceKeeping(ghSec, [ghHead, ghGrid]);
+      return;
+    }
+    // the kinds there are, in the market's order, each with how many the
+    // field leaves of it; one kind alone needs no picking
+    const found = ghList.filter(ghMatch);
+    const kinds = ["pv", "mw", "ag", "tl", "pg"].filter((k) => ghList.some((l) => kindOf(l) === k));
+    if (!kinds.includes(ghKind)) ghKind = "";
+    // which of them are here, asked once each: the counts below would ask
+    // it again for every pick in both strips. Like a kind alone, a list
+    // that is all installed or all not has nothing to pick out, and a pick
+    // that can no longer be seen doesn't go on narrowing the grid.
+    const here = new Map(ghList.map((l) => [l, !!entryOf(l.package)]));
+    const have = (l) => here.get(l);
+    const both = ghList.some(have) && ghList.some((l) => !have(l));
+    if (!both) ghHave = "";
+    // the field and the other strip narrow it, so each count is what a
+    // pick in this strip would leave; the kind's own pick is the one left
+    // out, or every count but All would be the picked kind's alone
+    const n = (k, h) => found.filter((l) => (!k || kindOf(l) === k) && (!h || have(l) === (h === "have"))).length;
+    const bar = [];
+    if (kinds.length > 1) {
+      const pick = segs([["", t("All") + " · " + n("", ghHave)], ...kinds.map((k) => [k, t(KINDS[k][1]) + " · " + n(k, ghHave)])], ghKind, (k) => { ghKind = k; drawGh(); });
+      pick.classList.add("pm-ghkinds");
+      pick.setAttribute("role", "group");
+      pick.setAttribute("aria-label", t("Kind of plugin"));
+      bar.push(pick);
+    }
+    // what's installed, on both sides of it: a reader looks for what to
+    // add as much as for what they have
+    if (both) {
+      const pick = segs([["", t("All") + " · " + n(ghKind, "")], ["have", t("Installed") + " · " + n(ghKind, "have")], ["none", t("Not installed") + " · " + n(ghKind, "none")]], ghHave, (h) => { ghHave = h; drawGh(); });
+      pick.classList.add("pm-ghhave");
+      pick.setAttribute("role", "group");
+      pick.setAttribute("aria-label", t("Installed or not"));
+      bar.push(pick);
+    }
+    bar.push(el("span", "grow"), ghFind);
+    ghQ.placeholder = t("Filter by name, author or description");
+    ghQ.setAttribute("aria-label", t("Filter the plugins on GitHub"));
+    if (ghQ.value !== ghQuery) ghQ.value = ghQuery;
+    replaceKeeping(ghBar, bar);
+    const shown = found.filter((l) => (!ghKind || kindOf(l) === ghKind) && (!ghHave || have(l) === (ghHave === "have")));
+    if (shown.length) {
+      ghGrid.replaceChildren(...shown.map(card));
+      replaceKeeping(ghSec, [ghHead, ghBar, ghGrid]);
+      return;
+    }
+    const none = el("div", "pm-ghnone");
+    const all = el("button", "text", t("Show all"));
+    all.type = "button";
+    all.onclick = () => { ghKind = ""; ghHave = ""; ghQuery = ""; drawGh(); ghQ.focus(); };
+    none.append(el("span", "", t("No plugin on GitHub matches")), all);
+    replaceKeeping(ghSec, [ghHead, ghBar, none]);
   }
 
   // the head and its search field are made once and drawn again in
@@ -568,16 +761,20 @@
 
   function head() {
     const n = mine?.plugins?.length || 0;
-    const tabs = segs([["discover", t("Discover")], ["installed", t("Installed") + (n ? " · " + n : "")]], tab, (id) => {
+    const tabs = segs([["builtin", t("Built-in")], ["discover", t("Discover")], ["installed", t("Installed") + (n ? " · " + n : "")]], tab, (id) => {
       tab = id;
       try { localStorage.setItem("magpie.pluginTab", id); } catch {}
+      searchShown();
       drawBody();
     });
     tabs.classList.add("lib-tabs");
+    tabs.querySelectorAll(".opt")[2].dataset.sub = "installed";
     q.placeholder = t("Search plugins and npm…");
     if (q.value !== query) q.value = query;
     q.setAttribute("aria-label", t("Search plugins"));
-    replaceKeeping(headBox, [tabs, el("span", "grow"), mirrorSwitch(), find]);
+    mirror = mirrorSwitch();
+    replaceKeeping(headBox, [tabs, el("span", "grow"), mirror, find]);
+    searchShown();
     headBox.classList.toggle("stuck", page.scrollTop > 0);
     return headBox;
   }
@@ -586,6 +783,13 @@
   // mirrors in China first (npmmirror, jsDelivr); none before what's
   // installed has come, which says how it is set
   let mirrorSaving = false;
+  // the built-in plugins are a short list of switches: nothing to search
+  // or fetch through a mirror
+  let mirror = null;
+  function searchShown() {
+    find.hidden = tab === "builtin";
+    if (mirror) mirror.hidden = !mine || tab === "builtin";
+  }
   function mirrorSwitch() {
     const on = !!mine?.mirror;
     const b = el("button", "pm-mirror" + (on ? " on" : ""));
@@ -594,6 +798,7 @@
     b.disabled = mirrorSaving;
     b.setAttribute("role", "switch");
     b.setAttribute("aria-checked", on ? "true" : "false");
+    b.setAttribute("aria-label", t("Mirrors in China"));
     b.title = t("Download the plugin list, plugins and Bun from mirrors in China first (npmmirror, jsDelivr), their official addresses after. Each is a copy of the very file, checked as the original is");
     const sw = el("span", "lib-switch" + (on ? " on" : ""));
     sw.append(el("i"));
@@ -633,7 +838,8 @@
   let body = null;
   function draw() {
     const scroll = page.scrollTop;
-    body = el("div", "lib-body pm-body");
+    // the body is made once, so the GitHub section's field stays in the page
+    body = body || el("div", "lib-body pm-body");
     replaceKeeping(page, [head(), body]);
     drawBody();
     page.scrollTop = scroll;
@@ -644,9 +850,11 @@
     const key = tab + (query ? ":q" : "");
     body.classList.toggle("enter", shown !== key);
     shown = key;
-    body.replaceChildren();
-    // the search field keeps its focus: only the body is redrawn while typing
+    // the search field keeps its focus: only the body is redrawn while
+    // typing, and the GitHub section's field is kept in it
+    if (tab === "installed" || tab === "builtin" || !listings) body.replaceChildren();
     if (tab === "installed") return drawInstalled();
+    if (tab === "builtin") return drawBuiltin();
     if (failedList && !listings) {
       body.append(el("p", "pm-empty", t("Couldn't load the plugins: {error}", { error: failedList })));
       return;
@@ -661,21 +869,31 @@
     // a tagged repository the market already lists is the market's card
     const listed = new Set(listings.map((l) => l.package));
     const gh = (tagged || []).filter((l) => !(l.github.package && listed.has(l.github.package)) && match(l));
+    // put in place around the GitHub section, which stays in the page
+    const out = [];
     if (!f) {
-      body.append(intro());
+      out.push(intro());
       // magpie's community's alone: others' plugins are found by a search
       const ours = ls.filter((l) => l.community && kindOf(l) === "pv");
       const mws = ls.filter((l) => l.community && kindOf(l) === "mw");
       const ags = ls.filter((l) => l.community && kindOf(l) === "ag");
-      if (ours.length) body.append(section(t("Subscriptions"), t("written for magpie, checked against its own sign-ins"), ours));
-      if (mws.length) body.append(section(t("Gateway middleware"), t("runs in magpie's gateway on what every agent sends and gets back, whichever provider serves it"), mws));
-      if (ags.length) body.append(section(t("Agents"), t("agents magpie has no setup of its own for, connected to it as its own are"), ags));
-      if (gh.length) body.append(section(t("Unofficial, on GitHub"), t("repositories their authors tagged {topic} — nobody has reviewed them; read the code before you install one", { topic }), gh));
-      body.append(manual());
+      const tls = ls.filter((l) => l.community && kindOf(l) === "tl");
+      const pgs = ls.filter((l) => l.community && kindOf(l) === "pg");
+      if (ours.length) out.push(section(t("Subscriptions"), t("written for magpie, checked against its own sign-ins"), ours));
+      if (mws.length) out.push(section(t("Gateway middleware"), t("runs in magpie's gateway on what every agent sends and gets back, whichever provider serves it"), mws));
+      if (ags.length) out.push(section(t("Agents"), t("agents magpie has no setup of its own for, connected to it as its own are"), ags));
+      if (tls.length) out.push(section(t("Tools for agents"), t("tools every agent can call, through magpie's MCP server"), tls));
+      if (pgs.length) out.push(section(t("Pages"), t("pages of their own in magpie's window, each shut off from the rest and reading only what it lists"), pgs));
+      if (gh.length) out.push(ghSection(gh));
+      else if (!tagged) out.push(ghWaiting());
+      else if (taggedErr) out.push(ghFailed());
+      out.push(manual());
+      replaceKeeping(body, out);
       return;
     }
-    if (ls.length) body.append(section(t("Suggested"), "", ls));
-    if (gh.length) body.append(section(t("Unofficial, on GitHub"), t("repositories their authors tagged {topic} — nobody has reviewed them; read the code before you install one", { topic }), gh));
+    if (ls.length) out.push(section(t("Suggested"), "", ls));
+    if (gh.length) out.push(ghSection(gh));
+    else if (!tagged) out.push(ghWaiting());
     const known = new Set([...listings.map((l) => l.package), ...(tagged || []).map((l) => l.github.package).filter(Boolean)]);
     const box = el("section", "pm-sec");
     const h = el("div", "pm-sechead");
@@ -691,20 +909,22 @@
       for (const x of list) g.append(card({ package: x.package, name: x.package, npm: x }));
       box.append(g);
     }
-    body.append(box);
+    out.push(box);
+    replaceKeeping(body, out);
   }
 
   function intro() {
     const box = el("div", "pm-intro");
     const text = el("div", "pm-introtext");
-    text.append(el("h2", "", t("Subscriptions and gateway middleware")));
+    text.append(el("h2", "", t("Plugins extend magpie")));
     text.append(el("p", "", t("Plugins sign in to coding plans and make their requests; the models then work in every agent, like any provider's. They're OpenCode's provider plugins or pi's packages, run on Bun.")));
     const mw = el("p", "");
-    mw.append(document.createTextNode(t("A plugin can also be middleware in magpie's gateway: it reads and rewrites what agents send and get back, for every provider.") + " "));
-    // the docs in the reader's language: the site has en, zh and ja
-    const how = el("a", "pm-link", "");
-    how.href = "https://usemagpie.ai/docs/" + ({ zh: "zh/", ja: "ja/" }[lang()] || "") + "plugins#middleware";
-    how.append(el("span", "", t("Write a middleware")), glyph(OUTL, 11, 1.5));
+    mw.append(document.createTextNode(t("A plugin can also run in magpie's gateway on what agents send and get back, pick which account a routing asks, give every agent tools, connect an agent, or add a page of its own.") + " "));
+    // the docs in the reader's language: the site has en, zh and ja, and
+    // Chinese is nearer a zh-TW reader than English is
+    const how = el("a", "pm-link pm-write", "");
+    how.href = "https://usemagpie.ai/docs/" + ({ zh: "zh/", "zh-TW": "zh/", ja: "ja/" }[lang()] || "") + "plugins";
+    how.append(el("span", "", t("Write a plugin")), glyph(OUTL, 11, 1.5));
     how.onclick = (ev) => { ev.preventDefault(); api("open", { url: how.href }).catch(() => {}); };
     mw.append(how);
     text.append(mw);
@@ -771,6 +991,28 @@
     return b;
   }
 
+  // Built-in: magpie's own plugins (Sessions, Library, routing groups…),
+  // each with a switch (renderBuiltins in app.js), read afresh each time
+  // the tab is drawn
+  let builtins = null, builtinsFailed = "";
+  async function loadBuiltins() {
+    try {
+      builtins = await api("plugins/builtin");
+      builtinsFailed = "";
+    } catch (e) {
+      builtinsFailed = e.message;
+    }
+    if (tab === "builtin") drawBody();
+  }
+  function drawBuiltin() {
+    const say = el("p", "feat-say", t("Parts of magpie not everyone needs. Switched off, a part leaves the sidebar, its pages and Settings; magpie works the same either way."));
+    const list = el("div", "list prefs");
+    list.id = "builtinList";
+    body.append(say, list);
+    if (builtinsFailed && !builtins) list.append(el("p", "pm-empty", t(builtinsFailed)));
+    else if (builtins) window.renderBuiltins(list, builtins, (next) => { builtins = next; drawBody(); });
+  }
+
   function drawInstalled() {
     if (failed && !mine) {
       body.append(el("p", "pm-empty", t("Couldn't load the plugins: {error}", { error: failed })));
@@ -787,6 +1029,22 @@
       body.append(none);
       return;
     }
+    // what the sidebar's dot is about, said where it's acted on: which
+    // plugins have a newer version, and one press to update them all
+    const outdated = es.filter((e) => (e.latest && e.version && newer(e.latest, e.version)) || (gitBehind(e) && !e.off));
+    if (outdated.length) {
+      const bar = el("div", "pm-updates");
+      const names = outdated.map(shownName).join(t(", "));
+      bar.append(el("span", "pm-dot"), el("span", "grow", outdated.length === 1
+        ? t("A newer version of {name} is out", { name: names })
+        : t("Newer versions of {n} plugins are out: {names}", { n: outdated.length, names })));
+      const up = el("button", "pm-act pm-up", busy.has("*") ? t("Updating…") : t("Update all ({n})", { n: outdated.length }));
+      up.type = "button";
+      up.disabled = busy.size > 0 || checking;
+      up.onclick = () => act("*", "update", {}, () => status(t("Plugins updated"), "ok"));
+      bar.append(up);
+      body.append(bar);
+    }
     // by name, in the order the reader picked (#481), not the order they
     // were installed in
     const list = el("div", "list pm-list");
@@ -799,7 +1057,6 @@
     fill();
     body.append(list);
     const foot = el("div", "pm-foot");
-    const outdated = es.filter((e) => (e.latest && e.version && newer(e.latest, e.version)) || (gitBehind(e) && !e.off));
     foot.append(el("span", "", mine.bun ? t("Plugins run on Bun {v}", { v: mine.bunVersion }) : ""), el("span", "grow"));
     // npm has versions to ask for, and a git one's repository commits; a
     // folder has none
@@ -811,13 +1068,6 @@
       c.disabled = checking || busy.size > 0;
       c.onclick = () => checkUpdates();
       foot.append(c);
-    }
-    if (outdated.length) {
-      const up = el("button", "pm-act pm-up", busy.has("*") ? t("Updating…") : t("Update all ({n})", { n: outdated.length }));
-      up.type = "button";
-      up.disabled = busy.size > 0 || checking;
-      up.onclick = () => act("*", "update", {}, () => status(t("Plugins updated"), "ok"));
-      foot.append(up);
     }
     body.append(foot);
   }
@@ -861,15 +1111,16 @@
     } else if (e.autoUpdated && e.autoUpdated.to === e.version) {
       // magpie updated it by itself lately: the row says so, quietly
       const c = el("span", "pm-chip soft", t("Auto-updated"));
-      c.title = t("magpie updated it from v{from} to v{to} on {date}", { from: e.autoUpdated.from, to: e.autoUpdated.to, date: new Date(e.autoUpdated.at).toLocaleDateString(document.documentElement.lang || undefined, { month: "short", day: "numeric" }) });
+      c.title = t("magpie updated it from v{from} to v{to} on {date}", { from: e.autoUpdated.from, to: e.autoUpdated.to, date: new Date(e.autoUpdated.at).toLocaleDateString(intlLang(), { month: "short", day: "numeric" }) });
       nm.append(c);
     } else if ((ck?.status === "current" || ck?.status === "update") && e.version) {
       const c = el("span", "pm-chip soft", t("Up to date"));
       c.title = (isGit(e.spec) ? t("{head} is the newest commit of {repo}", { head: ck.head || e.head || "", repo: e.spec }) : t("v{v} is the newest on npm", { v: e.version })) + "\n" + t("Last checked {time}", { time: checkedAt() });
       nm.append(c);
     }
-    // the built-in subscriptions moved onto it: taking it away moves them
-    // back, so the row says it carries them
+    // the built-in subscriptions moved onto it: taking it away or off
+    // stops them, as there is no built-in to go back to, so the row says
+    // it carries them
     const moved = (e.moved || []).map((id) => SUBS.find((x) => x.agent === id)?.name || id);
     const names = moved.join(t(", "));
     if (moved.length && !e.off) {
@@ -881,10 +1132,21 @@
     // gateway middleware runs in magpie's gateway, not as a subscription:
     // the row says so, and how it is doing, on a line of its own
     const mw = e.middleware;
+    const gw = e.gateway;
     const ag = e.agent;
     if (mw || e.isMiddleware) nm.append(kindChip("mw"));
+    if (gw || e.isGateway) {
+      const chip = kindChip("mw");
+      chip.querySelector("span").textContent = t("Request hook");
+      nm.append(chip);
+    }
     if (ag || e.isAgent) nm.append(kindChip("ag"));
-    if (e.providers?.length || !(e.middlewareOnly || e.inMagpieOnly || (mw && !e.isMiddleware) || (ag && !e.isAgent))) nm.append(kindChip("pv"));
+    // a plugin of tools alone signs in to nothing: no Provider chip
+    const toolsOnly = !!e.tools?.length && !e.providers?.length;
+    if (e.tools?.length) nm.append(kindChip("tl"));
+    if (e.page) nm.append(kindChip("pg"));
+    if (e.panels?.length) nm.append(kindChip("pn"));
+    if (e.providers?.length || !(e.gatewayOnly || e.middlewareOnly || e.inMagpieOnly || toolsOnly || (mw && !e.isMiddleware) || (ag && !e.isAgent))) nm.append(kindChip("pv"));
     who.append(nm);
     const subs = subsOf(pkg);
     const sub = el("div", "sub");
@@ -900,7 +1162,7 @@
       sub.textContent = t("{names} can run on it again, with the same accounts.", { names: cands.map((c) => c.name).join(t(", ")) });
       sub.classList.add("ask");
     } else if (ask) {
-      sub.textContent = t(ask === "remove" ? "{names} goes back to the built-in, with its accounts, before the plugin is removed." : "{names} goes back to the built-in, with its accounts, before the plugin is switched off.", { names });
+      sub.textContent = t(ask === "remove" ? "{names} stops working until the plugin is installed again. Its accounts are kept." : "{names} stops working while the plugin is off. Its accounts are kept.", { names });
       sub.classList.add("ask");
     } else if (e.off) sub.textContent = t("Off");
     else if (e.error) { sub.textContent = t("Didn't load: {error}", { error: e.error }); sub.classList.add("bad"); sub.title = e.error; }
@@ -915,17 +1177,30 @@
         else if (!x.signedIn && subs.some((y) => y.signedIn)) s.title = t("{name} is a subscription of its own; {other} works without it", { name: x.name, other: subs.find((y) => y.signedIn).name });
         sub.append(s);
       }
-    } else if ((mw || ag) && !e.providers.length) {
-      // only middleware or an agent: its own line says what it does
+    } else if ((mw || ag || gw || e.isGateway || toolsOnly || (e.page || e.panels?.length) && e.inMagpieOnly) && !e.providers.length) {
+      // only middleware, a request hook, an agent, tools, a page or panels: its own line says what it does
     } else if (clashes.length && !e.providers.length) {
       // its own line below says whose it is
-    } else sub.textContent = e.providers.length ? t("Signs in to {names}", { names: e.providers.join(t(", ")) }) : t("Signs in to nothing magpie can use");
+    } else if (e.providers.length) sub.textContent = t("Signs in to {names}", { names: e.providers.join(t(", ")) });
+    // an empty list only means "nothing" once the plugins have answered: a
+    // plugin installed a moment ago has no names yet, and the page says
+    // nothing rather than claiming here that it signs in to nothing magpie
+    // can use, which isn't known until the answer comes (#1112)
+    else if (e.named) sub.textContent = t("Signs in to nothing magpie can use");
     if (sub.textContent) who.append(sub);
     if (!ask) for (const c of clashes) who.append(clashLine(e, c, nameOfSpec));
     if (mw && !e.off && !ask) who.append(mwLine(mw));
+    if (gw && !e.off && !ask) who.append(gatewayLine(gw));
     if (ag && !e.off && !ask) who.append(agentLine(ag));
-    if (mw && !e.off && !ask && editing?.pkg === pkg) who.append(optionsEditor(e));
-    r.append(logo(l?.icon || l?.npm?.icon || subs[0]?.icon || ag?.icon, false, e.middlewareOnly ? "mw" : e.inMagpieOnly && e.isAgent && !e.isMiddleware ? "ag" : ""), who);
+    if (e.tools?.length && !e.off && !ask) who.append(toolsLine(e.tools));
+    // off too: what its page may read is said before it is turned on
+    if (e.page && !ask) who.append(pageLine(e.page));
+    if (e.panels?.length && !ask) who.append(panelsLine(e.panels, e.panelReads));
+    if (e.actions?.length && !ask) who.append(actionsLine(e.actions));
+    if ((mw || e.isGateway) && !e.off && !ask && editing?.pkg === pkg) who.append(optionsEditor(e));
+    // the plugin's own picture (package.json's magpie.icon) before its
+    // first provider's, which a plugin of several gives each its own (#1775)
+    r.append(logo(l?.icon || l?.npm?.icon || e.icon || subs[0]?.icon || ag?.icon, false, e.middlewareOnly ? "mw" : e.inMagpieOnly && e.isAgent && !e.isMiddleware ? "ag" : e.inMagpieOnly && (e.page || e.panels?.length) && !e.isAgent && !e.isMiddleware ? "pg" : toolsOnly && !e.page && !mw && !ag ? "tl" : ""), who);
     const val = el("div", "val");
     const b = busy.get(pkg) || busy.get(e.spec);
     // npm's newer version, or a git one's repository at a newer commit
@@ -954,15 +1229,14 @@
       // button names the one it signs in to and stays quiet
       const out = subs.find((x) => !x.signedIn), some = subs.some((x) => x.signedIn);
       const s = el("button", "text" + (here || some ? "" : " primary"), some ? t("Sign in to {name}", { name: out.name }) : t("Sign in"));
-      s.onclick = () => pluginSignIn(out.id);
+      s.onclick = (ev) => pluginSignIn(out.id, ev);
       val.append(s);
     }
-    const back = () => { if (moved.length) status(t("{names} is back on the built-in", { names }), "ok"); };
-    // switched on again: the built-ins that went back when it went off
-    // are offered its way again, in the row
+    // switched on again: a built-in it can carry is offered its way, in
+    // the row
     const again = () => { if (movableOf(pkg).length) { asking = { pkg, op: "move" }; draw(); } };
-    const off = () => act(pkg, "off", { spec: e.spec, off: !e.off }, e.off ? again : back);
-    const remove = () => act(pkg, "remove", { spec: e.spec }, () => { status(t("{name} removed", { name: l?.name || pkg }), "ok"); back(); });
+    const off = () => act(pkg, "off", { spec: e.spec, off: !e.off }, e.off ? again : null);
+    const remove = () => act(pkg, "remove", { spec: e.spec }, () => status(t("{name} removed", { name: l?.name || pkg }), "ok"));
     if (ask) {
       // asked in the row, not a dialog: the user sees which go back
       const yes = el("button", "text primary", t(ask === "move" ? "Move" : ask === "remove" ? "Remove" : "Switch off"));
@@ -973,7 +1247,7 @@
       r.append(val);
       return r;
     }
-    if (mw && !e.off && !mw.error && editing?.pkg !== pkg) {
+    if ((e.isGateway || (mw && !mw.error)) && !e.off && editing?.pkg !== pkg) {
       const o = el("button", "text", t("Options"));
       o.title = e.options ? t("The options it runs with") : t("It runs with no options; its package suggests some");
       o.disabled = !!b;
@@ -985,11 +1259,11 @@
       };
       val.append(o);
     }
-    const onoff = el("button", "text", b === "off" && !e.off && moved.length ? t("Moving back…") : t(e.off ? "Switch on" : "Switch off"));
+    const onoff = el("button", "text", t(e.off ? "Switch on" : "Switch off"));
     onoff.disabled = !!b;
     onoff.onclick = () => { if (!e.off && moved.length) { asking = { pkg, op: "off" }; draw(); } else off(); };
-    const rm = el("button", "text quiet", b === "remove" ? t(moved.length ? "Moving back…" : "Removing…") : t("Remove"));
-    rm.title = moved.length ? t("{names} goes back to the built-in first, then the plugin is removed", { names }) : t("Removes the plugin and what it installed; its sign-ins are kept until you sign out");
+    const rm = el("button", "text quiet", b === "remove" ? t("Removing…") : t("Remove"));
+    rm.title = moved.length ? t("{names} runs on this plugin: removed, it stops working until the plugin is installed again", { names }) : t("Removes the plugin and what it installed; its sign-ins are kept until you sign out");
     rm.disabled = busy.size > 0;
     rm.onclick = async () => {
       if (moved.length) {
@@ -1001,7 +1275,7 @@
     };
     val.append(onoff, rm);
     r.append(val);
-    r.onclick = (ev) => { if (!ev.target.closest("button, .pm-opts")) detail(l || (isGit(e.spec) ? { package: e.spec, name: e.package || e.spec, npm: { version: e.version, repository: gitWeb(e.spec) } } : { package: pkg, name: label(e.spec), npm: { version: e.latest } })); };
+    r.onclick = (ev) => { if (!ev.target.closest("button, .pm-opts")) detail(l || (isGit(e.spec) ? { package: e.spec, name: e.package || e.spec, icon: e.icon, npm: { version: e.version, repository: gitWeb(e.spec) } } : { package: pkg, name: label(e.spec), icon: e.icon, npm: { version: e.latest } })); };
     return r;
   }
 
@@ -1086,6 +1360,59 @@
     return d;
   }
 
+  // toolsLine is the tools a plugin gives, which magpie's plugin tools MCP
+  // server offers every agent: each by the name an agent sees, its
+  // description on hover, and the server's address to copy into an agent
+  function toolsLine(tools) {
+    const d = el("div", "sub pm-mw pm-tools");
+    d.append(el("span", "", t("Tools for every agent: {names}", { names: tools.map((x) => x.mcp || x.name).join(t(", ")) })));
+    d.title = tools.map((x) => (x.mcp || x.name) + (x.description ? " — " + x.description : "")).join("\n");
+    const url = mcpAddress(state.settings || {}, "/mcp/magpie/tools");
+    const b = copyBtn(url, t("MCP server address"));
+    b.title = t("Copy the MCP server's address ({url}): add it to an agent as an MCP server (Streamable HTTP)", { url });
+    d.append(b);
+    return d;
+  }
+
+  // what a plugin's page may read of magpie's: what its package.json's
+  // magpie.permissions declares, each a read with no secret in it
+  const READS = { "usage:summary": "your usage totals, by model", "providers:list": "your providers' names" };
+  const PAGES = { sessions: "Sessions", library: "Library", routing: "Routing", usage: "Usage" };
+  function pageLine(p) {
+    const d = el("div", "sub pm-mw pm-page");
+    const reads = (p.reads || []).map((r) => t(READS[r] || r));
+    const page = p.replaces && t(PAGES[p.replaces] || p.replaces);
+    d.textContent = d.title = page
+      ? reads.length
+        ? t("Takes the place of the {page} page, and can read {reads}", { page, reads: reads.join(t(", ")) })
+        : t("Takes the place of the {page} page, and reads nothing of magpie's", { page })
+      : reads.length
+        ? t("Adds a page to the sidebar, which can read {reads}", { reads: reads.join(t(", ")) })
+        : t("Adds a page to the sidebar, which reads nothing of magpie's");
+    return d;
+  }
+
+  // where a plugin's panels go in magpie's own pages (magpie.panels), and
+  // the row menus its page adds items to (magpie.actions), titled with
+  // their titles; picking an item tells the page the row's name only
+  const SLOTS = { agents: "the Agents page", usage: "the Usage page", settings: "Settings", provider: "each provider's editor" };
+  const MENUS = { provider: "providers' menus", agent: "agents' menus" };
+  function whereLine(xs, key, names, text) {
+    const d = el("div", "sub pm-mw pm-page");
+    d.textContent = text([...new Set(xs.map((x) => x[key]))].map((s) => t(names[s] || s)).join(t(", ")));
+    d.title = xs.map((x) => x.title).filter(Boolean).join("\n") || d.textContent;
+    return d;
+  }
+  function panelsLine(panels, panelReads) {
+    const reads = (panelReads || []).map((r) => t(READS[r] || r)).join(t(", "));
+    return whereLine(panels, "slot", SLOTS, (where) => reads
+      ? t("Adds panels to {where}, which can read {reads}", { where, reads })
+      : t("Adds panels to {where}, which read nothing of magpie's", { where }));
+  }
+  function actionsLine(actions) {
+    return whereLine(actions, "menu", MENUS, (where) => t("Adds items to {where}, which open its page", { where }));
+  }
+
   function mwLine(m) {
     const d = el("div", "sub pm-mw");
     if (m.error) {
@@ -1094,16 +1421,46 @@
       d.title = m.error;
       return d;
     }
-    const lang = document.documentElement.lang || undefined;
-    let s = t("Gateway middleware: {hooks}", { hooks: m.hooks.join(t(", ")) });
-    if (m.calls) s += " · " + t("{n} calls, {us} µs each", { n: m.calls.toLocaleString(lang), us: m.avgMicros < 10 ? m.avgMicros.toFixed(1) : Math.round(m.avgMicros).toLocaleString(lang) });
-    d.append(el("span", "", s));
+    const lang = intlLang();
+    // a gateway module's hooks, the routings it serves (strategies) and
+    // its usage observer (onUsage), each said when it has it
+    const parts = [];
+    if (m.hooks.length) {
+      let s = t("Gateway middleware: {hooks}", { hooks: m.hooks.join(t(", ")) });
+      if (m.calls) s += " · " + t("{n} calls, {us} µs each", { n: m.calls.toLocaleString(lang), us: m.avgMicros < 10 ? m.avgMicros.toFixed(1) : Math.round(m.avgMicros).toLocaleString(lang) });
+      parts.push(s);
+    }
+    if (m.strategies?.length) parts.push(t("Routings: {routings}", { routings: m.strategies.join(t(", ")) }) + (m.orders ? " · " + t("asked {n} times", { n: m.orders.toLocaleString(lang) }) : ""));
+    if (m.usage) parts.push(t("Usage observer: {n} rows", { n: (m.rows || 0).toLocaleString(lang) }));
+    d.append(el("span", "", parts.join(" · ")));
     if (m.events?.length) d.title = t("onEvent sees only {events} events", { events: m.events.join(t(", ")) });
     if (m.failures) {
       const f = el("span", "pm-mw-fail", t("{n} failed", { n: m.failures.toLocaleString(lang) }));
       f.title = t("A failed call leaves the request or reply as it was") + (m.lastError ? "\n" + t("Last: {error}", { error: m.lastError }) : "");
       d.append(el("span", "sep", " · "), f);
     }
+    if (m.dropped) {
+      const f = el("span", "pm-mw-fail", t("{n} rows dropped", { n: m.dropped.toLocaleString(lang) }));
+      f.title = t("Rows that came while onUsage was still busy are dropped: a request never waits for it");
+      d.append(el("span", "sep", " · "), f);
+    }
+    return d;
+  }
+
+  function gatewayLine(g) {
+    const d = el("div", "sub pm-mw pm-gateway");
+    const labels = {
+      idle: "Waiting for a request", ready: "Context injected", empty: "No matching context",
+      unbound: "Scope not bound", unauthorized: "Authorization failed",
+      unavailable: "Context service unavailable", invalid: "Invalid context response",
+      skipped: "Request skipped", cancelled: "Request cancelled", timeout: "Recall timed out", error: "Request hook failed",
+    };
+    let text = t("Gateway request hook") + ": " + t(labels[g.lastOutcome] || labels.idle);
+    if (g.calls) text += " · " + t("{n} calls, {ms} ms each", { n: g.calls.toLocaleString(intlLang()), ms: g.avgMillis.toFixed(1) });
+    if (g.lastBytes) text += " · " + t("{n} bytes injected", { n: g.lastBytes.toLocaleString(intlLang()) });
+    d.append(el("span", "", text));
+    if (g.failures) d.append(el("span", "sep", " · "), el("span", "pm-mw-fail", t("{n} failed", { n: g.failures.toLocaleString(intlLang()) })));
+    d.title = t("Diagnostics reset when the plugin host restarts; prompts and recalled text are not stored");
     return d;
   }
 
@@ -1169,7 +1526,7 @@
       w.append(glyph(SHIELD, 12, 1.5), el("span", "", t(from, { owner: l.github.owner, topic })));
       main.append(w);
     }
-    if (l.replaces) main.append(el("p", "pm-note", t("magpie also signs in to this itself, for now; the plugin keeps it working if the built-in one is retired.")));
+    if (l.replaces) main.append(el("p", "pm-note", t("magpie's own sign-in to this subscription is deprecated: this plugin takes its place, and accounts signed in there move to it.")));
     const readme = el("div", "pm-readme");
     readme.append(el("div", "pm-rskel"), el("div", "pm-rskel short"), el("div", "pm-rskel"));
     main.append(readme);
@@ -1187,7 +1544,7 @@
     try {
       const p = await api("plugins/page?name=" + encodeURIComponent(l.package));
       const at = l.github && !entryOf(l.package) ? l.github.pushed : p.updated;
-      upd.textContent = at && !at.startsWith("0001") ? new Date(at).toLocaleDateString(document.documentElement.lang || undefined, { year: "numeric", month: "short", day: "numeric" }) : "—";
+      upd.textContent = at && !at.startsWith("0001") ? new Date(at).toLocaleDateString(intlLang(), { year: "numeric", month: "short", day: "numeric" }) : "—";
       readme.replaceChildren(markdown(p.readme || t("No README")));
     } catch (e) {
       upd.textContent = "—";

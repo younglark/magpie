@@ -20,6 +20,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/dirent"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
@@ -163,7 +164,7 @@ func ompProfiles(home string) []*Agent {
 	var names []string
 	for _, e := range entries {
 		name := e.Name()
-		if !e.IsDir() || !ompProfileOK(name) {
+		if !dirent.IsFolder(filepath.Join(root, "profiles"), e) || !ompProfileOK(name) {
 			continue
 		}
 		if filepath.Join(root, "profiles", name, "agent") == cur {
@@ -198,7 +199,8 @@ func ompIn(at place) *Agent {
 // ompAt is omp with its agent folder at dir, magpie's entry in its
 // models.yml being entry's.
 func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
-	ompProvider := entry
+	// magpie's entry laid over the one in the models file at path (ompKept)
+	ompProvider := func(path string) any { return ompKept(path, entry()) }
 	// omp reads the .yml and falls back to the .yaml
 	pick := func(name string) string {
 		yml := filepath.Join(dir, name+".yml")
@@ -208,6 +210,8 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 		return yml
 	}
 	path := pick("config")
+	// the entries of enabledModels a sync took out (scope_gone.go)
+	gone := at.key("omp.scope.gone")
 	roleGet := func(name string) func() string {
 		return func() string {
 			k := "modelRoles." + name
@@ -238,20 +242,35 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 				return err
 			}
 		}
-		return edit.SetYAML(models, edit.KV{Path: "providers." + magpieID, Value: ompProvider()})
+		return edit.SetYAML(models, edit.KV{Path: "providers." + magpieID, Value: ompProvider(models)})
 	}
 	// dropMagpie takes magpie's provider out of models.yml once nothing in
 	// the config is on magpie; while something is (a fallback chain, another
 	// role), it writes it afresh instead, so a role set off magpie — applying
 	// again what Check found — mends the wiring that is left.
+	// The plain entries of enabledModels on magpie, which magpie adds there
+	// (omp_scope.go), don't count: once nothing else is on magpie they go
+	// with its provider (#1769). Those scoped to folders are the user's, and
+	// count.
 	dropMagpie := func() error {
-		used, err := onMagpie()
+		used := false
+		err := edit.EditYAMLStrings(path, slices.DeleteFunc(slices.Clone(ompRefKeys), func(k string) bool { return k == "enabledModels" }), func(v string) string {
+			ompRefs(v, func(m string) string { used = used || usesMagpie(m); return m })
+			return v
+		})
+		if err == nil && !used {
+			used, err = ompScopeFoldersOnMagpie(path)
+		}
 		switch {
 		case err != nil:
 			return err
 		case used:
 			return writeMagpie()
 		}
+		if err := ompScopeWithout(path); err != nil {
+			return err
+		}
+		forget(gone)
 		return edit.DelYAML(pick("models"), "providers."+magpieID)
 	}
 	// was are the stash's keys for the roles, one each
@@ -372,6 +391,20 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 		role("tiny", "tiny", "tiny", true),
 		role("memory", "memory", "memory", true),
 	}
+	// the default role's model is what a new session starts on only while
+	// enabledModels takes it in, so a model picked for it joins the list
+	// there is (omp_scope.go, #1769); a reset puts back what the user had,
+	// which is theirs to have scoped or not
+	setDefault := roles[0].Set
+	roles[0].Set = func(v string) error {
+		if err := setDefault(v); err != nil || v == "" {
+			return err
+		}
+		if model, _, one := ompSplit(roleGet("default")()); one && model != "" {
+			return ompScopeWith(path, model)
+		}
+		return nil
+	}
 	// each role but the default one has a thinking level of its own, the
 	// ":level" omp reads off the end of the role's model
 	// (splitThinkingSuffix, resolveModelRoleValue): #1397, the slow role at
@@ -423,7 +456,13 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 		// a list of models is the user's own
 		SplitSuffix: ompSplit,
 		Sync: func() error {
-			return syncYAML(pick("models"), "providers."+magpieID, func() any { return ompProvider() })
+			models := pick("models")
+			if err := syncYAML(models, "providers."+magpieID, func() any { return ompProvider(models) }); err != nil {
+				return err
+			}
+			// an entry on a model magpie no longer gives omp names nothing
+			// (#2055, scope_gone.go)
+			return ompScopeSynced(path, models, gone)
 		},
 		// a provider renamed takes its models' ids in models.yml with it; a
 		// name left on the old one omp would pass over, with a warning. So
@@ -447,6 +486,10 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 			}); err != nil {
 				return moved, err
 			}
+			if err := ompScopeOnce(path); err != nil {
+				return moved, err
+			}
+			scopeGoneRename(gone, from, to)
 			for _, w := range was {
 				s := stashLoad()[w]
 				ns := move(s)
@@ -476,8 +519,18 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 				return ""
 			}
 			models := pick("models")
-			return wiringOff("omp", models, func(k string) (string, bool) { return edit.GetYAML(models, "providers."+magpieID+"."+k) },
-				"baseUrl", at.v1())
+			if d := wiringOff("omp", models, func(k string) (string, bool) { return edit.GetYAML(models, "providers."+magpieID+"."+k) },
+				"baseUrl", at.v1()); d != "" {
+				return d
+			}
+			// a default role on magpie that enabledModels leaves out never
+			// starts; setting it again adds it there (#1769)
+			if def := roleGet("default")(); ompOnMagpie(def) {
+				if m := ompScopeLeavesOut(path, def); m != "" {
+					return "omp's enabledModels (" + filepath.Base(path) + ") leaves out " + m + ", so new sessions start on another of its models"
+				}
+			}
+			return ""
 		},
 		Fields: append(fields, Field{
 			// the thinking level sessions start with, as omp's settings save
@@ -629,6 +682,18 @@ func ompProviderAt(gw, version string) ompProviderEntry {
 		e.Auth, e.APIKey = "", key
 	}
 	return e
+}
+
+// ompKept is magpie's entry e laid over the one in the models.yml at path.
+// omp keeps keys its schema doesn't name and never writes the file itself,
+// so what is there beside magpie's is the user's: modelOverrides (a model's
+// context or cost), discovery, disableStrictTools, remoteCompaction, a
+// header or compat flag of their own (models-config-schema-bundle.ts
+// ProviderConfigSchema). Each stays; the address, API, auth, key and model
+// list are magpie's, an auth or key it no longer writes gone with it, so a
+// loopback's auth: none never sits beside the key a WSL omp needs (#2030).
+func ompKept(path string, e ompProviderEntry) any {
+	return yamlKept(path, "providers."+magpieID, e, "baseUrl", "api", "auth", "apiKey", "models")
 }
 
 // ompOwnOptions lists the models of the providers the user added to omp's

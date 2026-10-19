@@ -6,7 +6,6 @@ import (
 	"debug/buildinfo"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -71,6 +70,11 @@ type Option struct {
 	// by its address (provider.OwnFast, #1615), asked for there as OpenAI's
 	// priority, which the provider may or may not serve
 	OwnFast bool `json:"ownFast,omitempty"`
+	// UltraOK: an account offers the model as Ultrafast (provider.CanUltra,
+	// #1954), so the fast switch has a third setting; Ultra is whether it
+	// is on (provider.IsUltraPick)
+	UltraOK bool `json:"ultraOk,omitempty"`
+	Ultra   bool `json:"ultra,omitempty"`
 
 	// own: served on the agent's own sign-in (viaMagpie), for Same
 	own bool
@@ -91,6 +95,11 @@ type Field struct {
 	// Quiet fields are left out of listings while empty: they follow
 	// another field until set (Claude Code's per-tier models).
 	Quiet bool
+	// Live fields are magpie's own settings, read by the gateway on each
+	// request (Claude Desktop's subagent model): a change to one needs no
+	// restart of the agent, so its Notice isn't shown after it, unless
+	// the pick connected the agent to magpie as well.
+	Live bool
 	// Follows is the key of the field a Quiet one takes after while empty
 	// ("model" for Claude Code's tiers and subagents): a profile's details
 	// say so, and Drift reads the field as on that one's model (#1050).
@@ -124,6 +133,14 @@ type Agent struct {
 	// list magpie writes into its files, magpieModels(id), where its only
 	// field puts magpie in its picker (ZCode, Pencil: #1508)
 	ListsModels bool
+	// NoNames: the agent's own list doesn't name magpie's models as
+	// Names in agents' lists says (provider.Labels): magpie hands it the
+	// models' ids alone, its format having no name for one (Goose, Hermes,
+	// jcode …), it lists no models of magpie's at all (Gemini CLI, Snow),
+	// or it reads the gateway's /v1/models itself, whose display_name is
+	// the name alone (Empryo, Cursor Private Inference). The setting says
+	// so for each one connected, rather than seeming to do nothing.
+	NoNames bool
 	// Sync, for an agent that reads magpie's models from a file of its own
 	// rather than asking the gateway, rewrites that list as the catalog is
 	// now — where magpie wrote one; nothing else changes (see SyncCatalog).
@@ -148,8 +165,8 @@ type Agent struct {
 	Joined func() bool
 	// Beside reports an agent set on one of magpie's models beside its own
 	// (Codex by the base URL beside its ChatGPT sign-in), now on one of its
-	// own written in by the agent: still connected, as joined, though the
-	// change is told as drift (#940).
+	// own written in by the agent: still connected, as joined (#940), and
+	// a pick in the agent rather than drift (#2424).
 	Beside func() bool
 	// OwnVia is the catalog id magpie serves one of the agent's own models
 	// by on a sign-in of the user's, which its model field lists as its
@@ -209,7 +226,8 @@ type Agent struct {
 	Gateway func() string
 	// Import, for an app that takes magpie only through an import link of
 	// its own, which the user confirms there (Cindy), is that link; the app
-	// has no fields magpie sets. Added says whether it has magpie already.
+	// has no fields magpie sets. Added says whether it has magpie already;
+	// nil means the app exposes no way to read that status.
 	Import func() string
 	Added  func() bool
 	// Launch, for an agent that takes the gateway only from its
@@ -235,6 +253,11 @@ type Agent struct {
 	// has a provider of the same name (OpenHanako's own
 	// deepseek/deepseek-v4-pro read as magpie's deepseek, #835).
 	Spelled func(v string) bool
+	// ModelAliases are the names the agent's model takes besides ids
+	// (Claude Code's opus, best, opusplan). One that names a field as well
+	// is the model's on the command line: magpie claude opus sets the
+	// model, where another field's name alone shows that field.
+	ModelAliases []string
 	// detect, when set, says whether the agent is here in place of looking
 	// for its files and binary: a distro's, probed once.
 	detect func() bool
@@ -254,6 +277,19 @@ type Agent struct {
 	// (omp's, when PI_CODING_AGENT_DIR points it at Pi's): that it is there
 	// says nothing of this agent.
 	dirShared bool
+	// shared, when set, is the name of what the agent keeps in a folder its
+	// vendor's other app reads and writes the same way: Cursor CLI's
+	// ~/.cursor (MCP servers, skills, hooks, chats) is the Cursor editor's
+	// too, so the Library and Sessions call it Cursor (SharedName).
+	shared string
+	// pathOwn, when set, says whether the file at Path is this agent's,
+	// not one another tool wrote there first: a JetBrains plugin's
+	// settings.json in Qoder CN's folder (#1495).
+	pathOwn func() bool
+	// sign, when set, is one more sign the agent is here, for a folder
+	// that is dirShared: a file only the agent (or its own app) writes
+	// there (the Qoder app's status file, #2138).
+	sign func() bool
 }
 
 // Running reports whether a process whose command line matches any pattern
@@ -263,8 +299,10 @@ type Agent struct {
 // "open a new dsh session"), and a Windows that answered no here dropped
 // that advice silently — a model picked in magpie looked like it had done
 // nothing at all. claudeRunning and Pencil's own check already say they
-// can't be told, and say yes for the same reason.
-func Running(patterns ...string) bool {
+// can't be told, and say yes for the same reason. A var so tests can say
+// what runs, as claudeRunning is: magpie's own CLI tests printed "restart
+// the Codex app" on a Mac with Codex open, and on every Windows.
+var Running = func(patterns ...string) bool {
 	if runtime.GOOS == "windows" {
 		return len(patterns) > 0
 	}
@@ -274,6 +312,26 @@ func Running(patterns ...string) bool {
 		}
 	}
 	return false
+}
+
+// SharedName is the agent's name over what it keeps where another app of
+// its vendor's reads it too (the Library's MCP servers and skills, the
+// chats Sessions lists): Cursor for Cursor CLI, whose ~/.cursor the Cursor
+// editor shares; Name for any other.
+func (a *Agent) SharedName() string {
+	if a.shared != "" {
+		return a.shared
+	}
+	return a.Name
+}
+
+// SharedHere reports whether the folder the agent shares with its vendor's
+// other app is here (Cursor CLI's ~/.cursor, made by the Cursor editor),
+// whether the agent is or not. The agent isn't Detected for it (dirShared),
+// but what the other app reads there too, the Library's MCP servers and
+// skills, is still given.
+func (a *Agent) SharedHere() bool {
+	return a.shared != "" && a.WSL == "" && a.Dir != "" && !Taken(a.Dir) && agentDir(a.Dir)
 }
 
 // Detected reports whether the agent seems to be installed or configured.
@@ -286,13 +344,21 @@ func (a *Agent) Detected() bool {
 	if a.Dir != "" && Taken(a.Dir) {
 		return false
 	}
-	if _, err := os.Stat(a.Path); err == nil {
+	if _, err := os.Stat(a.Path); err == nil && (a.pathOwn == nil || a.pathOwn()) {
 		return true
 	}
 	if a.Dir != "" && !a.dirShared && agentDir(a.Dir) {
 		return true
 	}
+	if a.sign != nil && a.sign() {
+		return true
+	}
 	if a.Bin != "" && binAt(a.Bin) != "" {
+		return true
+	}
+	// one with no Bin, as its command's name is other tools' too, that
+	// Homebrew installed (Grok Build's grok-build cask) and hasn't run yet
+	if a.Bin == "" && a.WSL == "" && brewBin(cliSpecs[a.ID]) != "" {
 		return true
 	}
 	return false
@@ -306,9 +372,10 @@ func (a *Agent) Detected() bool {
 // started before Claude Code's installer put claude.exe in ~/.local/bin
 // and added that to the user's PATH, or a self-update restarting with the
 // PATH it had then, never listed it, while the sign-in, which asked
-// FindTool, found it (#839, #1482). "" when it is in none.
+// FindTool, found it (#839, #1482). A mise wrapper script found there is
+// given as the program it runs (proc.LookPath). "" when it is in none.
 func binAt(name string) string {
-	if p, err := exec.LookPath(name); err == nil {
+	if p, err := proc.LookPath(name); err == nil {
 		return p
 	}
 	if runtime.GOOS == "windows" {
@@ -393,15 +460,16 @@ var goPrograms struct {
 	m map[goProgramKey]bool
 }
 
-// Field looks a field up by key.
+// Field looks a field up by key, in any case, as Find looks an agent up
+// (magpie codex Model was written as the model).
 func (a *Agent) Field(key string) *Field {
 	for i := range a.Fields {
-		if a.Fields[i].Key == key {
+		if strings.EqualFold(a.Fields[i].Key, key) {
 			return &a.Fields[i]
 		}
 	}
 	for i := range a.Fields {
-		if a.Fields[i].Label == key { // `magpie gemini auth …`: the label as shown
+		if strings.EqualFold(a.Fields[i].Label, key) { // `magpie gemini auth …`: the label as shown
 			return &a.Fields[i]
 		}
 	}
@@ -498,7 +566,8 @@ func ids(as []*Agent) []string {
 // in others, and either is taken in both. A value the picker offers as is
 // stays, and so does one it doesn't know (a model the agent reaches on its
 // own that isn't listed); a "magpie/…" value the catalog doesn't have is an
-// error rather than a model the agent would ask its own vendor for. The
+// error rather than a model the agent would ask its own vendor for, and so
+// is one of magpie's the agent isn't shown (notOffered). The
 // agent's suffix after the model (SplitSuffix) stays as typed, and so does
 // a list of models, the user's own.
 func (a *Agent) Spell(key, v string) (string, error) {
@@ -532,7 +601,45 @@ func (a *Agent) Spell(key, v string) (string, error) {
 	if prefixed {
 		return "", fmt.Errorf("%s isn't a model in magpie's catalog (magpie models lists them)", ref)
 	}
+	if err := a.notOffered(ref, opts); err != nil {
+		return "", err
+	}
 	return v, nil
+}
+
+// notOffered refuses a value that names one of magpie's models, or one of
+// its providers or routing groups, that the agent isn't shown: kept from
+// the agent (magpie visible, a model not ticked for it) or not on its
+// provider's list yet (a remote magpie's group added there since the list
+// was fetched). Taken as the agent's own, Pi read remote/group/smart as
+// its own provider "remote" and model "group/smart", and was taken out of
+// magpie for a provider it doesn't have (#2376). A provider id the agent's
+// own models go by too (openai/… in Pi) stays the agent's.
+func (a *Agent) notOffered(ref string, opts []Option) error {
+	pid, model, ok := strings.Cut(ref, "/")
+	if !ok || pid == "" || model == "" {
+		return nil
+	}
+	if slices.ContainsFunc(opts, func(o Option) bool { return Own(o) && strings.HasPrefix(o.Value, pid+"/") }) {
+		return nil
+	}
+	ids := []string{ref, provider.RenamedRef(ref)}
+	shown, _ := provider.CatalogFor(a.ListsFor())
+	if slices.ContainsFunc(shown, func(e provider.Entry) bool { return slices.Contains(ids, e.ID) }) {
+		return nil // shown the agent: a field may offer fewer (Claude Desktop's tiers)
+	}
+	for _, e := range provider.Catalog() {
+		if slices.Contains(ids, e.ID) {
+			return fmt.Errorf("%s is one of magpie's models, but %s isn't shown it: magpie models %s says why, and magpie visible %s all shows it every model", ref, a.Name, a.ID, a.ID)
+		}
+	}
+	if pid+"/" == provider.GroupPrefix {
+		return fmt.Errorf("magpie has no routing group %s (magpie models lists them)", ref)
+	}
+	if p, err := provider.Find(pid); err == nil && (p.ID == pid || slices.Contains(p.Was, pid)) {
+		return fmt.Errorf("%s's model list has no %s: magpie provider refresh %s fetches the list again (or add the model to it in its editor), and magpie models %s lists what %s is shown", p.ID, model, p.ID, a.ID, a.Name)
+	}
+	return nil
 }
 
 // split is v as the model the picker offers and the agent's suffix after

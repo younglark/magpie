@@ -3,7 +3,7 @@
 // runs on the conversation's model, with no way to pick a cheaper one): by
 // default Codex's own pick; the app's menu (no native select) offers
 // magpie's models and groups; a pick posts settings/codex-auto-review on its
-// own, the row says what now happens, a refusal is said and the row keeps
+// own, its button shows the choice under a name alone (1ooogle on X), a refusal is said and the row keeps
 // what it had, and no click scrolls the Settings page.
 // English and Chinese, Chromium and WebKit; no backend, the API is faked here.
 const assert = require("node:assert/strict");
@@ -11,7 +11,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
-const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
+const { watchSettingsReads, settingsDrawn, wheelTo } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -68,8 +68,8 @@ function server(lang, posted) {
 }
 
 const want = {
-  en: { name: "Codex auto-review model", own: "Codex’s own pick", subOwn: /codex-auto-review/, subModel: /on this model/ },
-  zh: { name: "Codex 自动审批模型", own: "由 Codex 决定", subOwn: /codex-auto-review/, subModel: /用这个模型/ },
+  en: { name: "Codex auto-review model", own: "Codex’s own pick" },
+  zh: { name: "Codex 自动审批模型", own: "由 Codex 决定" },
 };
 const view = (page) => page.locator("#view-settings").evaluate((v) => v.scrollTop);
 
@@ -99,14 +99,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await row.locator("select").count(), 0, "no native select");
       assert.equal((await row.locator(".name").textContent()).trim(), want[lang].name);
       assert.equal((await pick.textContent()).trim(), want[lang].own, "Codex's own pick by default");
-      assert.match(await row.locator(".sub").textContent(), want[lang].subOwn);
+      assert.equal(await row.locator(".sub").count(), 0, "the row says its name alone, its button the choice (1ooogle on X)");
 
       // scrolled by a wheel till the row is mid-view, so a click that
       // moved the page would show
-      const box = await page.locator("#view-settings").boundingBox();
-      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-      const top = () => pick.evaluate((e) => e.getBoundingClientRect().top);
-      for (let i = 0; i < 40 && (await top()) > 200; i++) { await page.mouse.wheel(0, 100); await page.waitForTimeout(30); }
+      await wheelTo(page, pick, 200); // each wheel landed before the next (#2370)
       const before = await view(page);
       assert(before > 0, "the settings list must scroll to the row");
 
@@ -123,7 +120,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator("#list li:not(.group)").filter({ hasText: "DeepSeek V4 Flash" }).first().click();
       await page.locator("#codexAutoReviewPick button", { hasText: "DeepSeek V4 Flash" }).waitFor();
       assert.deepEqual(posted, [["codex-auto-review", { model: "deepseek/deepseek-v4-flash" }]]);
-      assert.match(await row.locator(".sub").textContent(), want[lang].subModel);
+      assert.equal(await row.locator(".sub").count(), 0);
       await page.waitForTimeout(300);
       assert.equal(await view(page), before, "picking a model scrolled the page");
 
@@ -137,7 +134,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await choose(want[lang].own);
       await page.locator("#codexAutoReviewPick button", { hasText: want[lang].own }).waitFor();
       assert.deepEqual(posted.at(-1), ["codex-auto-review", { model: "" }]);
-      assert.match(await row.locator(".sub").textContent(), want[lang].subOwn);
+      assert.equal(await row.locator(".sub").count(), 0);
       await page.waitForTimeout(300);
       assert.equal(await view(page), before, "the picks scrolled the page");
       assert(!posted.some(([k]) => k === "settings"), "set on its own, not with the other preferences");

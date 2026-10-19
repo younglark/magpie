@@ -2,10 +2,13 @@ package gateway
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -70,17 +73,19 @@ func (b aBlock) MarshalJSON() ([]byte, error) {
 var ephemeral = map[string]string{"type": "ephemeral"}
 
 type aRequest struct {
-	Model    string          `json:"model"`
-	System   json.RawMessage `json:"system,omitempty"`
-	Messages []struct {
+	Model        string          `json:"model"`
+	System       json.RawMessage `json:"system,omitempty"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
+	Messages     []struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	} `json:"messages"`
 	Tools []struct {
-		Type        string          `json:"type,omitempty"`
-		Name        string          `json:"name"`
-		Description string          `json:"description,omitempty"`
-		InputSchema json.RawMessage `json:"input_schema,omitempty"`
+		Type         string          `json:"type,omitempty"`
+		Name         string          `json:"name"`
+		Description  string          `json:"description,omitempty"`
+		InputSchema  json.RawMessage `json:"input_schema,omitempty"`
+		CacheControl json.RawMessage `json:"cache_control,omitempty"`
 	} `json:"tools,omitempty"`
 	ToolChoice *struct {
 		Type                   string `json:"type"`
@@ -109,12 +114,23 @@ type aRequest struct {
 }
 
 func parseAnthropic(body []byte) (*Request, error) {
+	return parseAnthropicRequest(body, false)
+}
+
+func parseAnthropicRequest(body []byte, clientMarks bool) (*Request, error) {
 	var a aRequest
 	if err := decodeJSON(body, &a); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: a.Model, System: stringOrText(a.System), MaxTokens: a.MaxTokens,
 		Temp: a.Temperature, TopP: a.TopP, Stop: a.StopSequences, Stream: a.Stream, Fast: a.Speed == "fast"}
+	if clientMarks {
+		var err error
+		r.clientCache, err = readClientCache(a)
+		if err != nil {
+			return nil, err
+		}
+	}
 	r.Safeguards = a.Safeguards
 	if string(r.Safeguards) == "null" {
 		r.Safeguards = nil
@@ -125,7 +141,7 @@ func parseAnthropic(body []byte) (*Request, error) {
 	if oc := a.OutputConfig; oc != nil && oc.Format != nil && oc.Format.Type == "json_schema" && len(oc.Format.Schema) > 0 {
 		r.Format = &Format{Type: "json_schema", Name: formatName, Schema: oc.Format.Schema}
 	}
-	for _, m := range a.Messages {
+	for mi, m := range a.Messages {
 		msg := Message{Role: m.Role}
 		var s string
 		if decodeJSON(m.Content, &s) == nil {
@@ -139,6 +155,7 @@ func parseAnthropic(body []byte) (*Request, error) {
 			}
 			var raws []json.RawMessage // each block as the client sent it
 			for i, b := range blocks {
+				before := len(msg.Parts)
 				switch b.Type {
 				case "text":
 					msg.Parts = append(msg.Parts, Part{Kind: Text, Text: b.Text})
@@ -164,6 +181,15 @@ func parseAnthropic(body []byte) (*Request, error) {
 						msg.Parts = append(msg.Parts, Part{Kind: Thinking, Sealed: raws[i], SealedBy: sealAnthropic})
 					}
 				}
+				if clientMarks && !(mi == len(a.Messages)-1 && i == len(blocks)-1) {
+					if ttl := cacheTTL(b.CacheControl); ttl != "" {
+						if len(msg.Parts) > before && renderedCacheBlock(b) {
+							msg.Parts[len(msg.Parts)-1].cache = ttl
+						} else {
+							r.clientCache.droppedMessages++
+						}
+					}
+				}
 			}
 		}
 		r.Messages = append(r.Messages, msg)
@@ -174,6 +200,17 @@ func parseAnthropic(body []byte) (*Request, error) {
 			// noted for those that can search by themselves
 			if strings.HasPrefix(t.Type, "web_search") {
 				r.WebSearch = true
+			}
+			if strings.HasPrefix(t.Type, "advisor_") {
+				// Claude Code's advisor: its instructions, which would
+				// have the model call a tool it hasn't got (advisor.go)
+				for i := range r.Messages {
+					for j, pt := range r.Messages[i].Parts {
+						if pt.Kind == Text {
+							r.Messages[i].Parts[j].Text, _ = advisorGoneIn(pt.Text)
+						}
+					}
+				}
 			}
 			continue
 		}
@@ -254,8 +291,9 @@ func anthropicReplaysThinking(host, model string) bool {
 }
 
 // withThinkingOnToolTurns gives each assistant message of a Messages
-// request that has a tool_use and no thinking block one holding
-// noReasoning, and turns a redacted_thinking block (Claude's, sealed, which
+// request that has a tool_use, or that answers tool results alone (DeepSeek
+// refuses that one too, checked 2026-10-12, #1822), and no thinking block
+// one holding noReasoning, and turns a redacted_thinking block (Claude's, sealed, which
 // DeepSeek can't read) into that too, or leaves it out when the message
 // has thinking already, for anthropicReplaysThinking. A Claude Code routing
 // group that falls from Claude to DeepSeek sends both (#1611). Every other
@@ -271,12 +309,29 @@ func withThinkingOnToolTurns(body []byte) []byte {
 	}
 	space, _ := json.Marshal(aBlock{Type: "thinking", Thinking: noReasoning})
 	changed := false
+	// afterTool: the message before is the user's tool results alone
+	afterTool := false
 	for i, raw := range msgs {
 		var m map[string]json.RawMessage
 		var role string
 		var blocks []json.RawMessage
-		if decodeJSON(raw, &m) != nil || decodeJSON(m["role"], &role) != nil || role != "assistant" ||
-			decodeJSON(m["content"], &blocks) != nil {
+		if decodeJSON(raw, &m) != nil || decodeJSON(m["role"], &role) != nil {
+			afterTool = false
+			continue
+		}
+		if role != "assistant" {
+			afterTool = decodeJSON(m["content"], &blocks) == nil && len(blocks) > 0 &&
+				!slices.ContainsFunc(blocks, func(b json.RawMessage) bool {
+					var t struct {
+						Type string `json:"type"`
+					}
+					return decodeJSON(b, &t) != nil || t.Type != "tool_result"
+				})
+			continue
+		}
+		after := afterTool
+		afterTool = false
+		if decodeJSON(m["content"], &blocks) != nil {
 			continue
 		}
 		var out []json.RawMessage
@@ -300,7 +355,7 @@ func withThinkingOnToolTurns(body []byte) []byte {
 			}
 			out = append(out, b)
 		}
-		if called && !thought {
+		if (called || after) && !thought {
 			out = append([]json.RawMessage{space}, out...)
 			edited = true
 		}
@@ -331,8 +386,25 @@ var anthropicModel = regexp.MustCompile(`(?i)(?:^|[/.:-])claude-`)
 // GLM-5.3 answers 1210, "…always engages in thinking…", or, in Chinese
 // (ZCode's GLM-5.3-Flash), "该模型始终支持思考，不可关闭" (#699); DashScope's
 // own glm-5.3 answers "The value of the enable_thinking parameter is
-// restricted to True."
-var alwaysThinks = regexp.MustCompile(`(?i)always engages in thinking|thinking (?:can ?not|can't) be (?:disabled|turned off)|enable_thinking[^"]{0,60}restricted to true|始终(?:支持|开启|启用)?思考|思考[^"]{0,20}(?:不可|无法|不能)关闭`)
+// restricted to True." MiniMax's MiniMax-M3.1-Flash-Preview answers
+// "…requires adaptive thinking; thinking.type="disabled" (including
+// reasoning.effort=none) is not allowed (2013)", and Volcengine Ark's
+// glm-5.3 "thinking.type `disabled` is not supported by this model"
+// (#1141).
+var alwaysThinks = regexp.MustCompile(`(?i)always engages in thinking|thinking (?:can ?not|can't) be (?:disabled|turned off)|enable_thinking[^"]{0,60}restricted to true|始终(?:支持|开启|启用)?思考|思考[^"]{0,20}(?:不可|无法|不能)关闭|requires adaptive thinking\W+thinking\.type\W+disabled\W+\(including reasoning\.effort=none\) is not allowed|thinking\.type \x60disabled\x60 is not supported by this model`)
+
+// refusesThinkingOff is an Anthropic endpoint turning away a request
+// with thinking turned off (thinking.type disabled): a model that always
+// thinks (alwaysThinks), OpenRouter's mandatory reasoning, a Claude that
+// takes no disabled (thinkingOffRefused), or a relay reading disabled as
+// reasoning effort none and turning that level away by naming the ones
+// it takes: Sub2API's gpt-6.1-sol, "gpt-6.1-sol does not support reasoning
+// effort \"none\"; use low, medium, high, xhigh or max" (#1465).
+func refusesThinkingOff(b []byte) bool {
+	// alwaysThinks' words are matched decoded, too (#1678): 思考 escaped as \uXXXX
+	return alwaysThinks.Match(wordsOf(b)) || mandatoryReasoning.Match(b) || thinkingOffRefused.Match(b) ||
+		effortLevelsNamed.Match(b) && noneQuoted.Match(b)
+}
 
 // ThinksOnlyWhenAsked is a model that takes thinking turned off on the
 // Messages API whatever its levels: one of Anthropic's own (anthropicModel,
@@ -724,6 +796,16 @@ func imageBlock(p Part) aBlock {
 	return b
 }
 
+// aMessage is one message of a request built for a Messages upstream.
+type aMessage struct {
+	Role    string   `json:"role"`
+	Content []aBlock `json:"content"`
+}
+
+// interruptedTool is what an unanswered call gets, as pairToolMessages and
+// pairToolItems make for the Chat and Responses paths.
+const interruptedTool = "[The result of this tool call is unavailable: the turn was interrupted.]"
+
 // buildAnthropic renders a request for an Anthropic-style upstream.
 func buildAnthropic(r *Request, model string) []byte {
 	return anthropicBody(r, model, false)
@@ -738,11 +820,7 @@ func anthropicBody(r *Request, model string, replay bool) []byte {
 		// asked for in words
 		r = r.inSystem()
 	}
-	type msg struct {
-		Role    string   `json:"role"`
-		Content []aBlock `json:"content"`
-	}
-	var msgs []msg
+	var msgs []aMessage
 	push := func(role string, blocks []aBlock) {
 		if len(blocks) == 0 {
 			return
@@ -751,7 +829,7 @@ func anthropicBody(r *Request, model string, replay bool) []byte {
 			msgs[n-1].Content = append(msgs[n-1].Content, blocks...)
 			return
 		}
-		msgs = append(msgs, msg{Role: role, Content: blocks})
+		msgs = append(msgs, aMessage{Role: role, Content: blocks})
 	}
 	for _, m := range r.Messages {
 		var results, rest []aBlock
@@ -800,6 +878,10 @@ func anthropicBody(r *Request, model string, replay bool) []byte {
 		}
 		push(role, append(results, rest...))
 	}
+	// a conversation a client left with its exchange broken — a call whose
+	// turn was interrupted, a result whose call it dropped — is mended, as
+	// the Chat and Responses paths mend theirs, where Anthropic refuses it
+	msgs = pairToolBlocks(msgs)
 	// Anthropic caches a prompt only up to a block marked for it, which a
 	// request from another API (Codex's, a Chat client's) never has: the
 	// conversation so far is marked at its last block, so the next turn,
@@ -824,7 +906,7 @@ func anthropicBody(r *Request, model string, replay bool) []byte {
 	}
 	maxTokens := r.MaxTokens
 	if maxTokens <= 0 {
-		maxTokens = 16384
+		maxTokens = defaultMaxTokens // the model's own is filled in before (askedOutput)
 	}
 	// a client that turned reasoning off — Codex's or a Chat client's
 	// effort none, which Effort reads as low — is sent thinking off, not a
@@ -927,6 +1009,101 @@ func anthropicBody(r *Request, model string, replay bool) []byte {
 	return b
 }
 
+// pairToolBlocks mends the tool exchange of a request built for a Messages
+// upstream, as pairToolMessages does for a Chat one (#554) and
+// pairToolItems for a relayed Responses request (#1341): Anthropic refuses
+// a tool_use the next message's tool_results don't answer ("`tool_use` ids
+// were found without `tool_result` blocks immediately after") and a
+// tool_result naming a call it never saw ("unexpected `tool_use_id` found
+// in `tool_result` blocks") — an interrupted turn or a client that dropped
+// its calls leaves both behind, and a relay serving Claude over Messages
+// passes the refusal on. A call left unanswered gets a synthetic result in
+// the user message that follows, or one of its own where none does; an
+// answer to no call becomes a text block, keeping what it said. A
+// well-formed exchange is built exactly as it was.
+func pairToolBlocks(msgs []aMessage) []aMessage {
+	out := make([]aMessage, 0, len(msgs))
+	var pending []string          // the calls of the assistant message in hand
+	open := map[string]bool{}     // which of them stand
+	answered := map[string]bool{} // pending calls a result answered
+
+	// synthetic is a call's missing result
+	synthetic := func(id string) aBlock {
+		c, _ := json.Marshal(interruptedTool)
+		return aBlock{Type: "tool_result", ToolUseID: id, Content: c, IsError: true}
+	}
+	// closeExchange answers the calls still open and ends the exchange
+	closeExchange := func() {
+		var blocks []aBlock
+		for _, id := range pending {
+			if !answered[id] {
+				blocks = append(blocks, synthetic(id))
+			}
+		}
+		if len(blocks) > 0 {
+			out = append(out, aMessage{Role: "user", Content: blocks})
+		}
+		pending, open, answered = nil, map[string]bool{}, map[string]bool{}
+	}
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			closeExchange()
+			for _, b := range m.Content {
+				if b.Type == "tool_use" {
+					pending = append(pending, b.ID)
+					open[b.ID] = true
+				}
+			}
+			out = append(out, m)
+			continue
+		}
+		var kept, rest []aBlock
+		for _, b := range m.Content {
+			if b.Type != "tool_result" {
+				rest = append(rest, b)
+				continue
+			}
+			if !open[b.ToolUseID] {
+				// answers no call of the exchange in hand — one another
+				// request carried, that closed already, or never there
+				rest = append(rest, resultSaid(b)...)
+				continue
+			}
+			if answered[b.ToolUseID] {
+				continue // a second answer: the first stands
+			}
+			answered[b.ToolUseID] = true
+			kept = append(kept, b)
+		}
+		for _, id := range pending {
+			if !answered[id] {
+				kept = append(kept, synthetic(id))
+			}
+		}
+		out = append(out, aMessage{Role: "user", Content: append(kept, rest...)})
+		pending, open, answered = nil, map[string]bool{}, map[string]bool{}
+	}
+	closeExchange()
+	return out
+}
+
+// resultSaid is what a tool_result that answers no call keeps: its text as
+// a text block, its images beside it as they came.
+func resultSaid(b aBlock) []aBlock {
+	var s string
+	if len(b.Content) > 0 && json.Unmarshal(b.Content, &s) == nil {
+		if strings.TrimSpace(s) == "" {
+			s = "Tool result received."
+		}
+		return []aBlock{{Type: "text", Text: s}}
+	}
+	var blocks []aBlock
+	if len(b.Content) > 0 && json.Unmarshal(b.Content, &blocks) == nil && len(blocks) > 0 {
+		return blocks
+	}
+	return []aBlock{{Type: "text", Text: "Tool result received."}}
+}
+
 // anthropicDecoder leaves out the blocks of Anthropic's own server tools —
 // a web search it ran — whose input is no call of the client's. A
 // tool_use block whose start carries its whole input, as a relay in front
@@ -1010,6 +1187,7 @@ func decodeAnthropic(data string, emit func(Event)) error {
 			StopReason  string `json:"stop_reason"`
 			// auto mode's review of the reply's calls (automode.go)
 			SafeguardResults json.RawMessage `json:"safeguard_results"`
+			StopDetails      json.RawMessage `json:"stop_details"`
 		} `json:"delta"`
 		Usage aUsage `json:"usage"`
 		Error struct {
@@ -1018,7 +1196,12 @@ func decodeAnthropic(data string, emit func(Event)) error {
 		} `json:"error"`
 	}
 	if err := decodeJSON([]byte(data), &ev); err != nil {
-		return nil // keep going: pings and unknown shapes are harmless
+		// keep going: pings and unknown shapes are harmless, but an
+		// error in a shape of its own is still the reply's end (#1933)
+		if e, ok := carriedError(data); ok {
+			emit(e)
+		}
+		return nil
 	}
 	switch ev.Type {
 	case "message_start":
@@ -1069,9 +1252,9 @@ func decodeAnthropic(data string, emit func(Event)) error {
 		if r := ev.Delta.SafeguardResults; len(r) > 0 && string(r) != "null" {
 			review = r
 		}
-		emit(Event{Kind: KUsage, Usage: ev.Usage.usage(), SafeguardResults: review})
+		emit(Event{Kind: KUsage, Usage: ev.Usage.usage(), SafeguardResults: review, StopDetails: stopDetails(ev.Delta.StopDetails)})
 	case "error":
-		emit(Event{Kind: KError, Text: ev.Error.Message, Code: refusedCode(data)})
+		emit(Event{Kind: KError, Text: cmp.Or(ev.Error.Message, ev.Error.Type, streamErrorText(data)), Code: refusedCode(data)})
 	}
 	return nil
 }
@@ -1095,6 +1278,8 @@ type aCacheCreation struct {
 func (u aUsage) usage() Usage {
 	out := Usage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadInputTokens, CacheWrite: u.CacheCreationInputTokens}
 	if c := u.CacheCreation; c != nil {
+		out.cacheCreationReported = true
+		out.cacheCreationHasCounts = c.Ephemeral5m+c.Ephemeral1h > 0
 		out.CacheWrite = max(out.CacheWrite, c.Ephemeral5m+c.Ephemeral1h)
 		out.CacheWrite1h = c.Ephemeral1h
 	}
@@ -1102,10 +1287,10 @@ func (u aUsage) usage() Usage {
 }
 
 // anthropic is the usage as Anthropic says it, the cache writes split by
-// how long they are kept where some were for an hour.
+// how long they are kept when upstream reported TTLs or some were for an hour.
 func (u Usage) anthropic() aUsage {
 	out := aUsage{InputTokens: u.Input, OutputTokens: u.Output, CacheReadInputTokens: u.CacheRead, CacheCreationInputTokens: u.CacheWrite}
-	if h := min(u.CacheWrite1h, u.CacheWrite); h > 0 {
+	if h := min(u.CacheWrite1h, u.CacheWrite); u.cacheCreationReported || h > 0 {
 		out.CacheCreation = &aCacheCreation{Ephemeral5m: u.CacheWrite - h, Ephemeral1h: h}
 	}
 	return out
@@ -1338,10 +1523,16 @@ func (e *anthropicEncoder) event(ev Event) {
 		e.index++
 	case KError:
 		e.close()
-		failed := map[string]any{"type": "api_error", "message": ev.Text}
+		typ := "api_error"
+		if ev.Status == http.StatusRequestEntityTooLarge && ev.Code != "context_length_exceeded" {
+			// the same type a 413 JSON body carries (writeErrorSaid)
+			typ = "request_too_large"
+		}
+		failed := map[string]any{"type": typ, "message": ev.Text}
 		if ev.Code != "" {
 			failed["code"] = ev.Code // preserve the upstream error type, including refusals
 		}
+		saidError(failed, ev.Said)
 		e.w.event("error", map[string]any{"type": "error", "error": failed})
 	}
 	e.col.add(ev)
@@ -1362,6 +1553,9 @@ func (e *anthropicEncoder) finish() {
 	delta := map[string]any{"stop_reason": stopToAnthropic(res.Stop), "stop_sequence": nil}
 	if len(res.SafeguardResults) > 0 {
 		delta["safeguard_results"] = res.SafeguardResults
+	}
+	if len(res.StopDetails) > 0 {
+		delta["stop_details"] = res.StopDetails
 	}
 	e.w.event("message_delta", map[string]any{"type": "message_delta",
 		"delta": delta,
@@ -1409,6 +1603,9 @@ func renderAnthropic(res Result, model string) []byte {
 		"content": content, "stop_reason": stopToAnthropic(res.Stop), "stop_sequence": nil, "usage": res.Usage.anthropic()}
 	if len(res.SafeguardResults) > 0 {
 		reply["safeguard_results"] = res.SafeguardResults
+	}
+	if len(res.StopDetails) > 0 {
+		reply["stop_details"] = res.StopDetails
 	}
 	b, _ := json.Marshal(reply)
 	return b
@@ -1463,4 +1660,12 @@ func objectSchema(schema json.RawMessage) json.RawMessage {
 		return schema
 	}
 	return b
+}
+
+// stopDetails is a reply's stop_details, or nil when it had none.
+func stopDetails(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return raw
 }

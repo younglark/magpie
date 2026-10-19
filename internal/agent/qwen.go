@@ -68,7 +68,11 @@ type qwenGen struct {
 func qwenEntriesAt(v1 string) []qwenEntry {
 	var out []qwenEntry
 	for _, m := range magpieModels("qwen") {
-		e := qwenEntry{ID: m.ID, Name: magpieID + "/" + m.ID, BaseURL: v1, EnvKey: qwenEnvKey}
+		// name is what /model shows, the id beside it when they differ:
+		// the model's name as every agent's list calls it, by the Provider
+		// in model names setting (magpie/<id> before, which none of the
+		// setting's ways changed)
+		e := qwenEntry{ID: m.ID, Name: m.Name, BaseURL: v1, EnvKey: qwenEnvKey}
 		if m.Context > 0 {
 			e.Generation = &qwenGen{ContextWindowSize: m.Context}
 		}
@@ -347,7 +351,7 @@ func qwenIn(at place) *Agent {
 			if c == nil {
 				return ""
 			}
-			if v, ok := edit.GetJSON(path, qwenEnv); !ok || v != at.gwKey() {
+			if v, _ := edit.GetJSON(path, qwenEnv); !keyHolds(v, at.gwKey()) {
 				return "Qwen Code's " + qwenEnv + " (settings.json) no longer is magpie's key, so magpie's models have none"
 			}
 			if v, ok := edit.GetJSON(path, qwenAuth); !ok || v != "openai" {

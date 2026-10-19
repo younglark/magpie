@@ -43,11 +43,15 @@ func UserPath() {
 	go func() {
 		defer close(done)
 		p, vars := shellEnv()
-		setUnset(vars)
+		agents := make(map[string]string, len(agentenv.Vars))
+		for _, v := range agentenv.Vars {
+			agents[v] = vars[v]
+		}
+		setUnset(agents)
 		if p != "" {
 			addPath(filepath.SplitList(p))
 			login.Lock()
-			login.dirs, login.at = filepath.SplitList(p), time.Now()
+			login.dirs, login.vars, login.at = filepath.SplitList(p), vars, time.Now()
 			login.Unlock()
 		}
 	}()
@@ -74,6 +78,7 @@ func setUnset(vars map[string]string) {
 var login struct {
 	sync.Mutex
 	dirs []string
+	vars map[string]string
 	at   time.Time
 }
 
@@ -87,12 +92,38 @@ func LoginPath() []string {
 	if login.dirs != nil && time.Since(login.at) < time.Minute {
 		return login.dirs
 	}
-	p, _ := shellEnv()
+	p, vars := shellEnv()
 	if p == "" {
 		return nil
 	}
-	login.dirs, login.at = filepath.SplitList(p), time.Now()
+	login.dirs, login.vars, login.at = filepath.SplitList(p), vars, time.Now()
 	return login.dirs
+}
+
+// ProxyVars are the proxy variables the login shell is asked for beside
+// agentenv.Vars. An agent run in a terminal has the ones its profile sets,
+// and so does one the ChatGPT app starts (it takes the login shell's
+// environment as it opens), while magpie opened from the Dock doesn't: a
+// NO_PROXY=127.0.0.1 in .zshrc keeps Codex's requests for magpie off a
+// proxy that magpie, reading its own environment, thought they went
+// through (liu_dyj on X). They are only read (LoginEnv), never set in
+// magpie's environment: magpie's own requests take their proxy from
+// netproxy.
+var ProxyVars = []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}
+
+// shellVars are the variables shellProbe asks for, in its order. Claude
+// Code's provider switches (agentenv.ClaudeProviders) are only read, as the
+// proxy variables are.
+var shellVars = slices.Concat(agentenv.Vars, ProxyVars, agentenv.ClaudeProviders)
+
+// LoginEnv is the value a terminal opened now has for k, one of
+// agentenv.Vars, ProxyVars or agentenv.ClaudeProviders: the login shell's, asked as LoginPath asks
+// and with it; "" when the shell has none for it or doesn't say.
+func LoginEnv(k string) string {
+	LoginPath()
+	login.Lock()
+	defer login.Unlock()
+	return login.vars[k]
 }
 
 // UserBinDirs are the folders a user's command-line tools are installed in
@@ -167,7 +198,7 @@ func npmPrefix(home string) string {
 }
 
 // shellEnv asks the user's login shell for its PATH and the values it has
-// for agentenv.Vars ("" for one it hasn't); "" and nil when it can't say
+// for agentenv.Vars and ProxyVars ("" for one it hasn't); "" and nil when it can't say
 // within a few seconds.
 //
 // fish and nushell are asked too, when they are installed and set up here
@@ -356,37 +387,41 @@ func ShellPath(sh string) []string {
 const shellMark = "__magpie_path__"
 
 // shellProbe is the command the login shell sh runs to print its PATH and
-// agentenv.Vars, between two marks. A NUL (which no variable can hold)
-// parts the values: PATH first, then each of agentenv.Vars in order.
+// agentenv.Vars and ProxyVars (shellVars), between two marks. A NUL (which
+// no variable can hold) parts the values: PATH first, then each of
+// shellVars in order.
 //
-// A POSIX shell (zsh, bash) expands "$PATH" itself, and so does fish:
-// PATH, as each variable whose name ends in PATH, is a path variable there,
-// joined with ':' in double quotes, not with the spaces another list gets. nushell
-// doesn't: a double-quoted string is literal there, so it printed "$PATH",
-// "$CLAUDE_CONFIG_DIR", ... and magpie set each variable to its own name
-// (#738: then Claude sign-in failed with "mkdir $CLAUDE_CONFIG_DIR:
-// read-only file system", and the account lapsed minutes later, Claude
-// Code's sign-in looked for under that folder). nushell has no POSIX
-// quoting to ask with, and its PATH is a list, so it is asked to run
-// /bin/sh with the same printf: nushell hands it the environment as a
-// child sees it, PATH joined back into one string, and sh expands the
-// references. The outer command is in nushell's single quotes, where a
-// backslash is a backslash, and the printf format in sh's double quotes,
-// where \0 reaches printf as it is.
+// Every shell is asked to run /bin/sh with the printf, and sh expands the
+// references, so a value is what the shell exports: what an agent started
+// from it gets. A shell's own expansion saw unexported variables too: fish's
+// universal http_proxy, set with `set -U` and never exported, reached no
+// program, yet magpie took it for Codex's proxy and showed the "proxied"
+// drift (#2627); an unexported zsh or bash variable is the same.
+//
+// nushell needs it most: a double-quoted string is literal there, so it
+// printed "$PATH", "$CLAUDE_CONFIG_DIR", ... and magpie set each variable
+// to its own name (#738: then Claude sign-in failed with "mkdir
+// $CLAUDE_CONFIG_DIR: read-only file system"). Its ^ runs /bin/sh as an
+// external command rather than a nushell one. nushell, as fish (PATH is a
+// path variable there), hands a child PATH joined with ':'. The outer
+// command is in single quotes, where a backslash is a backslash in every
+// one of these shells, and the printf format in sh's double quotes, where
+// \0 reaches printf as it is.
 func shellProbe(sh string) string {
 	format, args := shellMark+"%s", ` "$PATH"`
-	for _, v := range agentenv.Vars {
+	for _, v := range shellVars {
 		format += `\0%s`
 		args += ` "$` + v + `"`
 	}
+	cmd := `/bin/sh -c 'printf "` + format + shellMark + `"` + args + `'`
 	if filepath.Base(sh) == "nu" {
-		return `^/bin/sh -c 'printf "` + format + shellMark + `"` + args + `'`
+		return "^" + cmd
 	}
-	return "printf '" + format + shellMark + "'" + args
+	return cmd
 }
 
 // parseShellEnv reads shellEnv's answer out of what the shell printed. The
-// variables are nil when their count isn't agentenv.Vars' (a printf that
+// variables are nil when their count isn't shellVars' (a printf that
 // doesn't know \0); PATH alone is still taken then. A value that is the
 // variable's own reference ("$CODEX_HOME") is a shell that printed the
 // text instead of expanding it (nushell before shellProbe knew it; a shell
@@ -406,14 +441,14 @@ func parseShellEnv(s, mark string) (string, map[string]string) {
 	if f[0] == "$PATH" {
 		f[0] = ""
 	}
-	if len(f) != len(agentenv.Vars)+1 {
+	if len(f) != len(shellVars)+1 {
 		if len(f) == 1 {
 			return f[0], nil
 		}
 		return "", nil
 	}
-	vars := make(map[string]string, len(agentenv.Vars))
-	for k, v := range agentenv.Vars {
+	vars := make(map[string]string, len(shellVars))
+	for k, v := range shellVars {
 		if f[k+1] == "$"+v {
 			f[k+1] = ""
 		}
