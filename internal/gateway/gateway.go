@@ -4626,6 +4626,11 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	}
 	// structured output an upstream turned away before (#2126): a schema
 	// as any JSON object, or the format told in the system prompt alone
+	// a schema to DeepSeek, which takes json_object only: asked for as an
+	// object from the start, the schema in a trailing system message
+	if proto == provider.Chat && chatTakesObjectOnly(p.Host(), model) {
+		body, _ = deepseekFormatBody(body)
+	}
 	if !s.fits(p.ID, formatRefused(model), proto) {
 		body, _ = formatInBody(proto, body, false)
 	} else if !s.fits(p.ID, schemaRefused(model), proto) {
