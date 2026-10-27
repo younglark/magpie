@@ -606,10 +606,28 @@ func withEffort(proto provider.Protocol, body []byte, effort string) []byte {
 	}
 	switch proto {
 	case provider.Chat:
-		if v.ReasoningEffort == "" || v.ReasoningEffort == "none" {
+		thinkingOn := v.Thinking != nil && strings.EqualFold(v.Thinking.Type, "enabled")
+		asked := v.ReasoningEffort != "" && v.ReasoningEffort != "none"
+		if !asked && !thinkingOn {
 			return body
 		}
-		return withFields(body, map[string]any{"reasoning_effort": effort})
+		fields := map[string]any{}
+		if asked {
+			fields["reasoning_effort"] = effort
+		}
+		// Keep OpenCode-style thinking.type aligned with the new effort
+		// when the client already sent a thinking switch.
+		if v.Thinking != nil {
+			if effort == "none" {
+				fields["thinking"] = map[string]any{"type": "disabled"}
+			} else {
+				fields["thinking"] = map[string]any{"type": "enabled"}
+			}
+		}
+		if len(fields) == 0 {
+			return body
+		}
+		return withFields(body, fields)
 	case provider.Responses:
 		if v.Reasoning == nil || v.Reasoning.Effort == "" || v.Reasoning.Effort == "none" {
 			return body
@@ -723,7 +741,20 @@ func withFixedEffort(proto provider.Protocol, body []byte, effort string) []byte
 	}
 	switch proto {
 	case provider.Chat:
-		return withFields(body, map[string]any{"reasoning_effort": effort})
+		fields := map[string]any{"reasoning_effort": effort}
+		var v struct {
+			Thinking *struct {
+				Type string `json:"type"`
+			} `json:"thinking"`
+		}
+		if decodeJSON(body, &v) == nil && v.Thinking != nil {
+			if effort == "none" {
+				fields["thinking"] = map[string]any{"type": "disabled"}
+			} else {
+				fields["thinking"] = map[string]any{"type": "enabled"}
+			}
+		}
+		return withFields(body, fields)
 	case provider.Responses:
 		var v struct {
 			Reasoning map[string]any `json:"reasoning"`
