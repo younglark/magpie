@@ -175,6 +175,71 @@ func (r *Request) asObject() *Request {
 	return &q
 }
 
+// chatTakesObjectOnly is whether a Chat upstream takes response_format
+// {type: "json_object"} but no json_schema: DeepSeek's API ("Must be one
+// of text or json_object", api-docs.deepseek.com/api/create-chat-completion)
+// and DeepSeek models on other hosts (OpenCode Go's deepseek-v4.1-flash),
+// the same family chatWantsThinkingType names. A schema is asked for as a
+// JSON object there from the start, not after a 400 (schemaRefused).
+func chatTakesObjectOnly(host, model string) bool { return chatWantsThinkingType(host, model) }
+
+// deepseekSchemaLine is a schema said in words for DeepSeek's JSON Output,
+// which wants the word "json" in a system or user message and the shape
+// shown (api-docs.deepseek.com/guides/json_mode). The schema is written
+// again with its keys sorted, so the same schema is the same bytes on
+// every request however the client ordered it.
+func deepseekSchemaLine(schema json.RawMessage) string {
+	return "Respond with a single json object and nothing else (no prose, no code fences), matching this JSON schema:\n" + string(canonicalJSON(schema))
+}
+
+// canonicalJSON is raw JSON written again with every object's keys
+// sorted and nothing escaped for HTML, numbers as they were sent; raw
+// itself when it doesn't parse.
+func canonicalJSON(raw json.RawMessage) []byte {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if dec.Decode(&v) != nil {
+		return raw
+	}
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(v) != nil {
+		return raw
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
+}
+
+// deepseekFormatBody is a Chat body passed through to a chatTakesObjectOnly
+// upstream asking for a json_schema made to ask for any JSON object, the
+// schema told in a system message appended after the conversation
+// (deepseekSchemaLine): the messages before it are left as the client
+// sent them, so the upstream's cached prefix still holds. The body and
+// false when it asks for no schema.
+func deepseekFormatBody(body []byte) ([]byte, bool) {
+	f := bodyFormat(provider.Chat, body)
+	if f == nil || f.Type != "json_schema" {
+		return body, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if dec.Decode(&m) != nil {
+		return body, false
+	}
+	msgs, _ := m["messages"].([]any)
+	m["messages"] = append(msgs, map[string]any{"role": "system", "content": deepseekSchemaLine(f.Schema)})
+	m["response_format"] = map[string]any{"type": "json_object"}
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(m) != nil {
+		return body, false
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n")), true
+}
+
 // withLine is a system prompt with s said at its end.
 func withLine(system, s string) string {
 	if system != "" {

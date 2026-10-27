@@ -206,8 +206,8 @@ func TestResponsesTextKeepsVerbosityBesideFormat(t *testing.T) {
 }
 
 // An upstream that turns a schema away but takes any JSON object
-// (DeepSeek: "This response_format type is unavailable now"; Xiaomi MiMo's
-// Token Plan, #2126) is asked again for an object, the schema in the
+// (Xiaomi MiMo's Token Plan, #2126; a DeepSeek model is asked for an
+// object from the start, TestDeepSeekSchemaAskedAsObjectUpfront) is asked again for an object, the schema in the
 // system prompt; one that turns the object away too, with the format in
 // the system prompt alone. Each from then on, rather than the client
 // getting a 400 for a field the model could have been told in words.
@@ -226,13 +226,13 @@ func TestRefusedFormatToldInWords(t *testing.T) {
 			up := &formatRefuser{object: c.object}
 			srv := httptest.NewServer(up)
 			t.Cleanup(srv.Close)
-			if err := provider.Save(provider.Provider{ID: "ds", Name: "DS", Key: "k", Chat: srv.URL + "/v1", Models: []string{"deepseek-chat"}}); err != nil {
+			if err := provider.Save(provider.Provider{ID: "ds", Name: "DS", Key: "k", Chat: srv.URL + "/v1", Models: []string{"mimo-v2-flash"}}); err != nil {
 				t.Fatal(err)
 			}
 			h := New().Handler()
 			for i := range 2 {
 				rec := httptest.NewRecorder()
-				h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(strings.Replace(sdkResponsesParse, "%s", "ds/deepseek-chat", 1))))
+				h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(strings.Replace(sdkResponsesParse, "%s", "ds/mimo-v2-flash", 1))))
 				if rec.Code != 200 {
 					t.Fatalf("turn %d: status %d: %s", i, rec.Code, rec.Body.String())
 				}
