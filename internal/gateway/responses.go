@@ -307,11 +307,22 @@ func sentRaw(v json.RawMessage) json.RawMessage {
 	return v
 }
 
-func parseResponses(body []byte) (*Request, error) {
+func parseResponses(body []byte) (*Request, error) { return readResponses(body, false) }
+
+// readResponses is parseResponses; for facts (readFacts) it leaves out what
+// they never read: the assistant's words, its calls' arguments and the
+// tools' outputs, each decoded into strings of their own, and the copies
+// of raw values a parse kept would need. Run on every request, a long
+// Codex conversation's tool outputs were most of the parse (#3394).
+func readResponses(body []byte, facts bool) (*Request, error) {
+	decode := decodeJSON
+	if facts {
+		decode = decodeJSONView
+	}
 	// Responses Lite's tools, sent as the first input item (#350)
 	body = liftAdditionalTools(body)
 	var q rRequest
-	if err := decodeJSON(body, &q); err != nil {
+	if err := decode(body, &q); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: q.Model, System: q.Instructions, MaxTokens: q.MaxOutputTokens, Temp: q.Temperature,
@@ -329,7 +340,7 @@ func parseResponses(body []byte) (*Request, error) {
 		r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: Text, Text: s}}})
 	} else {
 		var items []rItem
-		if err := decodeJSON(q.Input, &items); err != nil {
+		if err := decode(q.Input, &items); err != nil {
 			return nil, fmt.Errorf("invalid input: %v", err)
 		}
 		// replied: the conversation has had a turn answered. Codex adds a
@@ -350,7 +361,10 @@ func parseResponses(body []byte) (*Request, error) {
 				if it.Role == "assistant" {
 					role = "assistant"
 				}
-				parts := responsesParts(it.Content)
+				var parts []Part
+				if !facts || role != "assistant" {
+					parts = responsesParts(it.Content)
+				}
 				if (it.Role == "system" || it.Role == "developer") && replied {
 					// in place, told as the system's, not the user's words
 					if t := text(parts); t != "" {
@@ -393,6 +407,8 @@ func parseResponses(body []byte) (*Request, error) {
 			case it.Type == "tool_search_output":
 				found = append(found, it.Tools...)
 				r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: it.CallID, Text: searchFound(it.Tools)}}})
+			case (it.Type == "function_call_output" || it.Type == "custom_tool_call_output") && facts:
+				r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: it.CallID}}})
 			case it.Type == "function_call_output" || it.Type == "custom_tool_call_output":
 				out, images := toolOutput(it.Output)
 				part := Part{Kind: ToolResult, CallID: it.CallID, Text: out, Images: images}
@@ -594,11 +610,11 @@ func joinToolRuns(body []byte) []byte {
 		return body
 	}
 	var q map[string]json.RawMessage
-	if decodeJSON(body, &q) != nil {
+	if decodeJSONView(body, &q) != nil {
 		return body
 	}
-	var input []json.RawMessage
-	if decodeJSON(q["input"], &input) != nil {
+	input, isList := inputList(q["input"])
+	if !isList {
 		return body
 	}
 	type item struct {
@@ -608,7 +624,7 @@ func joinToolRuns(body []byte) []byte {
 	}
 	items := make([]item, len(input))
 	for i, raw := range input {
-		if decodeJSON(raw, &items[i]) != nil {
+		if decodeJSONView(raw, &items[i]) != nil {
 			items[i] = item{}
 		}
 	}
@@ -696,11 +712,11 @@ func joinToolRuns(body []byte) []byte {
 // requiring paired outputs still need the delivered text, without a fake call ID.
 func orphanedToolOutputs(body []byte) []byte {
 	var q map[string]json.RawMessage
-	if decodeJSON(body, &q) != nil {
+	if decodeJSONView(body, &q) != nil {
 		return body
 	}
-	var input []json.RawMessage
-	if decodeJSON(q["input"], &input) != nil {
+	input, isList := inputList(q["input"])
+	if !isList {
 		return body
 	}
 	changed := false
@@ -717,7 +733,7 @@ func orphanedToolOutputs(body []byte) []byte {
 			CallID string          `json:"call_id"`
 			Output json.RawMessage `json:"output"`
 		}
-		if decodeJSON(raw, &item) != nil {
+		if decodeJSONView(raw, &item) != nil {
 			flush()
 			inCalls = false
 			out = append(out, raw)
@@ -747,7 +763,7 @@ func orphanedToolOutputs(body []byte) []byte {
 			content = append(content, map[string]any{"type": "input_text", "text": text})
 		}
 		for _, image := range images {
-			content = append(content, map[string]any{"type": "input_image", "detail": "auto", "image_url": dataURL(image)})
+			content = append(content, map[string]any{"type": "input_image", "detail": responsesDetail(image.Detail), "image_url": dataURL(image)})
 		}
 		if len(content) == 0 {
 			content = append(content, map[string]any{"type": "input_text", "text": "Tool result received."})
@@ -790,11 +806,11 @@ func pairToolItems(body []byte) []byte {
 		return body
 	}
 	var q map[string]json.RawMessage
-	if decodeJSON(body, &q) != nil {
+	if decodeJSONView(body, &q) != nil {
 		return body
 	}
-	var input []json.RawMessage
-	if decodeJSON(q["input"], &input) != nil {
+	input, isList := inputList(q["input"])
+	if !isList {
 		return body
 	}
 	type item struct {
@@ -804,7 +820,7 @@ func pairToolItems(body []byte) []byte {
 	items := make([]item, len(input))
 	answered := map[string]bool{}
 	for i, raw := range input {
-		if decodeJSON(raw, &items[i]) != nil {
+		if decodeJSONView(raw, &items[i]) != nil {
 			items[i] = item{}
 		}
 		if t := items[i].Type; (t == "function_call_output" || t == "custom_tool_call_output") && items[i].CallID != "" {
@@ -871,6 +887,7 @@ func responsesParts(raw json.RawMessage) []Part {
 		Type     string `json:"type"`
 		Text     string `json:"text"`
 		ImageURL string `json:"image_url"`
+		Detail   string `json:"detail"`
 	}
 	decodeJSON(raw, &items)
 	var out []Part
@@ -880,7 +897,9 @@ func responsesParts(raw json.RawMessage) []Part {
 			out = append(out, Part{Kind: Text, Text: it.Text})
 		case "input_image":
 			if it.ImageURL != "" {
-				out = append(out, imagePart(it.ImageURL))
+				im := imagePart(it.ImageURL)
+				im.Detail = it.Detail
+				out = append(out, im)
 			}
 		}
 	}
@@ -914,11 +933,11 @@ func withReasoningText(body []byte) []byte {
 		return body
 	}
 	var q map[string]json.RawMessage
-	if decodeJSON(body, &q) != nil {
+	if decodeJSONView(body, &q) != nil {
 		return body
 	}
-	var items []json.RawMessage
-	if decodeJSON(q["input"], &items) != nil {
+	items, isList := inputList(q["input"])
+	if !isList {
 		return body
 	}
 	changed := false
@@ -930,7 +949,7 @@ func withReasoningText(body []byte) []byte {
 			Summary []rText `json:"summary"`
 			Content []rText `json:"content"`
 		}
-		if decodeJSON(raw, &it) != nil {
+		if decodeJSONView(raw, &it) != nil {
 			continue
 		}
 		kinds[i] = stepKindOf(it.Type, it.Role)
@@ -946,11 +965,11 @@ func withReasoningText(body []byte) []byte {
 			b.WriteString(noReasoning)
 		}
 		var m map[string]json.RawMessage
-		if decodeJSON(raw, &m) != nil {
+		if decodeJSONView(raw, &m) != nil {
 			continue
 		}
 		m["content"], _ = json.Marshal([]map[string]string{{"type": "reasoning_text", "text": b.String()}})
-		if nb, err := json.Marshal(m); err == nil {
+		if nb, err := marshalJSON(m); err == nil {
 			items[i], changed = nb, true
 		}
 	}
@@ -961,8 +980,8 @@ func withReasoningText(body []byte) []byte {
 	if !changed {
 		return body
 	}
-	q["input"], _ = json.Marshal(items)
-	nb, err := json.Marshal(q)
+	q["input"], _ = marshalJSON(items)
+	nb, err := marshalJSON(q)
 	if err != nil {
 		return body
 	}
@@ -1094,6 +1113,25 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// sealed reasoning, and may refuse an item without it.
 	replay := replaysReasoning(model, host)
 	var input []any
+	// a deferred tool a result loaded goes in an additional_tools item
+	// after that result and the results beside it, once, where the
+	// upstream takes one (Request.LoadedInPlace, #2660)
+	deferred := map[string]Tool{}
+	placed := map[string]bool{}
+	if r.LoadedInPlace {
+		for _, t := range r.Tools {
+			if t.Deferred {
+				deferred[t.Name] = t
+			}
+		}
+	}
+	var loaded []any
+	flushLoaded := func() {
+		if len(loaded) > 0 {
+			input = append(input, map[string]any{"type": "additional_tools", "role": "developer", "tools": loaded})
+			loaded = nil
+		}
+	}
 	// a second answer to one call is left out, as the Chat and Messages
 	// builds leave it (dropSecondAnswers)
 	for _, m := range dropSecondAnswers(r.Messages) {
@@ -1102,6 +1140,7 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 			if len(content) == 0 {
 				return
 			}
+			flushLoaded()
 			input = append(input, map[string]any{"type": "message", "role": m.Role, "content": content})
 			content = nil
 		}
@@ -1124,21 +1163,24 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 				content = append(content, map[string]any{"type": t, "text": attachmentText(p)})
 			case Image:
 				if m.Role != "assistant" {
-					content = append(content, map[string]any{"type": "input_image", "detail": "auto", "image_url": dataURL(p)})
+					content = append(content, map[string]any{"type": "input_image", "detail": responsesDetail(p.Detail), "image_url": dataURL(p)})
 				}
 			case Thinking:
 				if !replay && sealedReasoning(p) {
 					// a Responses API's own sealed reasoning goes back as
 					// it came: id, summary and encrypted_content (#1445)
 					flushMsg()
+					flushLoaded()
 					input = append(input, p.Sealed)
 				} else if replay && p.Text != "" {
 					flushMsg()
+					flushLoaded()
 					input = append(input, map[string]any{"type": "reasoning", "summary": []any{},
 						"content": []map[string]any{{"type": "reasoning_text", "text": p.Text}}})
 				}
 			case ToolCall:
 				flushMsg()
+				flushLoaded()
 				id := p.ID
 				if id == "" {
 					id = "call_" + newID()
@@ -1158,15 +1200,22 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 						items = append(items, map[string]any{"type": "input_text", "text": p.Text})
 					}
 					for _, im := range p.Images {
-						items = append(items, map[string]any{"type": "input_image", "detail": "auto", "image_url": dataURL(im)})
+						items = append(items, map[string]any{"type": "input_image", "detail": responsesDetail(im.Detail), "image_url": dataURL(im)})
 					}
 					output = items
 				}
 				input = append(input, map[string]any{"type": "function_call_output", "call_id": p.CallID, "output": output})
+				for _, name := range p.Loads {
+					if t, ok := deferred[name]; ok && !placed[name] {
+						placed[name] = true
+						loaded = append(loaded, responsesTool(t))
+					}
+				}
 			}
 		}
 		flushMsg()
 	}
+	flushLoaded()
 	if replay {
 		// each step that makes a call, or follows a tool output, leads with
 		// its reasoning, or with a space's (#1592, #1822)
@@ -1255,14 +1304,10 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	if len(r.Tools) > 0 || r.WebSearch {
 		var tools []map[string]any
 		for _, t := range r.Tools {
-			// strict is said, as Codex says it: left out, the ChatGPT
-			// backend holds the schema to strict mode's rules and refuses a
-			// pattern with a lookaround (MiniMax Code's path, #383)
-			tool := map[string]any{"type": "function", "name": t.Name, "description": t.Description, "strict": t.Strict}
-			if len(t.Schema) > 0 {
-				tool["parameters"] = t.Schema
+			if placed[t.Name] {
+				continue // offered where it was loaded
 			}
-			tools = append(tools, tool)
+			tools = append(tools, responsesTool(t))
 		}
 		if r.WebSearch {
 			tools = append(tools, map[string]any{"type": "web_search"})
@@ -1272,7 +1317,9 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 				include = append(include, "web_search_call.action.sources")
 			}
 		}
-		out["tools"] = tools
+		if len(tools) > 0 {
+			out["tools"] = tools
+		}
 		switch {
 		case r.ToolChoice == "auto" || r.ToolChoice == "none" || r.ToolChoice == "required":
 			out["tool_choice"] = r.ToolChoice
@@ -1282,6 +1329,14 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 		if r.Parallel != nil {
 			out["parallel_tool_calls"] = *r.Parallel
 		}
+	} else if r.ToolChoice == "none" {
+		// tools turned off with none declared (Chat's "none", Anthropic's
+		// {"type":"none"}, Gemini's NONE) still says so here, as a
+		// Responses client's own request would, for a provider plugin that
+		// adds a server-side tool (Grok's x_search) to tell it from no
+		// choice (#3110). Only a plugin is sent it (the gateway leaves it
+		// out for a vendor, which has no use for it: xAI turns it away).
+		out["tool_choice"] = "none"
 	}
 	if len(include) > 0 {
 		out["include"] = include
@@ -1293,6 +1348,18 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// the lone call, "No tool output found for function call <id>", on
 	// every turn after it too (#2222)
 	return pairToolItems(b)
+}
+
+// responsesTool is t as a Responses function tool. strict is said, as
+// Codex says it: left out, the ChatGPT backend holds the schema to strict
+// mode's rules and refuses a pattern with a lookaround (MiniMax Code's
+// path, #383).
+func responsesTool(t Tool) map[string]any {
+	tool := map[string]any{"type": "function", "name": t.Name, "description": t.Description, "strict": t.Strict}
+	if len(t.Schema) > 0 {
+		tool["parameters"] = t.Schema
+	}
+	return tool
 }
 
 type rUsage struct {
@@ -1532,7 +1599,11 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 				msg = ev.Response.Error.Message
 			}
 			status, said := requestRefused(data)
-			emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: refusedCode(data), Status: status, Said: said})
+			code, fs, fsaid := filterRefused(data)
+			if status == 0 {
+				status, said = fs, fsaid
+			}
+			emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: code, Status: status, Said: said})
 			return nil
 		}
 		stop := "stop"
@@ -1560,7 +1631,11 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 			msg = cmp.Or(ev.Error.Message, msg)
 		}
 		status, said := requestRefused(data)
-		emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: refusedCode(data), Status: status, Said: said})
+		code, fs, fsaid := filterRefused(data)
+		if status == 0 {
+			status, said = fs, fsaid
+		}
+		emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: code, Status: status, Said: said})
 	}
 	return nil
 }

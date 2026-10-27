@@ -34,20 +34,25 @@ type Skill struct {
 	// Hash is of the skill's files as last fetched from GitHub, and Commit
 	// the last commit to have touched its folder there, once a check has
 	// found the two to agree: together they tell whether GitHub has
-	// changed the skill since.
+	// changed the skill since. For one from another git repository,
+	// Commit is the commit of the repository it was fetched at.
 	Hash   string `json:"hash,omitempty"`
 	Commit string `json:"commit,omitempty"`
 	// From is the repository one not installed from GitHub was found to
 	// come from (skill_from.go), only to group it with the rest of it
 	From string `json:"from,omitempty"`
+	// Gone is when an update or a check found its source without it: it
+	// was removed there (skill_gone.go). Kept on this computer only.
+	Gone string `json:"gone,omitempty"`
 }
 
 // Source is where a skill came from: a GitHub repository it can be updated
-// from, or a folder on this machine the library links to, so that editing
-// the folder is editing the skill.
+// from, another git repository (fetched with the user's own git), or a
+// folder on this machine the library links to, so that editing the folder
+// is editing the skill.
 type Source struct {
-	Kind string `json:"kind"` // github | folder
-	Repo string `json:"repo,omitempty"`
+	Kind string `json:"kind"`           // github | git | folder
+	Repo string `json:"repo,omitempty"` // owner/repo for github, the address git fetches for git
 	Ref  string `json:"ref,omitempty"`
 	Path string `json:"path,omitempty"` // in the repository
 	Dir  string `json:"dir,omitempty"`  // the folder, for kind folder
@@ -59,6 +64,9 @@ func (s *Source) String() string {
 	}
 	if s.Kind == "folder" {
 		return s.Dir
+	}
+	if s.Kind == "git" {
+		return gitURL(s)
 	}
 	u := "https://github.com/" + s.Repo
 	if s.Ref != "" || s.Path != "" {
@@ -747,22 +755,42 @@ var tarballURL = func(repo, ref string) string {
 	return "https://codeload.github.com/" + repo + "/tar.gz/" + url.PathEscape(ref)
 }
 
-// fetch downloads the repository into a new folder and gives it back. A
+// remote is whether a skill's source is a repository it is fetched from
+// again to update: GitHub, or another git repository.
+func (s *Source) remote() bool { return s != nil && (s.Kind == "github" || s.Kind == "git") }
+
+// fetch downloads the repository into a new folder and gives it back; one
+// not on GitHub is fetched with the user's git (fetchGit). A
 // repository codeload doesn't hand out without a token, a private one, is
 // asked of GitHub's API with the user's GitHub token (37FlowAI on X): the
 // API redirects to codeload, and the token, sent to the API's host alone,
 // isn't carried over to it.
+//
+// A repository too big to download whole is fetched only as far as src.Path
+// and name narrow it (fetchSkillFiles); part says it was.
 func fetch(src Source) (string, error) {
+	dir, _, err := fetchPart(src, "")
+	return dir, err
+}
+
+func fetchPart(src Source, name string) (dir string, part bool, err error) {
+	if src.Kind == "git" {
+		dir, err = fetchGit(src)
+		return dir, false, err
+	}
+	dir, err = fetchWhole(src, name)
+	return dir, tooBig.has(src) && (src.Path != "" || name != ""), err
+}
+
+func fetchWhole(src Source, name string) (string, error) {
 	c := &http.Client{Timeout: 2 * time.Minute}
 	get := func(u string) (*http.Response, bool, error) {
 		req, _ := http.NewRequest("GET", u, nil)
 		req.Header.Set("User-Agent", "magpie")
-		token := withGitHubToken(req)
-		resp, err := source.DoOfficial(c, req)
-		return resp, token, err
+		return doGitHub(req, func(r *http.Request) (*http.Response, error) { return source.DoOfficial(c, r) })
 	}
 	if tooBig.has(src) {
-		return fetchSkillFiles(src)
+		return fetchSkillFiles(src, name)
 	}
 	resp, _, err := get(tarballURL(src.Repo, src.Ref))
 	if err != nil {
@@ -813,7 +841,7 @@ func fetch(src Source) (string, error) {
 			// skills beside it, #1941): only the skills' folders
 			resp.Body.Close()
 			tooBig.add(src)
-			return fetchSkillFiles(src)
+			return fetchSkillFiles(src, name)
 		}
 		return "", err
 	}
@@ -994,12 +1022,22 @@ func skillsCommand(input string) string {
 }
 
 // ProbeSkills looks for skills at what the user typed: a GitHub repository
-// (or a folder in one), a folder on this machine, or a skills CLI command
-// for either.
-func ProbeSkills(input string) (*Probe, error) {
+// (or a folder in one), any other git repository (GitLab, one on a
+// company's own server; fetched with the user's git), a folder on this
+// machine, or a skills CLI command for one of them.
+func ProbeSkills(input string) (*Probe, error) { return probeSkills(input, "") }
+
+// probeSkills is ProbeSkills for the skill called name, when one is
+// wanted: a repository too big to download whole is then fetched only for
+// the skills by that name (fetchSkillFiles), and the probe is kept apart
+// from a whole one (probeKey).
+func probeSkills(input, name string) (*Probe, error) {
 	input = strings.TrimSpace(skillsCommand(input))
 	if input == "" {
-		return nil, fmt.Errorf("paste a GitHub link or a folder's path")
+		return nil, fmt.Errorf("paste a GitHub or git repository's link or a folder's path")
+	}
+	if strings.HasPrefix(input, "-") {
+		return nil, fmt.Errorf("a repository's address can't start with -")
 	}
 	sweepStaleDownloads()
 
@@ -1011,21 +1049,30 @@ func ProbeSkills(input string) (*Probe, error) {
 		}
 		p.Kind, p.root, p.src = "folder", dir, Source{Kind: "folder", Dir: dir}
 		p.Candidates = candidates(dir, "")
-	} else if src, ok := githubSource(input); ok {
-		tmp, err := fetch(src)
+	} else if src, ok := githubSource(input); ok || isGit(input) {
+		if !ok {
+			src, _, _ = gitSource(input)
+		}
+		tmp, part, err := fetchPart(src, name)
 		if err != nil {
 			return nil, err
 		}
-		p.Kind, p.root, p.src = "github", tmp, src
+		p.Kind, p.root, p.src = src.Kind, tmp, src
 		if _, err := os.Stat(filepath.Join(tmp, filepath.FromSlash(src.Path))); src.Path != "" && err != nil {
 			os.RemoveAll(tmp)
 			return nil, fmt.Errorf("%s has no folder %s", src.Repo, src.Path)
 		}
 		p.Candidates = candidates(tmp, src.Path)
 		p.Left = tookLeftOut(tmp, src.Path)
-		keepProbe(input, p, tmp)
+		key := input
+		if part && name != "" {
+			key = probeKey(input, name)
+		}
+		keepProbe(key, p, tmp)
+	} else if _, ok, err := gitSource(input); ok && err != nil {
+		return nil, err
 	} else {
-		return nil, fmt.Errorf("that's neither a GitHub repository nor a folder's full path")
+		return nil, fmt.Errorf("that's neither a git repository's link (GitHub, GitLab or another host) nor a folder's full path")
 	}
 	if p.Candidates == nil {
 		p.Candidates = []Candidate{}
@@ -1039,16 +1086,30 @@ func ProbeSkills(input string) (*Probe, error) {
 	return p, nil
 }
 
-func cachedProbe(input string) (*Probe, error) {
+func cachedProbe(input string) (*Probe, error) { return cachedProbeFor(input, "") }
+
+// probeKey is where a probe fetched only for the skill called name is
+// kept: a later probe of the whole source never takes it for one.
+func probeKey(input, name string) string { return input + "\x00" + name }
+
+// cachedProbeFor is the probe kept for input, a whole one or one made for
+// the skill called name, or a new one for name.
+func cachedProbeFor(input, name string) (*Probe, error) {
+	key := strings.TrimSpace(skillsCommand(input))
 	probes.Lock()
-	e := probes.m[strings.TrimSpace(skillsCommand(input))]
+	es := []*probeEntry{probes.m[key]}
+	if name != "" {
+		es = append(es, probes.m[probeKey(key, name)])
+	}
 	probes.Unlock()
-	if e != nil {
-		if _, err := os.Stat(e.tmp); err == nil {
-			return e.p, nil
+	for _, e := range es {
+		if e != nil {
+			if _, err := os.Stat(e.tmp); err == nil {
+				return e.p, nil
+			}
 		}
 	}
-	return ProbeSkills(input)
+	return probeSkills(input, name)
 }
 
 // InstallSkills adds the skills at those paths of the source to the library
@@ -1104,6 +1165,8 @@ func fromSameSource(s *Skill, src Source, path, from string) bool {
 	switch src.Kind {
 	case "github":
 		return strings.EqualFold(s.Source.Repo, src.Repo) && s.Source.Path == path
+	case "git":
+		return sameGitRepo(s.Source.Repo, src.Repo) && s.Source.Path == path
 	case "folder":
 		return realDir(s.Source.Dir) == realDir(from)
 	}
@@ -1152,7 +1215,7 @@ func installFrom(l *Library, p *Probe, paths, agents []string, shown bool, in *i
 			switch {
 			case src.Kind == "folder" && linked(dir) && realDir(dir) == realDir(from):
 				src.Dir = from
-			case src.Kind == "github" && !linked(dir) && sameTree(dir, from):
+			case src.remote() && !linked(dir) && sameTree(dir, from):
 				src.Path = c.Path
 			case src.Kind == "folder" && realDir(from) == realDir(dir):
 				// a folder already in the library's own (#595): linked to
@@ -1193,6 +1256,9 @@ func installFrom(l *Library, p *Probe, paths, agents []string, shown bool, in *i
 			in.added = append(in.added, c.Name)
 		}
 		sk := &Skill{Name: c.Name, Source: &src, Agents: slices.Clone(agents)}
+		if src.Kind == "git" {
+			sk.Hash, sk.Commit = hashDir(dir), gitHeadOf(p.root)
+		}
 		if src.Kind == "github" {
 			sk.Hash = hashDir(dir)
 			// every skill the picker showed was offered: a check
@@ -1228,9 +1294,16 @@ func UpdateSkill(name string, replace bool) (*Result, error) {
 	f := &fetcher{}
 	defer f.clean()
 	if edited, _ := l.editState(s, Targets()); edited && !replace {
-		return nil, &EditedError{Name: name}
+		return nil, editedError(s)
 	}
 	up, err := f.prepare(s)
+	var gone *GoneError
+	if errors.As(err, &gone) {
+		markGone([]string{name}, nil)
+		checks.Lock()
+		checks.m[name] = goneCheck(gone)
+		checks.Unlock()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1239,7 +1312,7 @@ func UpdateSkill(name string, replace bool) (*Result, error) {
 		if s := l.skill(name); s != nil && !replace {
 			// changed while it was fetched
 			if edited, _ := l.editState(s, targets); edited {
-				return &EditedError{Name: name}
+				return editedError(s)
 			}
 		}
 		return up.apply(l, targets)
@@ -1273,6 +1346,7 @@ func updateSkills(names []string) (*Result, error) {
 	var (
 		ups    []*skillUpdate
 		failed []Problem
+		gone   []*GoneError
 		pmu    sync.Mutex
 		wg     sync.WaitGroup
 		sem    = make(chan struct{}, 4)
@@ -1289,6 +1363,11 @@ func updateSkills(names []string) (*Result, error) {
 			up, err := f.prepare(s)
 			pmu.Lock()
 			defer pmu.Unlock()
+			var g *GoneError
+			if errors.As(err, &g) {
+				gone = append(gone, g)
+				return
+			}
 			if err != nil {
 				failed = append(failed, Problem{What: "skill:" + s.Name, Error: err.Error()})
 				return
@@ -1299,11 +1378,19 @@ func updateSkills(names []string) (*Result, error) {
 	wg.Wait()
 	sort.Slice(failed, func(i, j int) bool { return failed[i].What < failed[j].What })
 	res, err := change(func(l *Library) error {
+		var names []string
+		checks.Lock()
+		for _, g := range gone {
+			names = append(names, g.Name)
+			checks.m[g.Name] = goneCheck(g)
+		}
+		checks.Unlock()
+		l.setGone(names, nil)
 		targets := Targets()
 		for _, up := range ups {
 			if s := l.skill(up.name); s != nil {
 				if edited, _ := l.editState(s, targets); edited {
-					failed = append(failed, Problem{What: "skill:" + up.name, Error: (&EditedError{Name: up.name}).Error()})
+					failed = append(failed, Problem{What: "skill:" + up.name, Error: editedError(s).Error()})
 					continue
 				}
 			}
@@ -1324,13 +1411,17 @@ func updateSkills(names []string) (*Result, error) {
 	}
 	sort.Strings(res.Updated)
 	res.Unupdated = failed
+	for _, g := range gone {
+		res.Gone = append(res.Gone, g.Name)
+	}
+	sort.Strings(res.Gone)
 	return res, nil
 }
 
-// updatable is whether a skill can be fetched again: one from GitHub, or
-// one CC Switch installed from there.
+// updatable is whether a skill can be fetched again: one from GitHub or
+// another git repository, or one CC Switch installed from GitHub.
 func updatable(s *Skill) bool {
-	if s.Source != nil && s.Source.Kind == "github" {
+	if s.Source.remote() {
 		return true
 	}
 	_, ok := ccSwitchOrigin(s)
@@ -1338,7 +1429,10 @@ func updatable(s *Skill) bool {
 }
 
 // fetcher downloads each repository at each ref once, however many of
-// its skills are updated.
+// its skills are updated. A repository too big to download whole is
+// fetched only under the folder asked for (fetchPart), so a skill
+// elsewhere in it is fetched on its own: read from the first folder, it
+// would look removed there (goneFrom).
 type fetcher struct {
 	mu   sync.Mutex
 	got  map[string]*fetched
@@ -1346,17 +1440,28 @@ type fetcher struct {
 }
 
 type fetched struct {
-	once sync.Once
-	dir  string
-	err  error
+	once  sync.Once
+	dir   string
+	err   error
+	part  bool   // only under
+	under string // the folder fetched, when part
 }
 
 func (f *fetcher) fetch(src Source) (string, error) {
+	key := src.Repo + "@" + src.Ref
+	g := f.get(key, src)
+	if g.part && !inRepoDir(src.Path, g.under) {
+		g = f.get(key+"@"+src.Path, src)
+	}
+	return g.dir, g.err
+}
+
+// get is the fetch kept under key, made from src the first time.
+func (f *fetcher) get(key string, src Source) *fetched {
 	f.mu.Lock()
 	if f.got == nil {
 		f.got = map[string]*fetched{}
 	}
-	key := src.Repo + "@" + src.Ref
 	g := f.got[key]
 	if g == nil {
 		g = &fetched{}
@@ -1364,14 +1469,15 @@ func (f *fetcher) fetch(src Source) (string, error) {
 	}
 	f.mu.Unlock()
 	g.once.Do(func() {
-		g.dir, g.err = fetch(src)
+		g.dir, g.part, g.err = fetchPart(src, "")
+		g.under = src.Path
 		if g.err == nil {
 			f.mu.Lock()
 			f.dirs = append(f.dirs, g.dir)
 			f.mu.Unlock()
 		}
 	})
-	return g.dir, g.err
+	return g
 }
 
 func (f *fetcher) clean() {
@@ -1382,31 +1488,41 @@ func (f *fetcher) clean() {
 
 // skillUpdate is a skill fetched again, ready to take the old one's place.
 type skillUpdate struct {
-	name  string
-	src   *Source
-	adopt bool
-	from  string
+	name   string
+	src    *Source
+	adopt  bool
+	from   string
+	commit string // the commit a git repository was fetched at
 }
 
 func (f *fetcher) prepare(s *Skill) (*skillUpdate, error) {
 	name := s.Name
 	src, adopt := s.Source, false
-	if src == nil || src.Kind != "github" {
+	if !src.remote() {
 		// one CC Switch installed from GitHub becomes the library's own,
 		// fetched from there, leaving CC Switch's folder as it is
 		o, ok := ccSwitchOrigin(s)
 		if !ok {
-			return nil, fmt.Errorf("%s isn't from GitHub; it's kept as it is", name)
+			return nil, fmt.Errorf("%s isn't from GitHub or a git repository; it's kept as it is", name)
 		}
 		src, adopt = &o, true
 	} else {
 		c := *src
 		src = &c
 	}
-	tmp, err := f.fetch(*src)
+	// CC Switch's Path is only the folder's name (origin): the whole
+	// repository is looked in
+	at := func() Source {
+		w := *src
+		if adopt {
+			w.Path = ""
+		}
+		return w
+	}
+	tmp, err := f.fetch(at())
 	if err != nil && adopt && src.Ref != "" {
 		src.Ref = "" // the branch CC Switch recorded is gone: the default one
-		tmp, err = f.fetch(*src)
+		tmp, err = f.fetch(at())
 	}
 	if err != nil {
 		return nil, err
@@ -1420,9 +1536,17 @@ func (f *fetcher) prepare(s *Skill) (*skillUpdate, error) {
 	}
 	from := filepath.Join(tmp, filepath.FromSlash(src.Path))
 	if _, ok := readMeta(from); !ok {
+		if !adopt && goneFrom(tmp, src.Path) {
+			// the repository was read, and the skill isn't in it
+			return nil, &GoneError{Name: name, Source: src.Repo}
+		}
 		return nil, fmt.Errorf("%s has no SKILL.md at %s any more", src.Repo, src.Path)
 	}
-	return &skillUpdate{name: name, src: src, adopt: adopt, from: from}, nil
+	up := &skillUpdate{name: name, src: src, adopt: adopt, from: from}
+	if src.Kind == "git" {
+		up.commit = gitHeadOf(tmp)
+	}
+	return up, nil
 }
 
 // apply puts the fetched skill in the old one's place; the agents' links
@@ -1465,8 +1589,9 @@ func (up *skillUpdate) apply(l *Library, targets []*Target) error {
 			s.Source = up.src
 		}
 		// the commit it's at is known again once a check finds the files
-		// GitHub has to be these
-		s.Hash, s.Commit = hash, ""
+		// GitHub has to be these; a git repository's is the one fetched
+		s.Hash, s.Commit = hash, up.commit
+		s.Gone = "" // its source has it again
 	}
 	forgetCheck(name)
 	if old == "" {

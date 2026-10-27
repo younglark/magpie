@@ -5,15 +5,32 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/yetone/magpie/internal/testenv"
 )
 
-// inZone runs the test with the local time zone at a fixed offset.
+// inZone runs the test with the local time zone at a fixed offset. The
+// background cache writer (saveCache) reads time.Local, and one started by
+// this or an earlier test's List can still be running, so it is drained
+// before the zone is swapped and again before it is put back (cleanups run
+// last-in first-out).
 func inZone(t *testing.T, hours int) {
+	savesDone()
 	testenv.Zone(t, time.FixedZone("test", hours*3600))
+	t.Cleanup(savesDone)
+}
+
+// savesDone waits for the background cache writer to finish.
+func savesDone() {
+	saving.Lock()
+	for saving.running {
+		saving.Wait()
+	}
+	saving.Unlock()
 }
 
 // ccMsg is a line of a Claude Code reply at a time.
@@ -126,7 +143,7 @@ func TestStatsMidnight(t *testing.T) {
 
 	// the same from the start, and from the parse kept on disk
 	full := parse(file{agent: "claude", path: path, main: true, size: int64(len(first + rest)), mod: time.Now()}, nil)
-	if got := full.Days["2026-09-21"].Models["claude-opus-5-5"]; got != after21 {
+	if got := full.Days.of("2026-09-21").Models.of("claude-opus-5-5"); got != after21 {
 		t.Fatalf("read whole: %+v", got)
 	}
 	Reset()
@@ -275,6 +292,16 @@ func TestStatsHoursAndSessions(t *testing.T) {
 	}
 	if clip("abcdef", 4) != "abc…" || clip("abc", 4) != "abc" {
 		t.Fatal("clip")
+	}
+}
+
+// The overview's title of a long first prompt is the session's own string:
+// cut again to 160, it was a new copy of every title in each range kept.
+func TestStatsTitleIsTheSessionsOwn(t *testing.T) {
+	long := title(strings.Repeat("写一个很长的提示词", 40))
+	got := clip(long, titleKept)
+	if got != long || unsafe.StringData(got) != unsafe.StringData(long) {
+		t.Fatalf("clipped again: %q", got)
 	}
 }
 
