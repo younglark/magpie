@@ -37,6 +37,7 @@ import (
 	"github.com/yetone/magpie/internal/fonts"
 	"github.com/yetone/magpie/internal/fx"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/ghtoken"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/mcpauth"
@@ -402,6 +403,9 @@ type settingsJSON struct {
 	GatewayOn  bool   `json:"gatewayOn,omitempty"`
 	GatewayWhy string `json:"gatewayWhy,omitempty"`
 	Web        bool   `json:"web,omitempty"`
+	// NoVideo: this app's webview would crash on a <video> (Linux without
+	// gst-plugins-good, webkitPlaysVideo), so the pages show no video
+	NoVideo bool `json:"noVideo,omitempty"`
 	// the proxy vendor requests go through now, and where it came from:
 	// settings, environment, system, off or none
 	ProxyNow    string `json:"proxyNow"`
@@ -468,6 +472,9 @@ type settingsJSON struct {
 	// is from ("settings", GITHUB_TOKEN or GH_TOKEN); never the token
 	GitHubTokenMask string `json:"githubTokenMask,omitempty"`
 	GitHubTokenFrom string `json:"githubTokenFrom,omitempty"`
+	// the token set in Settings was refused by GitHub (401): it is still
+	// shown, masked, while requests go without a token (#3926)
+	GitHubTokenRefused bool `json:"githubTokenRefused,omitempty"`
 	// where other machines reach the gateway while it is shared
 	LANURLs []string `json:"lanURLs,omitempty"`
 	// LANURLs are a container's own addresses, not the host's: the page
@@ -623,13 +630,19 @@ func settingsState() settingsJSON {
 	}
 	s.WSL = runtime.GOOS == "windows"
 	s.Web = webPage.Load()
+	s.NoVideo = !s.Web && !webkitPlaysVideo()
 	s.GatewayOn, s.GatewayWhy = gatewayMode(s.Web)
 	s.LANKey = "" // the retained credential belongs on disk, not in UI state
 	// the GitHub token, masked, and where the library's requests take one
 	// from: Settings, or the environment variable named
+	own := strings.TrimSpace(s.GitHubToken)
 	s.GitHubToken = ""
 	if tok, from := library.GitHubToken(); tok != "" {
 		s.GitHubTokenMask, s.GitHubTokenFrom = provider.Mask(tok), from
+	} else if _, refused := ghtoken.SettingsRefused(); refused && own != "" {
+		// a refused token set here is still the user's: shown as refused,
+		// not as if none were set, while requests go without one (#3926)
+		s.GitHubTokenMask, s.GitHubTokenFrom, s.GitHubTokenRefused = provider.Mask(own), "settings", true
 	}
 	if found, err := discoverTerminals(); err == nil {
 		for _, app := range found.Apps {
@@ -823,7 +836,9 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	if gw != nil {
 		served.Store(gw)
 	}
-	if isWeb(w) {
+	// magpie web's own page, not the app's served to a browser, which the
+	// app's windows share their settings state with
+	if ownWeb(w) {
 		webPage.Store(true)
 	}
 	mux := http.NewServeMux()
@@ -840,12 +855,16 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		if s.Colorblind {
 			boot["colorblind"] = true
 		}
+		// a browser tab keeps its own font choice (fonts.js) and is told
+		// whether there is a list to choose from
 		if !isWeb(w) {
 			boot["uiFont"], boot["codeFont"] = s.UIFont, s.CodeFont
+		} else if fonts.Available {
+			boot["fonts"] = true
 		}
 		// and whether it is a gateway's page alone (gatewaymode.go), so the
 		// pages left out never show
-		if on, _ := gatewayMode(isWeb(w)); on {
+		if on, _ := gatewayMode(ownWeb(w)); on {
 			boot["gateway"] = true
 		}
 		// and the built-in plugins it leaves out (builtins.go), gone
@@ -887,7 +906,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		writeJSON(rw, nil)
 	})
 	omarchyRoutes(mux, w)
-	fontRoutes(mux, isWeb(w) || !fonts.Available, fonts.List)
+	fontRoutes(mux, !fonts.Available, fonts.List)
 	mux.HandleFunc("GET /api/state", func(rw http.ResponseWriter, r *http.Request) {
 		// the panel and its model picker load from here: an account still
 		// without its vendor's list (one whose try at start-up failed) is
@@ -1190,6 +1209,9 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	cliBehindRoutes(mux)
 	gatewayFixRoutes(mux)
 	gatewayModeRoutes(mux)
+	if !isWeb(w) {
+		appPageRoutes(mux)
+	}
 	privacyModelRoutes(mux)
 	maskingRoutes(mux)
 	builtinRoutes(mux)

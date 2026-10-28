@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"os"
@@ -239,6 +240,7 @@ func TestCodexAppHomeHelper(t *testing.T) {
 	if os.Getenv("MAGPIE_CODEX_HOME_HELPER") != "1" {
 		return
 	}
+	os.Stdout.WriteString("running\n")
 	time.Sleep(30 * time.Second)
 }
 
@@ -251,11 +253,20 @@ func TestCodexAppServersOnHome(t *testing.T) {
 	start := func(env ...string) int {
 		ctx, cancel := context.WithCancel(context.Background())
 		cmd := proc.CommandContext(ctx, os.Args[0], "-test.run=^TestCodexAppHomeHelper$")
-		cmd.Env = append([]string{"MAGPIE_CODEX_HOME_HELPER=1"}, env...)
+		// TMPDIR is this test's: given no testenv.Marker, the helper makes
+		// a test home of its own there, which it never removes once killed
+		cmd.Env = append([]string{"MAGPIE_CODEX_HOME_HELPER=1", "TMPDIR=" + t.TempDir()}, env...)
+		out, _ := cmd.StdoutPipe()
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { cancel(); _ = cmd.Wait() })
+		// running, so its exec is done: Start returns before Linux has
+		// written the new program's environment, and /proc/<pid>/environ
+		// read then is empty (#3906)
+		if line, _ := bufio.NewReader(out).ReadString('\n'); line != "running\n" {
+			t.Fatalf("the helper: %q", line)
+		}
 		return cmd.Process.Pid
 	}
 	ctx := context.Background()
@@ -372,15 +383,28 @@ func TestCodexOutUntil(t *testing.T) {
 	}
 }
 
+// codexWindowsAppServer is the Windows Codex app's own app-server.
+const codexWindowsAppServer = `C:\Users\yeton\AppData\Local\OpenAI\Codex\bin\2993767bd1dfb009\codex.exe -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true`
+
 // Only the app's own app-server is restarted: another program's, started
 // from the app's bundled codex with --listen (Miyi Helper's, seen on the
 // owner's Mac), is that program's.
 func TestCodexAppOwnServer(t *testing.T) {
-	own := "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true"
-	if !isCodexAppOwnServer(own) {
-		t.Fatalf("the app's own app-server not taken: %s", own)
+	for _, own := range []string{
+		"/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true",
+		// the Windows app's (OpenAI.Codex 26.1021, ChatGPT.exe's child),
+		// as Windows listed it on the Windows box: run from LOCALAPPDATA,
+		// not from its package (zhibukaixinyao on Discord)
+		codexWindowsAppServer,
+	} {
+		if !isCodexAppOwnServer(own) {
+			t.Errorf("the app's own app-server not taken: %s", own)
+		}
 	}
 	for _, other := range []string{
+		`C:\Users\me\AppData\Local\OpenAI\Codex\bin\2993767bd1dfb009\codex.exe app-server --listen stdio://`,
+		`C:\Users\me\AppData\Roaming\npm\node_modules\@openai\codex\vendor\x86_64-pc-windows-msvc\codex\codex.exe app-server`,
+		`C:\Users\me\AppData\Local\Microsoft\WinGet\Links\codex.exe app-server`,
 		"/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server --listen stdio://",
 		"/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server --listen=ws://127.0.0.1:4500",
 		"/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex -c forced_login_method=\"chatgpt\" exec-server --remote https://codex-cloud-environments.chatgpt.com/api",
@@ -389,5 +413,102 @@ func TestCodexAppOwnServer(t *testing.T) {
 		if isCodexAppOwnServer(other) {
 			t.Errorf("taken for the app's own app-server: %s", other)
 		}
+	}
+}
+
+// Switching Codex's ChatGPT account left the Codex app on the one before
+// until it was quit and opened again, and Windows has no Restart button
+// for it (zhibukaixinyao on Discord): the app's app-server keeps the
+// account it started with. A switch now ends that app-server once no
+// Codex turn runs, as a route change does, and the app starts another on
+// the new account.
+func TestCodexAppServerRestartedOnAccountSwitch(t *testing.T) {
+	signIn(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	s := stubCodexApp(t)
+	old := listProcesses
+	t.Cleanup(func() {
+		listProcesses = old
+		DismissCodexDaemon()
+		DismissCodexApp()
+	})
+	listProcesses = func(context.Context) ([]proc.Process, error) {
+		var ps []proc.Process
+		for _, p := range s.running {
+			ps = append(ps, proc.Process{PID: p, Args: codexWindowsAppServer})
+		}
+		return ps, nil
+	}
+	now := time.Now()
+	idle := func() (int, time.Time) { return 0, now.Add(-time.Minute) }
+	step := func() []int { return codexAppStep(context.Background(), now, idle) }
+
+	s.running = []int{60}
+	if got := step(); got != nil {
+		t.Fatalf("nothing changed: ended %v", got)
+	}
+	noteCodexSwitch("a@x", "b@x")
+	s.turnOpen = true
+	if got := step(); got != nil {
+		t.Fatalf("a turn open in Codex's sessions: ended %v", got)
+	}
+	s.turnOpen = false
+	if got := step(); !slices.Equal(got, []int{60}) {
+		t.Fatalf("switched, idle: ended %v, want [60]", got)
+	}
+	if got := step(); got != nil {
+		t.Fatalf("the new app-server read the new account as it started: ended %v", got)
+	}
+	codexDaemonMu.Lock()
+	codexDaemonChecked = time.Time{}
+	codexDaemonMu.Unlock()
+	if got := CodexAppStale(); got != "" {
+		t.Fatalf("still said to be on %q after its restart", got)
+	}
+}
+
+// The Agents row's Restart ends only the app-server the app at the bundle
+// runs for itself, and leaves its window, the app itself, another
+// program's --listen server and another bundle's alone (yoshi037070: a
+// quit and open opened a new window).
+func TestRestartCodexAppEndsOnlyItsServer(t *testing.T) {
+	const bundle = "/Applications/ChatGPT.app"
+	ps := []proc.Process{
+		{PID: 1, Args: bundle + "/Contents/MacOS/ChatGPT"},
+		{PID: 2, Args: bundle + "/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex -c features.code_mode_host=true app-server --analytics-default-enabled"},
+		{PID: 3, Args: bundle + "/Contents/Resources/codex app-server --listen ws://127.0.0.1:4500"},
+		{PID: 4, Args: "/Applications/Codex.app/Contents/Resources/codex app-server"},
+		{PID: 5, Args: "/opt/homebrew/bin/codex app-server"},
+		{PID: 6, Args: bundle + "/Contents/Resources/codex exec-server --remote x"},
+	}
+	oldList, oldEnd, oldWait := listProcesses, endCodexAppServer, codexAppGoneWait
+	t.Cleanup(func() { listProcesses, endCodexAppServer, codexAppGoneWait = oldList, oldEnd, oldWait })
+	listProcesses = func(context.Context) ([]proc.Process, error) { return slices.Clone(ps), nil }
+	var ended []int
+	endCodexAppServer = func(pid int) error {
+		ended = append(ended, pid)
+		ps = slices.DeleteFunc(ps, func(p proc.Process) bool { return p.PID == pid })
+		return nil
+	}
+	if err := RestartCodexApp(context.Background(), bundle); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(ended, []int{2}) {
+		t.Fatalf("ended %v, want only the app's own app-server 2", ended)
+	}
+
+	// none running: said
+	ended = nil
+	if err := RestartCodexApp(context.Background(), "/Applications/Other.app"); err == nil || len(ended) > 0 {
+		t.Fatalf("no app-server: %v, ended %v", err, ended)
+	}
+
+	// one that doesn't end: said, not waited on forever
+	ps = append(ps, proc.Process{PID: 7, Args: bundle + "/Contents/Resources/codex app-server"})
+	endCodexAppServer = func(pid int) error { ended = append(ended, pid); return nil }
+	codexAppGoneWait = 300 * time.Millisecond
+	if err := RestartCodexApp(context.Background(), bundle); err == nil {
+		t.Fatal("an app-server that stays: no error")
 	}
 }

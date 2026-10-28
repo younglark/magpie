@@ -21,7 +21,8 @@ five languages on Chromium and WebKit.
 family/style fixtures: independent traits, literal names, search and keyboard
 selection, rapid queued saves and rollback, reload, unavailable faces,
 discovery failure and refresh, empty collections, platform fallback,
-Omarchy precedence and browser-mode isolation. It checks narrow windows and
+Omarchy precedence, and a browser tab's own choice (kept in the browser,
+from the families it draws, never the app's). It checks narrow windows and
 no scroll on click in Chromium and WebKit, in English and Chinese.
 `ARTIFACT_DIR` retains screenshots; `MAGPIE_FONT_ASSETS` can point to an older
 asset directory to verify that the test fails on the missing picker.
@@ -1115,6 +1116,14 @@ folds them again without moving the page, and is remembered across a
 reload; DeepSeek's keys fold too, four keys aren't folded, a subscription's
 accounts aren't keys, an unread key leaves the sum out, and at 440px nothing
 is cut; in Chromium and WebKit, English and Chinese.
+
+`usage-shared-balance.test.cjs` checks that keys found to read one account's
+balance (`sharedBalance`, mimi on Discord: a site's three keys each showed
+the account's $8.39 and its curve) show it once: one row with one balance
+and one curve, "+2 keys" beside the key with the keys on hover, and the
+head's sum counting the account once; a key with the same amount not found
+to be that account's, and another provider's keys, stay their own rows, and
+at 440px nothing is cut; in Chromium and WebKit, English and Chinese.
 
 `upstream-status.test.cjs` checks the vendors' status pages on the
 Providers and Usage pages (#971): with Anthropic's page saying its API is
@@ -2522,3 +2531,14 @@ does. Both engines, at 440px. The reckoning itself is covered by
 `TestHistoricalWindowHoldsUsesEachWindowsOwnReading`,
 `TestWindowHoldsResetBeforeRefillReading` and
 `TestWindowHoldsDryAgainAfterReset`.
+
+## Browser access
+
+`browser-access.test.cjs` checks Settings › Network and sharing › Browser
+access, the app's own page served to a browser: Off, This computer and
+Local network posted to `/api/web-page`, the link shown with its key as
+"…" and copied whole, New key, the port with Apply and a taken port's
+reason, the "Not encrypted" row on the local network, no native select or
+left border, nothing wider or cut off at 360px, and no such section (nor a
+read of it) in a browser on the page. Every language, Chromium and WebKit,
+with the API faked.

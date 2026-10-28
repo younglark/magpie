@@ -2504,8 +2504,9 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .accts { display: grid; grid-template-columns: minmax(0, 1fr); border: 1px solid var(--line); border-radius: 10px; background: var(--card); overflow: hidden; }
 .acc { display: flex; align-items: center; gap: 9px; min-height: 38px; padding: 5px 8px 5px 11px; font-size: 12.5px; text-align: left; }
 .acc + .acc, .accts .signing { border-top: 1px solid var(--line-2); }
-.editor .accts .keep-login, .editor .accts .switch-only { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-height: 34px; padding: 6px 11px; font-size: 12px; border-top: 1px solid var(--line-2); }
+.editor .accts .keep-login, .editor .accts .switch-only, .editor .accts .pool-ends { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-height: 34px; padding: 6px 11px; font-size: 12px; border-top: 1px solid var(--line-2); }
 .editor .accts .keep-login .keep-as { max-width: 240px; }
+.editor .accts .pool-ends .note { flex-basis: 100%; color: var(--fg-2); }
 .acc .n { font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acc .plan { color: var(--muted); font-size: 11px; padding: 1px 6px; border-radius: 5px; background: var(--pill); white-space: nowrap; }
 .acc .grow { flex: 1; }
@@ -3294,6 +3295,7 @@ body:not(.side-nav) #view-settings .set-head.stuck::before { box-shadow: 0 1px 0
 .set-searching .feat-say { display: none; }
 .row.pref .sub.feat-why { color: var(--muted); font-size: 11px; }
 /* the local model's row says a download, a device or an error in full */
+#privacyModelRow .val { gap: 8px; }
 #privacyModelRow .sub { white-space: normal; overflow-wrap: anywhere; }
 /* Privacy › how it's found: the rules, always on while anything is masked,
    and the local model, which says why it can't be used while nothing is */
@@ -3530,6 +3532,17 @@ input.words.search-key, input.words.search-url { flex: 1 1 120px; width: auto; m
 .row.pref.lan-address-row { position: relative; height: 50px; transition: height .28s var(--ease); }
 .row.pref.lan-address-row .who { position: absolute; top: 16px; left: 14px; }
 .prefs .lan-address-row .val { max-width: 64%; }
+/* Browser access: a link per address, each with its copy button */
+.prefs .web-page-link-row .val { max-width: 64%; gap: 6px; }
+.web-page-links { display: flex; flex-direction: column; align-items: flex-end; min-width: 0; }
+.web-page-link { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; }
+.row.pref.web-page-warn .name { color: var(--amber); }
+/* three choices leave the words no room in a narrow window: they go under */
+@media (max-width: 600px) {
+  .row.pref.web-page-mode { flex-wrap: wrap; row-gap: 8px; }
+  .row.pref.web-page-mode .who { flex: 1 1 100%; }
+  .prefs .web-page-mode .val { max-width: 100%; }
+}
 .lan-address-controls { position: absolute; inset: 0; pointer-events: none; }
 .lan-address-controls > * { position: absolute; pointer-events: auto; }
 .row.pref .proto.pick.lan-interface { top: 13px; right: 40px; width: 240px; max-width: calc(100% - 40px); margin-left: 0; font: var(--code-style, normal) var(--code-weight, 400) 12px var(--code-font, var(--code)); font-stretch: var(--code-stretch, 100%); transition: top .28s var(--ease), background .12s, color .12s; }
@@ -4221,7 +4234,7 @@ body.window .row + .row.agent.conn > .who { min-height: 41px; } /* the line abov
 .ag-stale-copy .ag-quiet { height: 20px; margin-left: 4px; padding: 0 6px; vertical-align: middle; }
 .ag-stale-copy .ag-quiet.busy { opacity: .6; cursor: progress; }
 .ag-hint { font-size: 12px; color: var(--muted); }
-.ag-tier { width: 70px; flex: none; font-size: 12px; color: var(--fg-2); }
+.ag-tier { width: 70px; flex: none; font-size: 12px; color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ag-vl .field.ag-pick { width: 220px; justify-content: flex-start; }
 .ag-vl .field.ag-eff { flex: none; }
 /* the subagents' effort, while they are on Claude Code's pick: Default, dimmed, as a macOS control that can't be used yet */
@@ -4357,3 +4370,6 @@ body .row.agent .ag-prefs .row.pref .who { display: block; }
 :is(.ag-prefs, .agent-prefs) .compact-at { flex: 0 1 auto; min-width: 0; flex-wrap: wrap; row-gap: 6px; }
 /* Settings' search finds them; not searching, the links stay out */
 #view-settings:not(.set-searching) #agentPrefLinks { display: none; }
+.sess-pick.led-more { padding: 0 6px; }
+.sess-pick.led-more svg { transform: none; }
+.sess-tools .led-rename { flex: none; width: 180px; height: 26px; padding: 0 8px; border-radius: 7px; font-size: 12px; }
