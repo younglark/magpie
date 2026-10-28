@@ -2548,8 +2548,13 @@ function goneSaid(a) {
 let installsOpen = null; // null: as the list has it (open with no agents)
 const VIA = { script: "Installer", powershell: "PowerShell", brew: "Homebrew", npm: "npm" };
 
+let pluginAgents = []; // the names of the agents a suggested plugin adds, not installed
+
 async function loadInstalls() {
   if (mode === "panel") return;
+  // the plugins' agents come from the market, which may be fetched: the
+  // commands aren't held for them
+  api("plugins/agents").then((r) => { pluginAgents = Array.isArray(r) ? r : []; paintInstalls(); }, () => {});
   let r;
   try { r = await api("agents/install"); } catch { return; } // it just isn't shown
   installInfo = Array.isArray(r) ? r : [];
@@ -2586,7 +2591,7 @@ function paintInstalls() {
   // one listed above by its settings alone, its CLI gone (#843), is
   // offered again too
   const items = installInfo.filter((x) => x.missing || !here.has(x.id));
-  if (!items.length) { box?.remove(); return; }
+  if (!items.length && !pluginAgents.length) { box?.remove(); return; }
   if (!box) {
     box = el("section", "ag-install");
     box.id = "agentsInstall";
@@ -2597,7 +2602,7 @@ function paintInstalls() {
   head.type = "button";
   head.setAttribute("aria-expanded", String(open));
   head.dataset.unrolls = ""; // it stays put, and its commands open beneath it
-  head.append(el("span", "", t("Install another agent ({n})", { n: items.length })), el("span", "chev", svg(CHEV, 10, 1.8)));
+  head.append(el("span", "", t("Install another agent ({n})", { n: items.length + pluginAgents.length })), el("span", "chev", svg(CHEV, 10, 1.8)));
   head.onclick = (e) => {
     e.stopPropagation();
     installsOpen = !open;
@@ -2606,7 +2611,7 @@ function paintInstalls() {
   };
   const parts = [head];
   if (open) {
-    parts.push(el("p", "ag-install-note", installNote(items)));
+    if (items.length) parts.push(el("p", "ag-install-note", installNote(items)));
     for (const x of items) {
       const r = el("div", "ag-install-row");
       r.dataset.id = x.id;
@@ -2629,8 +2634,33 @@ function paintInstalls() {
       r.append(who, cmds);
       parts.push(r);
     }
+    // the agents plugins add, installed from Plugins as every plugin is
+    if (pluginAgents.length) parts.push(pluginAgentsRow());
   }
   box.replaceChildren(...parts);
+}
+
+function pluginAgentsRow() {
+  const r = el("button", "ag-install-row ag-install-plugins");
+  r.type = "button";
+  const who = el("div", "ag-install-who");
+  const ic = el("span", "puzzle");
+  ic.append(svg(PUZZLE, 15, 1.4));
+  const name = el("span", "ag-install-name");
+  name.append(el("b", "", t("More in Plugins")));
+  who.append(ic, name);
+  const names = el("span", "ag-install-pnames", pluginAgents.join(t(", ")));
+  r.append(who, names, el("span", "chev", svg(CHEV_R, 11, 1.6)));
+  r.title = t("Agents magpie has no setup of its own for: install a plugin for one in the Plugins tab, and it is listed here");
+  r.onclick = (e) => openPluginAgents(e);
+  return r;
+}
+
+// openPluginAgents: the Plugins tab, at its Agents
+async function openPluginAgents(e) {
+  if (mode !== "window") { api("window/main?view=plugins", {}).catch(() => {}); return; }
+  if (!await show("plugins")) return;
+  window.pluginAgentsTo?.(e);
 }
 
 // ---------- the agents' order, and the ones put away ----------
@@ -4242,7 +4272,7 @@ function updatePath(p) {
 async function renderUpdateBadge() {
   const b = $("#update"), label = b.querySelector("span");
   const u = await api(updatePath("update")).catch(() => null);
-  if (u) updateLast = u;
+  if (u) updateLast = u, u.at = Date.now();
   // pulling: a click is downloading it again, and restarts once it's in
   const pulling = !!u && !!b.dataset.pulling && ["checking", "downloading", "ready"].includes(u.state);
   if (b.dataset.pulling && !pulling) {
@@ -22456,25 +22486,23 @@ function editRedactRule(r, n, row) {
 }
 
 // renderUpdate fills in the version row: whether a newer magpie is out.
-// The app checks and downloads on its own, so usually the row just offers
-// the restart; a check can also be asked for. That check leaves the button
-// where it is, dimmed, and a second click does nothing. A read still out
-// from before the answer is not drawn over it. A row drawn again draws the
-// last state at once, but in a check (#3469), and reads while a check or a
-// download is under way.
+// A check asked for dims its button, ignores a second click, and isn't
+// drawn over by an older read. A row drawn again draws a state read in the
+// last 30s at once (#3469); an older one may be stale, so it waits (#4057).
 let updateBusy = false, updateLast = null;
 const updateSeq = new WeakMap(), seqOf = (r) => updateSeq.get(r) || 0;
 
 async function renderUpdate(r, u) {
   const seq = seqOf(r);
   if (u == null) {
-    const early = !updateBusy && updateLast && !r.querySelector(".sub");
+    const bare = !r.querySelector(".sub"), early = bare && !updateBusy && Date.now() - updateLast?.at < 3e4;
     if (early) renderUpdate(r, updateLast);
+    else if (bare) r.querySelector(".who").append(el("div", "sub", "\u00a0"));
     u = await api(updatePath("update?fresh=1")).catch(() => null);
     if (!u || !r.isConnected || seqOf(r) !== seq) return;
     if (early) updateSeq.set(r, seq + 1); // stops timers
   } else if (!r.isConnected) return;
-  updateLast = u;
+  updateLast = u, u.at ??= Date.now();
   const who = r.querySelector(".who"), val = r.querySelector(".val");
   const sub = who.querySelector(".sub") || who.appendChild(el("div", "sub"));
   sub.title = "";
@@ -24065,7 +24093,7 @@ function renderSideGw(g) {
   if (b.hidden) return;
   // a page other machines open (magpie web) says where they reach it,
   // MAGPIE_PUBLIC_URL, as the Gateway page does (#1551; noahhrreion)
-  const url = web && g.publicURL || g.url;
+  const url = self.sideLAN?.(g) || web && g.publicURL || g.url;
   let host = url;
   try { host = new URL(url).host; } catch {}
   b.classList.toggle("off", !g.running);
@@ -24075,7 +24103,7 @@ function renderSideGw(g) {
   // gateway leaves it no room ("Zugangspunkt") says the address alone, the
   // word kept in its tooltip
   if (g.running && s.scrollWidth > s.clientWidth) s.textContent = host;
-  b.title = g.running ? t("Gateway") + " " + url : url;
+  b.title = (g.running ? t("Gateway") + " " + url : url) + (web || url == g.url ? "" : " · " + g.url);
 }
 if (mode === "window") {
   $("#sideGw").onclick = () => { show("gateway"); $("#sideGw").blur(); };
