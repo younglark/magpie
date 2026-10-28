@@ -1,6 +1,7 @@
 package redact
 
 import (
+	_ "embed"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -30,12 +31,15 @@ const zhNotGiven = "的了在是和与跟同说他她它我你您们这那个不
 
 // zhWords begin with a surname but are words, not names: 文案 in
 // "改一下文案" is no one (zeewell on X). Each is two characters, so a
-// candidate's first two are looked up (zhWord).
+// candidate's first two are looked up (zhWord). 毛利 is a gross margin
+// (毛利低 went as a name, _kaichen on X, 10-28) and a Japanese surname
+// too (毛利兰): the rules leave both, and the model, which reads the
+// sentence, finds the name.
 var zhWords = runes2(
 	"张量", "张开", "张贴", "高度", "高效", "高级", "高速", "高亮", "高手", "高兴", "王国", "王者",
 	"黄河", "黄色", "方法", "方向", "方式", "方案", "方便", "方面", "程序", "程度", "温度", "白色",
 	"金额", "金融", "江湖", "石头", "马上", "周期", "周末", "周围", "周边", "文件", "文本", "文档",
-	"文字", "文章", "余额", "安全", "安装", "安排", "钱包", "叶子", "毛病", "万一", "雷达", "宋体",
+	"文字", "文章", "余额", "安全", "安装", "安排", "钱包", "叶子", "毛病", "毛利", "毛重", "毛坯", "毛巾", "毛衣", "万一", "雷达", "宋体",
 	"常量", "常用", "常见", "向量", "向上", "全部", "全局", "全面", "史上", "易用", "武器", "时间",
 	"时候", "明天", "明确", "明白", "任何", "任务", "任意", "华为", "管理", "简单", "简介", "范围",
 	"许多", "许可", "包括", "包含", "关于", "关系", "关闭", "连接", "成功", "成为", "应用", "应该",
@@ -54,7 +58,74 @@ var zhWords = runes2(
 	"符号", "景色", "费用", "舒服", "辛苦", "纪律", "席位", "车间", "管道", "何时", "何况", "于是",
 	"余下", "杜绝", "罗列", "程式", "叶片", "涂层", "沙发", "池子", "巩固", "迟到", "仲裁", "钟点",
 	"钟表", "向导", "史诗", "易懂", "马路", "马虎", "汤汁", "朱红", "阳光", "任职", "董事",
+	"边距", "边栏", "尚需",
 )
+
+// zhDict are some 1,500 more such words, from a dictionary
+// (zhdict.txt says which and how): 边界, 应该, 尚可, 关心, 高兴.
+//
+//go:embed zhdict.txt
+var zhDictText string
+
+var zhDict = func() map[string]bool {
+	m := map[string]bool{}
+	for _, l := range strings.Split(zhDictText, "\n") {
+		if strings.HasPrefix(l, "#") {
+			continue
+		}
+		for _, w := range strings.Fields(l) {
+			m[w] = true
+		}
+	}
+	return m
+}()
+
+// zhColours are the colour characters: a word of them alone (黄绿, 红蓝)
+// or one that ends in 色 (黄绿色, 金黄色, 红色) is a colour, no name.
+// 青 is left out, a given name's as often (王青).
+const zhColours = "红橙黄绿蓝紫黑白灰褐棕粉赤"
+
+// zhNounEnds are what makes a word a longer one (关键 → 关键词, 边界 →
+// 边界线, 毛利 → 毛利率), and no given name ends with (毛利兰 does not).
+const zhNounEnds = "词字性率值码型键框栏库器类表量度点线层期区图版式页数论员价计费件名夹帧戳"
+
+// zhWordShaped says v, a Chinese name the model or the cues took, is an
+// ordinary word: a colour (黄绿色, hh05928822 on X), a word that starts
+// with a surname (zhWords, zhDict: 边界, 尚可), or one of those with what
+// makes a longer word after it (关键词, 关键字, wangjunxiao128 on X;
+// 应用层). The surnames stay: 黄 starts 黄绿色 and 黄晓明 both.
+func zhWordShaped(v string) bool {
+	rs := []rune(v)
+	if len(rs) < 2 {
+		return false
+	}
+	colour := true
+	for _, r := range rs {
+		if !unicode.Is(unicode.Han, r) {
+			return false
+		}
+		colour = colour && strings.ContainsRune(zhColours, r)
+	}
+	if colour || rs[len(rs)-1] == '色' {
+		return true
+	}
+	two := string(rs[:2])
+	switch len(rs) {
+	case 2:
+		return zhWords[two] || zhDict[two]
+	case 3:
+		return (zhWords[two] || zhDict[two]) && strings.ContainsRune(zhNounEnds, rs[2])
+	}
+	return false
+}
+
+// zhWordNotName says s[a:b], taken for a Chinese name, is an ordinary
+// word there (zhWordShaped): unless a role before it or a title after it
+// says a person is meant (客户方圆, 我叫高歌, 江山老师), where a name
+// that is also a word is masked.
+func zhWordNotName(s string, a, b int) bool {
+	return zhWordShaped(s[a:b]) && !endsAny(s[:a], zhRoles, true) && !startsAny(s[b:], zhTitles)
+}
 
 // zhRoles before a name say it is one: 客户陈建国, 联系人：赵丽颖,
 // 我叫黄晓明, 提交者是欧阳娜娜.
@@ -122,8 +193,10 @@ func zhFirsts() string {
 }
 
 // zhNameSpans are the Chinese names in s the model didn't find, as
-// PERSON spans; person are those it did.
-func zhNameSpans(s string, person []span) []span {
+// PERSON spans; person are those it did. With nicks, only a nickname
+// (小王, 老李): AstrLink Guard finds the rest itself, and the cues here
+// took words for names it didn't (关键发现, 易触发; xuanwo on X).
+func zhNameSpans(s string, person []span, nicks bool) []span {
 	if !hasHan(s) {
 		return nil
 	}
@@ -135,12 +208,15 @@ func zhNameSpans(s string, person []span) []span {
 			i += n
 			continue
 		}
+		i = b
+		if nicks && !zhNick(s[a:b]) || zhWordNotName(s, a, b) {
+			continue // a word, nor joined to a name: 张伟和边界
+		}
 		kind := ""
 		if ok {
 			kind = "PERSON"
 		}
-		cs = append(cs, span{a, b, kind, ByModel})
-		i = b
+		cs = append(cs, span{a, b, kind, ByModel, 0})
 	}
 	// a name joined by 和, 与, 跟, 及 or 、 to one that is a name is one
 	// too: 李娜和刘洋, where only 刘洋 has a word after it that says so
@@ -169,6 +245,13 @@ func zhNameSpans(s string, person []span) []span {
 		}
 	}
 	return out
+}
+
+// zhNick says name is a nickname: 小 or 老 and a surname (小王, 老李).
+func zhNick(name string) bool {
+	r, n := utf8.DecodeRuneInString(name)
+	r2, n2 := utf8.DecodeRuneInString(name[n:])
+	return (r == '小' || r == '老') && isNick[r2] && n+n2 == len(name)
 }
 
 // joined says only 和, 与, 跟, 及 or 、 is between c and a name, one

@@ -216,6 +216,9 @@ function notJSON(res, text) {
   return t("A proxy in front of magpie answered, not magpie ({what})", { what });
 }
 
+// blurOnEnter has Enter in a field commit it (by blur), its keys kept from the page
+const blurOnEnter = (i) => { i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") i.blur(); }; };
+
 // el makes a tag with a class and its content: text, or a node put inside
 // it as it is, never written out as "[object HTMLButtonElement]" (#2181).
 function el(tag, cls, text) {
@@ -360,6 +363,8 @@ function icon(name, lazy) {
   return e;
 }
 
+// a change done: its line, with the agent's notice (a warning) when there is one
+const saidOk = (msg, ms) => state.notice ? status(withNotice(msg, state.notice), "warn", 9000) : status(msg, "ok", ms);
 function status(msg, kind = "", ms = kind === "err" ? 8000 : 3500) {
   const s = $("#status");
   s.textContent = msg;
@@ -1156,9 +1161,7 @@ function connectSwitch(a) {
       state = await api("agents/connect/" + a.id, {});
       renderAgents();
       const msg = connectedSaid(a, state.connected);
-      if (state.notice) status(withNotice(msg, state.notice), "warn", 9000);
-      else if (msg !== t("{agent} is connected to magpie", { agent: a.name })) status(msg, "ok", 7000);
-      else status(msg, "ok");
+      saidOk(msg, msg !== t("{agent} is connected to magpie", { agent: a.name }) ? 7000 : undefined);
     } catch (err) {
       s.disabled = false;
       s.classList.remove("on");
@@ -1753,8 +1756,7 @@ async function guideConnect(a, ev) {
     guideBusy = "";
     renderAgents();
     const msg = connectedSaid(a, state.connected);
-    if (state.notice) status(withNotice(msg, state.notice), "warn", 9000);
-    else status(msg, "ok", 7000);
+    saidOk(msg, 7000);
   } catch (err) {
     guideBusy = "";
     guideRedraw();
@@ -2262,8 +2264,7 @@ function askDisconnect(a) {
       if (agentExpanded === a.id) agentExpanded = null;
       renderAgents();
       const msg = t(offline ? "Saved settings restored; magpie was removed from {agent}" : "{agent} no longer goes through magpie; its own settings are back", { agent: a.name });
-      if (state.notice) status(withNotice(msg, state.notice), "warn", 9000);
-      else status(msg, "ok");
+      saidOk(msg);
     } catch (err) {
       go.disabled = false;
       go.classList.remove("busy");
@@ -2300,8 +2301,7 @@ async function reapplyAgent(a, btn) {
     renderAgents();
     document.querySelector(`.agent[data-id="${CSS.escape(a.id)}"] .field`)?.classList.add("flash");
     const msg = t("{agent} goes through magpie again", { agent: a.name });
-    if (state.notice) status(withNotice(msg, state.notice), "warn", 9000);
-    else status(msg, "ok");
+    saidOk(msg);
   } catch (e) {
     btn?.classList.remove("busy");
     status(e.message, "err");
@@ -4775,8 +4775,7 @@ function ultracodeToggle(a, f) {
       state = await api("set", { agent: a.id, field: f.key, value: on ? "" : "on" });
       renderAgents();
       const msg = t("{agent} ultracode → {value}", { agent: a.name, value: t(on ? "off" : "on") });
-      if (state.notice) status(withNotice(msg, state.notice), "warn", 9000);
-      else status(msg, "ok");
+      saidOk(msg);
     } catch (e) { status(e.message, "err"); }
   };
   return b;
@@ -5058,8 +5057,7 @@ function effortSeg(a, f) {
 // open Claude Code session keeps the level it started with.
 function effortSaid(a, f, o) {
   const msg = `${a.name} ${t(f.label)} → ${effortName(o)}`;
-  if (state.notice) status(withNotice(msg, state.notice), "warn", 9000);
-  else status(msg, "ok");
+  saidOk(msg);
 }
 
 function renderEffortPicker() {
@@ -6842,7 +6840,8 @@ addEventListener("pointerup", (e) => {
   addEventListener("click", seen, true);
   setTimeout(() => {
     removeEventListener("click", seen, true);
-    if (!clicked && b.isConnected) b.click();
+    // its newest self: b, or what a draw since put there (#3922)
+    if (!clicked) [...document.querySelectorAll(".segs")].find((x) => segsWho(x) === p.who)?.querySelectorAll(":scope > .opt")[p.i]?.click();
   });
 }, true);
 
@@ -8302,7 +8301,8 @@ const SPRING = CSS.supports?.("animation-timing-function", "linear(0, 1)")
   : "cubic-bezier(.2, .9, .25, 1.02)";
 const IOS_EASE = "cubic-bezier(.32, .72, 0, 1)";
 // a declaration, so code above it can ask too
-function calm() { return matchMedia("(prefers-reduced-motion: reduce)").matches; }
+// the system's Reduce Motion, or Settings' (#3813)
+function calm() { return document.documentElement.dataset.motion === "reduce" || matchMedia("(prefers-reduced-motion: reduce)").matches; }
 // magpie's bird in parts, its wing and tail free to move (the header's logo
 // holds the shapes)
 const BIRD = `<svg viewBox="0 0 44 44"><use href="#bird" clip-path="url(#bird-body)"/><g class="tail"><use href="#bird" clip-path="url(#bird-tail)"/></g><g class="wing"><use href="#bird" clip-path="url(#bird-wing)"/></g></svg>`;
@@ -11231,7 +11231,7 @@ function renderModels(p) {
         i.inputMode = "decimal";
         i.dataset.part = k;
         i.setAttribute("aria-label", label);
-        i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") i.blur(); };
+        blurOnEnter(i);
         i.onchange = () => takePrice();
         return i;
       };
@@ -12017,6 +12017,8 @@ function importSay(agent) {
   };
 }
 let signing = null; // the sign-in under way: { id, agent, url, state, installing, error }
+// stopSignIn tells the server the sign-in under way is given up
+const stopSignIn = () => { if (signing?.id) api("signin/" + signing.id + "/cancel", {}).catch(() => {}); };
 const signingOpen = () => signing?.state === "waiting" || signing?.state === "installing";
 let justAdded = ""; // the account that just came in, to greet it
 
@@ -12321,7 +12323,7 @@ function renderStepPlan(sp, id) {
 }
 
 function cancelSignIn() {
-  if (signing?.id) api("signin/" + signing.id + "/cancel", {}).catch(() => {});
+  stopSignIn();
   if (signing?.behind) api("signin/" + signing.behind + "/cancel", {}).catch(() => {});
   signing = null;
   renderProviders();
@@ -12435,7 +12437,7 @@ function copilotHostSwitch(sub) {
   b.title = site ? t("Signing in on {host}", { host: site }) : t("An account of an enterprise on GitHub Enterprise Cloud with data residency signs in at its <name>.ghe.com");
   b.onclick = () => {
     if (site) return startSignIn("copilot", true); // which ends this one
-    if (signing?.id) api("signin/" + signing.id + "/cancel", {}).catch(() => {});
+    stopSignIn();
     signing = { agent: "copilot", state: "ghe" };
     renderProviders();
   };
@@ -12699,7 +12701,7 @@ function renderSigning(sub) {
     const k = el("button", "link", t("Use an API key instead"));
     k.title = t("If the page can't reach magpie (it runs on a server or in Docker)");
     k.onclick = () => {
-      if (signing?.id) api("signin/" + signing.id + "/cancel", {}).catch(() => {});
+      stopSignIn();
       startPluginSignIn(sub, keyWay);
     };
     acts.append(k);
@@ -12713,7 +12715,7 @@ function renderSigning(sub) {
     const acts = tt.querySelector(".acts") || tt.appendChild(el("span", "acts"));
     const other = el("button", "link other-ways", t("Other ways to sign in…"));
     other.onclick = () => {
-      if (signing?.id) api("signin/" + signing.id + "/cancel", {}).catch(() => {});
+      stopSignIn();
       signing = { agent: sub.agent, state: "method" };
       renderProviders();
     };
@@ -13525,6 +13527,26 @@ const CAP_SHARES = [50, 60, 70, 80, 90];
 // account was found to stand in for, the name it goes by till it has one.
 function accountNameOf(p, user) { return p?.accountNames?.[String(user).toLowerCase()] || ""; }
 function accountSeatOf(p, user) { return p?.accountSeats?.[String(user).toLowerCase()] || ""; }
+// renameIn edits a name in place of at: Enter saves it changed, Escape
+// keeps it. Once: Enter or Escape draws the editor again, and the blur
+// that follows (Chromium's, as the redraw takes the input out) does nothing,
+// rather than draw it again inside that draw or save on Escape (#3944)
+function renameIn(at, own, hint, save) {
+  const i = input(own, hint);
+  let over = false;
+  const done = (ok) => {
+    if (over) return;
+    over = true;
+    if (ok && i.value.trim() !== own) save(i.value);
+    else renderProviders();
+  };
+  i.className = "rename-in";
+  i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") done(true); else if (e.key === "Escape") done(false); };
+  i.onblur = () => done(true);
+  at.replaceWith(i);
+  i.focus();
+  return i;
+}
 // accountNameButton is the account's name on its editor row: the name of
 // its own, the account beside it, and a click renames it.
 function accountNameButton(p, user) {
@@ -13540,21 +13562,7 @@ function accountNameButton(p, user) {
   name.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); name.onclick(); } };
   name.onclick = () => {
     if (String(getSelection?.() || "").length) return;
-    const i = input(own, seat || t("Name, e.g. Personal or Team"));
-    i.className = "rename-in";
-    i.maxLength = 64;
-    // once: Enter re-renders the row, and the input's blur then follows
-    let over = false;
-    const done = (save) => {
-      if (over) return;
-      over = true;
-      if (save && i.value.trim() !== own) accountAction("provider/accountname", { id: p.id, account: user, alias: i.value });
-      else renderProviders();
-    };
-    i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") done(true); else if (e.key === "Escape") done(false); };
-    i.onblur = () => done(true);
-    wrap.replaceWith(i);
-    i.focus();
+    renameIn(wrap, own, seat || t("Name, e.g. Personal or Team"), (alias) => accountAction("provider/accountname", { id: p.id, account: user, alias })).maxLength = 64;
   };
   wrap.append(name);
   if (own) wrap.append(el("span", "acct-user", user));
@@ -13621,12 +13629,13 @@ function directNote(agent) {
   return t("{agent} is signed in to this account and asks its vendor itself, not through magpie, so with no other account on to move it to, {agent} goes on using it past the cap. Add another account, or pick {agent}'s models via magpie, for the cap to hold it", { agent });
 }
 function capHeldNote(held, cap, several, direct) {
+  const back = held.back ? " · " + resetText(new Date(held.back), new Date(held.back).toLocaleString(intlLang())) : "";
   if (direct) {
     // the account is held for what goes through magpie, but the agent
     // signed in to it isn't: the note doesn't say it is safe at its cap
     const n = el("span", "using acap-held acap-direct", t("At its cap · {agent} still uses it", { agent: direct }));
     n.title = t("A usage window is at {n}%, past this account's {cap}% cap: requests through magpie are refused with a usage-cap error until it renews", { n: Math.round(held.used), cap })
-      + (held.back ? " · " + resetText(new Date(held.back), new Date(held.back).toLocaleString(intlLang())) : "")
+      + back
       + "\n" + directNote(direct);
     return n;
   }
@@ -13634,13 +13643,13 @@ function capHeldNote(held, cap, several, direct) {
     const names = held.some.join(", ");
     const n = el("span", "using acap-held", held.back ? t("{names} at its cap · back {in}", { names, in: untilText(held.back) }) : t("{names} at its cap", { names }));
     n.title = t("{names} is at {n}%, past this account's {cap}% cap, so magpie sends the requests it counts to the other accounts until it renews; other models still use this account", { names, n: Math.round(held.used), cap })
-      + (held.back ? " · " + resetText(new Date(held.back), new Date(held.back).toLocaleString(intlLang())) : "")
+      + back
       + (several ? "" : "\n" + t("With no other account on, those requests are refused with a usage-cap error until then"));
     return n;
   }
   const n = el("span", "using acap-held", held.back ? t("At its cap · back {in}", { in: untilText(held.back) }) : t("At its cap"));
   n.title = t("A usage window is at {n}%, past this account's {cap}% cap, so magpie counts it as used up and sends requests to the other accounts until that window renews", { n: Math.round(held.used), cap })
-    + (held.back ? " · " + resetText(new Date(held.back), new Date(held.back).toLocaleString(intlLang())) : "")
+    + back
     + (several ? "" : "\n" + t("With no other account on, requests are refused with a usage-cap error until then"));
   return n;
 }
@@ -14225,18 +14234,7 @@ function renderKeyAccounts(p) {
     dot.onclick = () => accountAction("keys/" + (k.on ? "off" : "on"), { id: p.id, ref: k.id });
     const name = el("button", "n rename" + (k.name ? "" : " mono"), k.name || k.masked);
     name.title = t("Rename");
-    name.onclick = () => {
-      const i = input(k.name, t("Name, e.g. Personal or Team"));
-      i.className = "rename-in";
-      const done = (save) => {
-        if (save && i.value.trim() !== (k.name || "")) accountAction("keys/rename", { id: p.id, ref: k.id, name: i.value });
-        else renderProviders();
-      };
-      i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") done(true); else if (e.key === "Escape") done(false); };
-      i.onblur = () => done(true);
-      name.replaceWith(i);
-      i.focus();
-    };
+    name.onclick = () => renameIn(name, k.name || "", t("Name, e.g. Personal or Team"), (n) => accountAction("keys/rename", { id: p.id, ref: k.id, name: n }));
     row.append(dot, name);
     if (k.name) row.append(el("span", "plan mono", k.masked));
     // a key rotated at the vendor (#1869): its new value pasted in place,
@@ -14672,6 +14670,8 @@ function placeMenu(box, anchor, align = "left", dx = 0) {
   box.style.left = Math.max(pad, Math.min(left, innerWidth - w - pad)) + "px";
   box.style.top = Math.max(top, y) + "px";
 }
+// no tick column with nothing to tick (#4020)
+const bareTicks = (box, items) => box.classList.toggle("pm-bare", !items.some((b) => b.matches(".on, [role=menuitemcheckbox]")));
 function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key speaks", cls = "", align = "left", live = false, search = "") {
   closeProtoMenu();
   const multi = Array.isArray(value);
@@ -14719,6 +14719,7 @@ function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key sp
     box.append(b);
     return b;
   });
+  bareTicks(box, items);
   if (filter) filter.oninput = () => {
     const q = filter.value.trim().toLocaleLowerCase();
     items.forEach((b, i) => { b.hidden = !opts[i].always && !opts[i].name.toLocaleLowerCase().includes(q); });
@@ -17858,6 +17859,23 @@ function askReset(q) {
 }
 // closes a confirmation, nothing more (its Cancel, or an OK that only dismisses)
 function cancelAsk(e) { e.stopPropagation(); closeConfirmAsk(); }
+// THIRD_PARTY_NOTICES, which every build carries
+async function showNotices() {
+  let text;
+  try { text = (await api("notices")).text; } catch (e) { status(e.message, "err"); return; }
+  const ed = el("div", "editor wide notices");
+  const head = el("div", "ehead");
+  head.append(el("b", "", t("Open-source licenses")));
+  const bar = el("div", "bar");
+  const ok = el("button", "text primary", t("Done"));
+  ok.onclick = cancelAsk;
+  bar.append(el("span", "grow"), ok);
+  ed.append(head, el("pre", "notices-text", text), bar);
+  confirmAsk = ed;
+  openModal(ed);
+  $("#modal").classList.add("lib");
+  ok.focus({ preventScroll: true });
+}
 function closeConfirmAsk() {
   if (!confirmAsk) return;
   // Escape and the backdrop must not expose row actions while a bulk write
@@ -18758,6 +18776,7 @@ function openSessCombo(anchor, all, opts, value, choose, head) {
     const cur = !words.length && value && !shown.some((o) => o.v === value) && opts.find((o) => o.v === value);
     items = [...(words.length ? [] : [{ v: "", name: t(all), note: "" }]), ...(cur ? [cur] : []), ...shown].map(item);
     list.replaceChildren(...items);
+    bareTicks(box, items);
     if (!hit.length) list.append(el("div", "sc-none", t("No match")));
     else if (hit.length > shown.length) list.append(el("div", "sc-more", t("{n} more — type to narrow", { n: fmtN(hit.length - shown.length) })));
   };
@@ -18877,9 +18896,10 @@ async function loadFonts(refresh = false) {
   if (fontFlight || (fontList !== null && !refresh)) return fontFlight;
   fontListError = false;
   fontFlight = api("fonts" + (refresh ? "?refresh=1" : ""))
-    .then((list) => {
+    .then(async (list) => {
       if (!Array.isArray(list)) throw new Error("invalid font collection");
-      window.desktopFonts.catalogue(fontList = web ? window.desktopFonts.here(list) : list);
+      // a browser tab's own fonts: only a tab loads webfonts.js
+      window.desktopFonts.catalogue(fontList = web ? await import("./webfonts.js").then(() => webFonts.list(list)) : list);
       window.desktopFonts.apply(fontChoices(prefs || window.bootPrefs));
     })
     .catch(() => { fontListError = true; })
@@ -18931,9 +18951,10 @@ function renderFonts(s) {
     paint(style, chosen?.name || t("System default"), "Font style");
     style.disabled = !family?.styles.length;
     row.querySelector(".font-preview").textContent = t("Aa 0123 · 中文");
-    pill.onclick = (e) => {
+    pill.onclick = async (e) => {
       e.stopPropagation();
       if (pill.classList.contains("open")) return closeProtoMenu();
+      if (web) await window.webFonts?.ask();
       const options = [{ v: "", name: t("System default"), note: "", literalName: true },
         ...(fontList || []).map((f) => ({ v: "family:" + f.name, name: f.name, note: "", literalName: true })),
         { v: "refresh", name: t("Refresh fonts"), note: fontListError ? t("Couldn't read installed fonts") : "", literalName: true, always: true }];
@@ -18943,6 +18964,7 @@ function renderFonts(s) {
         const next = fontList.find((f) => "family:" + f.name === v);
         if (next?.styles.length) chooseFont(key, closestFont(next.styles, chosen));
       }, label, "sess-menu font-menu", "right", false, "Search fonts…");
+      if (web) window.webFonts?.typing(key);
     };
     style.onclick = (e) => {
       e.stopPropagation();
@@ -18974,6 +18996,7 @@ function applyPrefs(s, rate) {
       if (applyPrefs.ready) { tintPanel(450); tintTitleBar(460); }
     }
   }
+  if (!!s.reduceMotion !== (root.dataset.motion === "reduce")) window.holdStill(!!s.reduceMotion);
   if (!!s.colorblind !== !!root.dataset.colorblind) {
     if (s.colorblind) root.dataset.colorblind = "1";
     else delete root.dataset.colorblind;
@@ -19417,6 +19440,8 @@ function renderSettings() {
   $("#themeSegs").replaceChildren(segs(THEMES.map(([id, name]) => [id, t(name)]), s.theme, (theme) => savePrefs({ ...keep, theme })));
   $("#colorblindSegs").title = t("Colorblind-safe chart colors, and each allowance window's line in a dash of its own");
   $("#colorblindSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.colorblind ? "on" : "off", (v) => savePrefs({ ...keep, colorblind: v === "on" })));
+  $("#reduceMotionSegs").title = t("Animations stand still, as with the system's Reduce Motion, so magpie keeps the computer less busy");
+  $("#reduceMotionSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.reduceMotion ? "on" : "off", (v) => savePrefs({ ...keep, reduceMotion: v === "on" })));
   renderLangPick(s, keep);
   renderGatewayMode(s);
   // a browser tab has its own zoom, and magpie leaves it to it
@@ -19602,6 +19627,9 @@ function renderSettings() {
   const site = el("button", "text", t("Open"));
   site.onclick = () => api("open", { url: "https://usemagpie.ai" }).catch(() => {});
   row(t("Website"), t("downloads, docs and what's new"), "usemagpie.ai", site);
+  const lic = el("button", "text", t("View"));
+  lic.onclick = showNotices;
+  row(t("Open-source licenses"), t("the notices of the code and data magpie is built with"), "", lic);
   const join = el("button", "discord");
   join.innerHTML = DISCORD_SVG;
   join.append(el("span", "", t("Join Discord")));
@@ -20614,7 +20642,7 @@ function renderWarmAt(box, sub, ats, onReset, via, save) {
     const i = input(at, "06:00", "time");
     i.className = "at";
     i.setAttribute("aria-label", t("Time of day"));
-    i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") i.blur(); };
+    blurOnEnter(i);
     i.onchange = () => { if (i.value && i.value !== at) save(ats.map((a, k) => (k === n ? i.value : a))); };
     one.append(i);
     if (ats.length > 1) {
@@ -20731,7 +20759,7 @@ function renderWarmAtOwn(s) {
       const i = input(at, "06:00", "time");
       i.className = "at";
       i.setAttribute("aria-label", t("{who}'s time of day", { who: user }));
-      i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") i.blur(); };
+      blurOnEnter(i);
       i.onchange = () => { if (i.value && i.value !== at) save(user, i.value); };
       box.append(i);
     }
@@ -20766,7 +20794,7 @@ function renderAlerts(s, keep) {
       i.className = "at num";
       i.inputMode = "decimal";
       i.setAttribute("aria-label", label);
-      i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") i.blur(); };
+      blurOnEnter(i);
       i.onchange = () => {
         const n = Number(i.value);
         if (!ok(n)) { i.value = String(value); return; }
@@ -20958,83 +20986,50 @@ function modelOpt(x) {
   return { value: x.id, label: x.name || x.id, note: x.providerName, icon: x.icon, group: x.provider ? x.providerName : ROUTING_GROUPS, ref: x.id };
 }
 
-// renderCodexDescriptions picks the model for descriptions independently
-// of titles; an empty setting preserves Codex's requested model, off
-// answers with no description.
 // a model id as "Name · Provider", else as is
 const namedIn = (models) => (id) => {
   const m = models.find((x) => x.id === id);
   return m ? `${m.name || m.id} · ${m.providerName}` : id;
 };
-function renderCodexDescriptions(s) {
+// codexSidePick is the picker for where one of Codex's side requests goes
+// (descriptions, predictions, titles): as Codex sends it, off, or a model of
+// magpie's
+function codexSidePick(s, key, aria, none, path) {
   const models = s.titleModels || [];
   const named = namedIn(models);
-  const v = s.codexDescriptions || "";
+  const v = s[key] || "";
   const b = el("button", "rt-cond on");
   b.type = "button";
-  b.setAttribute("aria-label", t("Codex thread descriptions"));
+  b.setAttribute("aria-label", t(aria));
   if (v === "off") b.append(el("span", "", t("Off")));
   else if (v) b.append(icon(models.find((x) => x.id === v)?.icon || "generic"), el("span", "", named(v)));
   else b.append(icon("generic"), el("span", "", t(SAME_SESSION)));
-  b.onclick = (ev) => openPicker({ id: "", name: "", fields: [] }, { key: "codexDescriptions", label: "model", value: v, options: [
+  b.onclick = (ev) => openPicker({ id: "", name: "", fields: [] }, { key, label: "model", value: v, options: [
     { value: "", label: t(SAME_SESSION), note: t("as Codex sends them when the session is on Codex’s own model"), icon: "generic", reset: true },
-    { value: "off", label: t("Off"), note: t("no description, nothing sent"), reset: true },
+    { value: "off", label: t("Off"), note: t(none), reset: true },
     ...models.map(modelOpt)],
   onPick: (id) => {
     if (id === v) return;
-    prefWrite(api("settings/codex-descriptions", { model: id }));
+    prefWrite(api("settings/" + path, { model: id }));
   } }, b, ev);
-  $("#codexDescriptionsPick").replaceChildren(b);
+  $("#" + key + "Pick").replaceChildren(b);
 }
+
+// renderCodexDescriptions picks the model for descriptions independently
+// of titles; an empty setting preserves Codex's requested model, off
+// answers with no description.
+function renderCodexDescriptions(s) { codexSidePick(s, "codexDescriptions", "Codex thread descriptions", "no description, nothing sent", "codex-descriptions"); }
 
 // renderCodexPredictions: where the Codex app's guess at the user's next
 // message goes (#1970) — as Codex sends it, on the thread's own model; off,
 // answered by magpie with no prediction; or to a model of magpie's.
-function renderCodexPredictions(s) {
-  const models = s.titleModels || [];
-  const named = namedIn(models);
-  const v = s.codexPredictions || "";
-  const b = el("button", "rt-cond on");
-  b.type = "button";
-  b.setAttribute("aria-label", t("Codex composer predictions"));
-  if (v === "off") b.append(el("span", "", t("Off")));
-  else if (v) b.append(icon(models.find((x) => x.id === v)?.icon || "generic"), el("span", "", named(v)));
-  else b.append(icon("generic"), el("span", "", t(SAME_SESSION)));
-  b.onclick = (ev) => openPicker({ id: "", name: "", fields: [] }, { key: "codexPredictions", label: "model", value: v, options: [
-    { value: "", label: t(SAME_SESSION), note: t("as Codex sends them when the session is on Codex’s own model"), icon: "generic", reset: true },
-    { value: "off", label: t("Off"), note: t("no prediction, nothing sent"), reset: true },
-    ...models.map(modelOpt)],
-  onPick: (id) => {
-    if (id === v) return;
-    prefWrite(api("settings/codex-predictions", { model: id }));
-  } }, b, ev);
-  $("#codexPredictionsPick").replaceChildren(b);
-}
+function renderCodexPredictions(s) { codexSidePick(s, "codexPredictions", "Codex composer predictions", "no prediction, nothing sent", "codex-predictions"); }
 
 // renderCodexTitles: where Codex's requests for a thread's title go (#705)
 // — as Codex sends them, to its own model through its ChatGPT sign-in; off,
 // answered by magpie with no title; or to a model of magpie's — set on its
 // own, as Codex's subagents are.
-function renderCodexTitles(s) {
-  const models = s.titleModels || [];
-  const named = namedIn(models);
-  const v = s.codexTitles || "";
-  const b = el("button", "rt-cond on");
-  b.type = "button";
-  b.setAttribute("aria-label", t("Codex thread titles"));
-  if (v === "off") b.append(el("span", "", t("Off")));
-  else if (v) b.append(icon(models.find((x) => x.id === v)?.icon || "generic"), el("span", "", named(v)));
-  else b.append(icon("generic"), el("span", "", t(SAME_SESSION)));
-  b.onclick = (ev) => openPicker({ id: "", name: "", fields: [] }, { key: "codexTitles", label: "model", value: v, options: [
-    { value: "", label: t(SAME_SESSION), note: t("as Codex sends them when the session is on Codex’s own model"), icon: "generic", reset: true },
-    { value: "off", label: t("Off"), note: t("no title, nothing sent"), reset: true },
-    ...models.map(modelOpt)],
-  onPick: (id) => {
-    if (id === v) return;
-    prefWrite(api("settings/codex-titles", { model: id }));
-  } }, b, ev);
-  $("#codexTitlesPick").replaceChildren(b);
-}
+function renderCodexTitles(s) { codexSidePick(s, "codexTitles", "Codex thread titles", "no title, nothing sent", "codex-titles"); }
 
 // renderCodexAutoReview: the model Codex's auto-review — the reviewer that
 // decides an approval in the user's place — runs on (#938): Codex's own pick
@@ -22026,7 +22021,7 @@ function pmSub(m) {
   if (d) return t("Downloading the model: {done} of {total}", { done: fmtBytes(d.done), total: fmtBytes(d.total) });
   const bad = (m.models || []).find((x) => x.error) || (m.error ? m : null);
   if (bad) return t("The download stopped: {error}", { error: bad.error });
-  if (m.on && m.failed) return t("The model didn't answer, so requests are held back: {error}", { error: m.failed });
+  if (m.on && m.failed) return m.chosen ? t("The model didn't answer, so requests are held back: {error}", { error: m.failed }) : t("The model didn't answer, so the rules mask requests alone: {error}", { error: m.failed });
   if (m.on && m.running) {
     if (m.gpu) return t("On, on the GPU ({device})", { device: m.device });
     return m.gpuError ? t("On, on the CPU: the GPU failed ({error})", { error: m.gpuError }) : t("On, on the CPU");
@@ -22744,7 +22739,7 @@ function wbCheckinLine(r) {
 
 // prefsKeep is what the settings page sends of s, all of it each time.
 function prefsKeep(s) {
-  return { theme: s.theme, colorblind: !!s.colorblind, lang: s.lang, tray: s.tray, dock: !!s.dock, dockWindow: !!s.dockWindow, lightweight: s.lightweight, keepAwake: !!s.keepAwake, keepAwakeDisplay: !!s.keepAwakeDisplay, noWSLAgents: !!s.noWSLAgents, proxy: s.proxy || "",
+  return { theme: s.theme, colorblind: !!s.colorblind, reduceMotion: !!s.reduceMotion, lang: s.lang, tray: s.tray, dock: !!s.dock, dockWindow: !!s.dockWindow, lightweight: s.lightweight, keepAwake: !!s.keepAwake, keepAwakeDisplay: !!s.keepAwakeDisplay, noWSLAgents: !!s.noWSLAgents, proxy: s.proxy || "",
     sessionTerminal: s.sessionTerminal || "",
     uiFont: s.uiFont || null, codeFont: s.codeFont || null,
     otel: s.otel || {},
