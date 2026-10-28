@@ -258,17 +258,24 @@ CoreText on macOS and Fontconfig on Linux. Discovery is lazy, cached in the
 handler, and refreshed by the menu. It returns names and CSS traits, never
 font files or paths. A failed refresh answers 503 and preserves the previous
 collection; an empty successful collection is distinct from failure.
-A `nogui` build can't read the catalogue and answers 404.
+A `nogui` build can't read the catalogue and answers the app 404.
 
-A browser tab (`magpie web`, or the app's page opened in a browser) has the
-same rows when boot says `fonts` (Norcleeh on Discord). Its choice is the
+A browser tab (`magpie web`, or the app's page opened in a browser) always
+has the same rows (Norcleeh on Discord). Its choice is the
 browser's own, kept in `localStorage` under `magpie.fonts` and applied by
 `fonts.js` before the first paint: the tab can be on another computer, so
-it neither changes nor takes the app's `settings.UIFont`/`CodeFont`. Its
-list is `/api/fonts` less the families the browser doesn't draw
-(`desktopFonts.here`: text in the family measures apart from a generic
-family's on a canvas), so another computer's fonts, and Safari's
-user-installed ones, aren't offered. In a nogui build the rows stay hidden.
+it neither changes nor takes the app's `settings.UIFont`/`CodeFont`. A
+tab's `/api/fonts` is the server's families (none in a nogui build such as
+Docker or `magpie-cli`, and none when reading them fails, never an error)
+plus `commonFamilies` in `internal/gui/fonts.go`, in regular and bold.
+The tab keeps those it draws (`desktopFonts.here`: text in the family
+measures apart from a generic family's on a canvas), so another computer's
+fonts, and Safari's user-installed ones, aren't offered. When none is
+kept, the rows still offer System default. Until 10-28 the rows were
+gated on a boot `fonts` flag, so a nogui server had none, and what
+"flashed and vanished" on a refresh was Text size: the rows a tab never
+shows (Text size, the tray click, Open at login, the menu bar's
+allowances) are `.app-only`, which `body.web` hides before the first paint.
 
 `settings.UIFont` and `settings.CodeFont` keep the family, style name,
 OpenType weight, CSS slope and width percentage. A missing choice keeps the
@@ -380,6 +387,8 @@ security model, the bridge and the reads are in
 covers it in both engines, every language and a narrow window.
 
 ### Shared UI rules
+
+- Windows desktop windows and tray panels keep the modal's dimming veil without backdrop blur or saturation: full-window filtering can stall WebView2 while a provider test or sign-in dialog is open. The existing `win` marker from [`layout.js`](../../internal/gui/assets/layout.js) scopes the rule in [`app.css`](../../internal/gui/assets/app.css) to the desktop app; browser pages and other platforms keep their existing effect. `modal-backdrop.test.cjs` checks the computed filter and veil in both engines and modes.
 
 - Settings → General is laid out as macOS System Settings is (1ooogle on X): a row says its name alone when that says enough (Appearance, Colorblind mode, Language, Text size, the fonts, the tray click, Open at login, Show in Dock), and keeps one short line where the setting isn't clear from its name or has a consequence (Lightweight mode, Prevent sleep, Session terminal). Codex's and Claude Code's own settings (Codex subagents, Long conversations, background compaction, thread titles and descriptions, composer predictions, the auto-review and memories models) aren't here: they are in the agent's opened row on the Agents page (`AGENT_PREFS`, `connectPanel`), the panel's row has a Settings line that opens them in a sheet (`openAgentPrefs`), as does the agent's menu, and Settings' search finds them with a row that opens that sheet (`#agentPrefLinks`). Each row is one element moved between its places, so its handlers and state go with it (the owner, 10-20; `agent-prefs.test.cjs`). Long conversations is the exception with no Codex or Claude Code here, in gateway mode or a magpie in Docker: it sets the windows the gateway serves, which agents on other computers read, so it stays in General (`renderAgentPrefLinks`, Linka on Discord). A font row's line shows only while its fonts load or fail; the text size keys are the choices' tooltip, and Colorblind mode's note is its Off/On control's (`#colorblindSegs`). Colorblind mode (`settings.Colorblind`, `data-colorblind="1"` on `:root`, #2073) switches the chart series (`--c1`…`--c7`) in both light and dark themes to an Okabe–Ito palette where adjacent series differ in hue and lightness. On a quota curve each window (`data-series`, its index mod 7, set by `drawQuotaPlot` and `quotaCurve`'s legend only) gets a dash of its own on `path.qc-line`, its legend key shows a sample of that line (`.qc-sample`) for the dot, and the even paces (`line.qc-even`) are dotted; the curve's tooltip says so. The balance curve sets no `data-series` and keeps its solid line, dashed fit and dot. The Context tab's "good" grade, which takes `--c2` as a colour rather than a series, keeps a blue (`--c1`). Language is one menu button showing the language picked, opened in the app's menu (`renderLangPick`). See `settings-general.test.cjs` and `quota-curve.test.cjs`. Open at login reads `autostart.Enabled`, which on macOS 13 and later also asks Background Task Management about magpie's launch agent (`SMAppService.statusForLegacyURL:`, matched by the plist's Label, not its path); a record the user switched off in System Settings › General › Login Items reads as needing allowing, and the row keeps On with one line saying so and a button that opens Login Items (`/api/open` allows that one `x-apple.systempreferences` URL). The status read again when the window comes back to the front clears the line. On macOS 12, in a build without cgo, or when the system can't be asked, the plist alone decides, as before (#2120, `login-allow.test.cjs`, `login_allow_test.go`).
 - A setting row's line under its name (`.row.pref .sub`, in Settings, Plugins › Built-in and an agent's own settings) wraps whole beside its control, never cut to one line with an ellipsis (arculongus on Discord, `settings-lines-wrap.test.cjs`).
