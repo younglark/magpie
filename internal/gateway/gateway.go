@@ -631,7 +631,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// loops' next look (#3185)
 	go filememo.Watch(freshCtx, pluginrt.Path(), settings.Path(), provider.Path(), plugin.ListPath(), plugin.ToolsPath(), access.Path())
 	go pluginrt.KeepFresh(freshCtx, filememo.OthersEvery, settings.Path(), provider.Path(), plugin.ListPath(), plugin.ToolsPath(), access.Path())
-	srv := &http.Server{Handler: s.Front(), ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute, ConnState: s.unread.note}
+	srv := &http.Server{Handler: s.closesWhenHandedOff(s.Front()), ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute, ConnState: s.unread.note}
 	// the magpie serving the gateway, and only it, keeps the saved accounts
 	// signed in, so two never refresh one sign-in at once
 	go provider.KeepLoginsAlive(ctx)
@@ -695,9 +695,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		defer cancel()
 		if s.handingOver() {
 			// another magpie takes every connection from here: this one
-			// stops taking them, and each one it took has its first
-			// request read before Shutdown, which closes one it reads
-			// after it began unanswered (#3568)
+			// stops taking them, and each one it took, new or kept alive,
+			// has its next request read before Shutdown, which closes one
+			// it reads after it began unanswered (#3568, #3451)
 			s.stopAccepting()
 			s.unread.wait(c)
 		}
@@ -2496,7 +2496,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// the last try went to, not the group's first member, which a
 	// failover may never have reached
 	if !sentWhole {
-		m, done := noteMaskedUntil(r, "chat", maskedHits, string(body), tr.ID, p.ID, call.Model)
+		m, done := noteMaskedUntil(r, "chat", maskedHits, sentOf(maskedHits, body), tr.ID, p.ID, call.Model)
 		if m != nil {
 			s.trace.update(tr, func(t *Route) { t.Masked = m })
 		}
@@ -4587,6 +4587,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		}
 	case provider.Chat:
 		body = developerAsSystem(body)
+		// a content of text parts, which a vendor's server that takes a
+		// string alone turns the whole request away for (Atria on Discord)
+		body = textPartsAsString(body)
 		// a turn the client cut off before it said anything, which
 		// DeepSeek and Kimi turn every later request away for (#2599)
 		body = silentAssistantsOut(body)
