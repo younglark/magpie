@@ -3,6 +3,11 @@ const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 const params = new URLSearchParams(location.search);
 const mode = params.get("mode") || "window";
+// kept: magpie.<k> in localStorage, read as JSON; d when it holds none, or
+// not d's kind, or can't be read. keep writes one, for this time only if
+// it can't be kept
+function kept(k, d) { try { const v = JSON.parse(localStorage.getItem("magpie." + k)); return v && typeof v == typeof d && Array.isArray(v) == Array.isArray(d) ? v : d; } catch { return d; } }
+function keep(k, v) { try { localStorage.setItem("magpie." + k, JSON.stringify(v)); } catch {} }
 // The panel loads Wails for ExecJS readiness, but stays attached to the tray.
 // On Linux it is dragged by its header like the window: a Wayland window
 // can't be put by the icon, so KWin places it, and since it has no KWin
@@ -78,15 +83,14 @@ let adding = false; // the preset sheet is open
 // the partners counted as shown since the sheet opened: once an opening,
 // however often it is drawn (countPartner)
 let partnersCounted = null;
+// the Partners heading's light has run since the sheet opened (shinePartners)
+let partnersShone = false;
 let importing = null; // a magpie://import link waiting for a yes: { provider, error, replaces }
 let importingApps = null; // the Import from other apps dialog: { sources, picks }
 let providerDiscovery = []; // only opaque fingerprints and app names, never credentials
 let discoveryAt = 0, discoveryRun = 0, discoveryPending = false;
-let discoveryIgnored = new Set();
-try { discoveryIgnored = new Set(JSON.parse(localStorage.getItem("magpie.discoveryIgnored") || "[]")); } catch {}
-let savedModelFavorites = [];
-try { savedModelFavorites = JSON.parse(localStorage.getItem("magpie.modelFavorites") || "[]"); } catch {}
-const modelFavorites = new Set(Array.isArray(savedModelFavorites) ? savedModelFavorites : []);
+let discoveryIgnored = new Set(kept("discoveryIgnored", []));
+const modelFavorites = new Set(kept("modelFavorites", []));
 // A model through magpie is starred as its catalog id, which is the same in
 // every agent; the agent's own models by their value. Stars kept by value
 // before still count.
@@ -5431,7 +5435,7 @@ function renderList() {
         ev.stopPropagation();
         const key = favoriteKey(o);
         if (isFavorite(o)) { modelFavorites.delete(key); modelFavorites.delete(o.value); } else modelFavorites.add(key);
-        localStorage.setItem("magpie.modelFavorites", JSON.stringify([...modelFavorites]));
+        keep("modelFavorites", [...modelFavorites]);
         filter();
       };
       li.append(star);
@@ -7029,6 +7033,25 @@ function pickForAgent(a, p, btn, ev) {
   openPicker(agent, field, btn, ev, (o) => pre.test(o.value));
 }
 
+// shinePartners: a hairline of light runs once round the Partners heading
+// when the sheet opens, as the reader reaches it (the owner picked it, of
+// three). Once an opening: a search or a reload drawing it again doesn't.
+function shinePartners(k) {
+  if (partnersShone || calm()) return;
+  k.classList.add("shine");
+  k.append(el("i", "glow"), el("i", "ring"));
+  const seen = new IntersectionObserver(([en]) => {
+    // a redraw's new heading takes over from this one
+    if (!k.isConnected) return seen.disconnect();
+    if (!en.isIntersecting || !adding) return;
+    seen.disconnect();
+    if (partnersShone) return;
+    partnersShone = true;
+    k.classList.add("lit");
+  }, { root: $("#view-providers"), threshold: 1 });
+  seen.observe(k);
+}
+
 // The add sheet: presets first (a key is all they need), custom last.
 let presetQuery = "", addReturnPick = null;
 function renderAdd() {
@@ -7049,7 +7072,7 @@ function renderAdd() {
     setRoom(view, 0);
   }
   sheet.hidden = !adding;
-  if (!adding) partnersCounted = null;
+  if (!adding) { partnersCounted = null; partnersShone = false; }
   // Duplicate and Add another open a new provider's editor with no sheet
   if (!adding) return editing && typeof editing === "object" ? renderEditor(null, editing.preset) : null;
   const head = el("div", "row-head");
@@ -7108,6 +7131,7 @@ function renderAdd() {
     if (partners.length) {
       any = true;
       const grid = section("Partners", "magpie's sponsors");
+      shinePartners(grid.previousElementSibling);
       // a new one's tile keeps a dot until opened (partnerTile)
       newPartnerTiles ??= new Set();
       for (const p of partners) if (p.new && !p.added) newPartnerTiles.add(p.id);
@@ -9203,7 +9227,7 @@ function drawEditor(p, presetID) {
       if (p.move) ed.append(...renderMove(p));
     } else {
       const acct = el("div", "acct");
-      acct.append(icon(a.agentIcon), el("span", "n", a.user), hideAccounts.eye(a.user), el("span", "plan", accountPlan(a)));
+      acct.append(icon(a.agentIcon), el("span", "n", a.user), hideAccounts.eye(a.user, p.id), el("span", "plan", accountPlan(a)));
       ed.append(...field(t("Account"), acct, t("{agent}'s sign-in, read from its own files. Sign out there and this provider goes away.", { agent: a.agentName })));
     }
     ed.append(...field(t("Models"), renderModels(p), ""));
@@ -10164,9 +10188,9 @@ $("#reviewProviderDiscovery").onclick = () => openImportApps(new Set(providerDis
 $("#dismissProviderDiscovery").onclick = () => {
   // Merge other windows' choices before saving, without forgetting candidates
   // that happen to be unavailable or already imported during this scan.
-  try { for (const id of JSON.parse(localStorage.getItem("magpie.discoveryIgnored") || "[]")) discoveryIgnored.add(id); } catch {}
+  for (const id of kept("discoveryIgnored", [])) discoveryIgnored.add(id);
   for (const c of providerDiscovery) discoveryIgnored.add(c.fingerprint);
-  try { localStorage.setItem("magpie.discoveryIgnored", JSON.stringify([...discoveryIgnored])); } catch {}
+  keep("discoveryIgnored", [...discoveryIgnored]);
   renderProviderDiscovery();
 };
 window.addEventListener("storage", (e) => {
@@ -13571,7 +13595,7 @@ function accountNameButton(p, user) {
     s.title = t("The same seat as the key plan {name}, shown once, on this account's card", { name: seat });
     wrap.append(s);
   }
-  wrap.append(hideAccounts.eye(user));
+  wrap.append(hideAccounts.eye(user, p.id));
   return wrap;
 }
 // an account or key list's last row, adding one
@@ -15291,10 +15315,7 @@ let quotas = null;
 let quotasAt = 0; // when they came in
 // the panel's last read, drawn at once, turning, until the read lands (#3160)
 let quotasKept = false;
-if (mode === "panel") try {
-  const kept = JSON.parse(localStorage.getItem("magpie.panelQuotas"));
-  if (Array.isArray(kept)) { quotas = kept; quotasKept = true; }
-} catch {}
+if (mode === "panel") { const none = [], k = kept("panelQuotas", none); if (k !== none) { quotas = k; quotasKept = true; } }
 let quotaHist = []; // each account's windows over time, for the curves (#651)
 // quotasOpened: the reader opened what shows the allowances (the Usage
 // page's Overview, the tray panel's Allowances tab, a menu bar cell, either
@@ -15637,16 +15658,11 @@ function renderQuotas(lazy) {
 // (magpie.usageAcctsOpened), so that its fold puts those back in brief,
 // and only those (WuSix on Discord: with both accounts in brief, 展开 opened
 // both and 收起其余账号 folded only the second).
-let usageOpen = new Set(), usageAccts = {}, usageByMore = new Set();
-try { usageOpen = new Set(JSON.parse(localStorage.getItem("magpie.usageOpen") || "[]")); } catch {}
-try { usageAccts = JSON.parse(localStorage.getItem("magpie.usageAccounts") || "{}") || {}; } catch {}
-try { usageByMore = new Set(JSON.parse(localStorage.getItem("magpie.usageAcctsOpened") || "[]")); } catch {}
+let usageOpen, usageAccts, usageByMore;
+const usageFolds = () => { usageOpen = new Set(kept("usageOpen", [])); usageAccts = kept("usageAccounts", {}); usageByMore = new Set(kept("usageAcctsOpened", [])); };
+usageFolds();
 addEventListener("storage", (e) => {
-  if (e.key !== "magpie.usageOpen" && e.key !== "magpie.usageAccounts" && e.key !== "magpie.usageAcctsOpened") return;
-  try { usageOpen = new Set(JSON.parse(localStorage.getItem("magpie.usageOpen") || "[]")); } catch {}
-  try { usageAccts = JSON.parse(localStorage.getItem("magpie.usageAccounts") || "{}") || {}; } catch {}
-  try { usageByMore = new Set(JSON.parse(localStorage.getItem("magpie.usageAcctsOpened") || "[]")); } catch {}
-  renderQuotas();
+  if (["magpie.usageOpen", "magpie.usageAccounts", "magpie.usageAcctsOpened"].includes(e.key)) { usageFolds(); renderQuotas(); }
 });
 function usageShown(subs) {
   let pick = subs[0];
@@ -15668,8 +15684,8 @@ function setUsageAccts(list, open, byMore = false) {
     usageAccts[usageAcctKey(q)] = typeof open === "function" ? open(q) : open;
     if (byMore) usageByMore.add(usageAcctKey(q)); else usageByMore.delete(usageAcctKey(q));
   }
-  try { localStorage.setItem("magpie.usageAccounts", JSON.stringify(usageAccts)); } catch {}
-  try { localStorage.setItem("magpie.usageAcctsOpened", JSON.stringify([...usageByMore])); } catch {}
+  keep("usageAccounts", usageAccts);
+  keep("usageAcctsOpened", [...usageByMore]);
   renderQuotas();
 }
 // A card of a provider's keys shows the first three, and any in full,
@@ -15677,8 +15693,7 @@ function setUsageAccts(list, open, byMore = false) {
 // place; remembered by provider (magpie.usageKeysAll). One more alone
 // isn't folded: the button would take the room the key does.
 const KEYS_SHOWN = 3;
-let usageKeysAll = new Set();
-try { usageKeysAll = new Set(JSON.parse(localStorage.getItem("magpie.usageKeysAll") || "[]")); } catch {}
+const usageKeysAll = new Set(kept("usageKeysAll", []));
 function keysFolded(subs) {
   if (usageKeysAll.has(subs[0].provider)) return new Set();
   const shown = new Set(subs.filter((q) => usageAcctOpen(q, subs)));
@@ -15692,7 +15707,7 @@ function keysMore(provider, n) {
   b.setAttribute("aria-expanded", String(!n));
   b.onclick = () => {
     if (n) usageKeysAll.add(provider); else usageKeysAll.delete(provider);
-    try { localStorage.setItem("magpie.usageKeysAll", JSON.stringify([...usageKeysAll])); } catch {}
+    keep("usageKeysAll", [...usageKeysAll]);
     renderQuotas();
     backToReader($("#view-usage"));
   };
@@ -15704,8 +15719,7 @@ function keysMore(provider, n) {
 // provider (magpie.usageAcctsAll). The tray panel leaves the ones in brief
 // out already.
 const ACCTS_FOLD = 8, ACCTS_SHOWN = 5;
-let usageAcctsAll = new Set();
-try { usageAcctsAll = new Set(JSON.parse(localStorage.getItem("magpie.usageAcctsAll") || "[]")); } catch {}
+const usageAcctsAll = new Set(kept("usageAcctsAll", []));
 function acctsFolded(subs) {
   if (usageAcctsAll.has(subs[0].provider)) return new Set();
   const shown = new Set(subs.slice(0, ACCTS_SHOWN));
@@ -15722,7 +15736,7 @@ function acctsMore(provider, n) {
   b.setAttribute("aria-expanded", String(!n));
   b.onclick = () => {
     if (n) usageAcctsAll.add(provider); else usageAcctsAll.delete(provider);
-    try { localStorage.setItem("magpie.usageAcctsAll", JSON.stringify([...usageAcctsAll])); } catch {}
+    keep("usageAcctsAll", [...usageAcctsAll]);
     renderQuotas();
     backToReader($("#view-usage"));
   };
@@ -17223,7 +17237,7 @@ function panelQuotaCard(q) {
   // and its eye while Hide accounts is on, as on the Usage page (yogurt36)
   const who = el("span", "pq-who");
   who.append(el("span", "pq-user", q.alias || q.user || q.name));
-  if ((q.user || q.alias) && window.hideAccounts) who.append(hideAccounts.eye(q.user || q.alias));
+  if ((q.user || q.alias) && window.hideAccounts) who.append(hideAccounts.eye(q.user || q.alias, q.provider));
   card.append(who);
   card.title = [q.name, q.alias, q.user, q.seat && q.seat !== q.alias && "≡ " + q.seat, q.plan, q.until ? planTerm(q) : "", q.balance && t("Balance") + " " + q.balance].filter(Boolean).join(" · ");
   if (q.error) {
@@ -17323,7 +17337,7 @@ function panelQuotaCard(q) {
     fold.onclick = (e) => {
       e.stopPropagation();
       if (folded) panelOptsFolded.delete(id); else panelOptsFolded.add(id);
-      try { localStorage.setItem("magpie.panelOptsFolded", JSON.stringify([...panelOptsFolded])); } catch {}
+      keep("panelOptsFolded", [...panelOptsFolded]);
       renderPanelQuota();
       $(`#panelQuota .pq-card[data-card="${CSS.escape(id)}"] .pq-opts-fold`)?.focus({ preventScroll: true });
     };
@@ -17350,8 +17364,7 @@ function panelQuotaCard(q) {
   return card;
 }
 // panelOptsFolded: the panel cards, by id, whose options are folded.
-let panelOptsFolded = new Set();
-try { panelOptsFolded = new Set(JSON.parse(localStorage.getItem("magpie.panelOptsFolded") || "[]")); } catch {}
+const panelOptsFolded = new Set(kept("panelOptsFolded", []));
 
 // resetsWords: a Codex account's rate-limit resets, "↺ 2 resets · until
 // Sat 22:30", the date only when one of them runs out. A GLM Coding team
@@ -24311,7 +24324,9 @@ window.noteAccounts = noteAccounts;
     const ns = names(), key = ns.join("\n");
     if (key !== findKey) {
       findKey = key;
-      find = ns.length ? new RegExp(EMAIL.source + "|" + ns.map(esc).join("|"), "g") : EMAIL;
+      // whole, not its address: Kiro's "a@b.c (GitHub)" (outloudvi)
+      const at = (n) => n.includes("@");
+      find = ns.length ? new RegExp([...ns.filter(at).map(esc), EMAIL.source, ...ns.filter((n) => !at(n)).map(esc)].join("|"), "g") : EMAIL;
     }
     return find;
   }
@@ -24323,12 +24338,19 @@ window.noteAccounts = noteAccounts;
   const joined = (s, i, step) => WORD.test(s[i] || "") || (JOIN.test(s[i] || "") && WORD.test(s[i + step] || ""));
   // accounts shown while the rest stay hidden (yogurt36), this page's
   // only: the window and the tray panel are pages of their own, so one
-  // shown in either never shows in the other
-  const shown = new Set(), low = (x) => String(x).trim().toLowerCase();
-  function* hits(s, re) {
+  // shown in either never shows in the other; kept by provider
+  // (outloudvi: one address on two services showed on both)
+  const shown = new Set(), low = (x) => String(x).trim().toLowerCase(), sk = (p, k) => p + "\n" + low(k);
+  // by an eye, its provider's only; elsewhere, shown under any
+  const isShown = (k, e) => {
+    if (!shown.size) return false;
+    for (; e && e !== document.body; e = e.parentElement) { const b = e.querySelector?.(":scope>.acct-eye,:scope>*>.acct-eye"); if (b?._p) return shown.has(sk(b._p, k)); }
+    return [...shown].some((s) => s.endsWith("\n" + low(k)));
+  };
+  function* hits(s, re, at) {
     re.lastIndex = 0; // matchAll starts where the pattern's last test ended
     for (const m of s.matchAll(re)) {
-      if (shown.has(low(m[0]))) continue;
+      if (isShown(m[0], at)) continue;
       const name = !m[0].includes("@"), end = m.index + m[0].length;
       if (name && ((WORD.test(m[0][0]) && joined(s, m.index - 1, -1)) || (WORD.test(m[0].at(-1)) && joined(s, end, 1)))) continue;
       yield m;
@@ -24338,6 +24360,8 @@ window.noteAccounts = noteAccounts;
   // itself watched, so it can't set itself off again
   const OBS = { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["title"] };
   const SKIP = new Set(["SCRIPT", "STYLE", "OPTION", "TEXTAREA"]);
+  // a demo's made-up text (data-no-pii) is never hidden (outloudvi)
+  const KEEP = "[data-no-pii]";
   // Usage's Sessions and Context are read from the agents' own logs, which
   // name no account (their answers aren't looked through for one, see api):
   // a project, a session or a prompt there that has an account's name in
@@ -24364,7 +24388,7 @@ window.noteAccounts = noteAccounts;
       const all = finder(), reOf = (e) => e?.closest(NAMELESS) ? EMAIL : all;
       const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT), found = [];
       for (let n; (n = walk.nextNode());) {
-        if (n.data.length < 2 || SKIP.has(n.parentElement?.tagName) || n.parentElement?.closest(".pii")) continue;
+        if (n.data.length < 2 || SKIP.has(n.parentElement?.tagName) || n.parentElement?.closest(".pii, " + KEEP)) continue;
         const re = reOf(n.parentElement);
         re.lastIndex = 0;
         if (re.test(n.data)) found.push(n);
@@ -24372,7 +24396,7 @@ window.noteAccounts = noteAccounts;
       for (const n of found) {
         const bits = [];
         let last = 0;
-        for (const m of hits(n.data, reOf(n.parentElement))) {
+        for (const m of hits(n.data, reOf(n.parentElement), n.parentElement)) {
           if (m.index > last) bits.push(n.data.slice(last, m.index));
           const s = el("span", "pii", dots(m[0]));
           s.dataset.raw = m[0];
@@ -24388,9 +24412,9 @@ window.noteAccounts = noteAccounts;
       }
       for (const e of [root, ...root.querySelectorAll("[title]")]) {
         // one masked already reads as an account too, its stars and all
-        if (!e.dataset || "piiTitle" in e.dataset || !e.title) continue;
+        if (!e.dataset || "piiTitle" in e.dataset || !e.title || e.closest(KEEP)) continue;
         let out = "", last = 0;
-        for (const m of hits(e.title, reOf(e))) {
+        for (const m of hits(e.title, reOf(e), e)) {
           out += e.title.slice(last, m.index) + m[0].replace(m[0].includes("@") ? /[^@.]/g : /./gu, "•"); // a tooltip can't blur
           last = m.index + m[0].length;
         }
@@ -24451,14 +24475,14 @@ window.noteAccounts = noteAccounts;
     if (!keep) { chosen = on ? "1" : "0"; try { localStorage.setItem("magpie.maskEmails", chosen); } catch {} }
     for (const set of pages) set(on);
   }
-  const kin = (u) => {
+  const kin = (u, pid) => {
     const k = [u];
-    for (const p of providers?.providers || []) for (const [a, n] of Object.entries(p.accountNames || {})) if (a === low(u) || n === u) k.push(a, n);
-    for (const q of quotas || []) if (q.user === u || q.alias === u) k.push(q.user, q.alias);
-    return k.filter(Boolean).map(low);
+    for (const p of providers?.providers || []) if (p.id === pid) for (const [a, n] of Object.entries(p.accountNames || {})) if (a === low(u) || n === u) k.push(a, n);
+    for (const q of quotas || []) if (q.provider === pid && (q.user === u || q.alias === u)) k.push(q.user, q.alias);
+    return k.filter(Boolean).map((x) => sk(pid, x));
   };
   const paint = (b) => {
-    const on = shown.has(low(b._u));
+    const on = shown.has(sk(b._p, b._u));
     b.setAttribute("aria-pressed", on);
     b.title = t(on ? "Hide this account" : "Show this account");
     b.querySelector("path").setAttribute("d", on ? EYE : EYE_OFF);
@@ -24469,17 +24493,18 @@ window.noteAccounts = noteAccounts;
   };
   // Settings' Privacy has the same switch, and the settings follow
   window.hideAccounts = {
-    eye: (u) => {
+    eye: (u, p) => {
       const b = el("button", "acct-eye");
       b._u = u;
+      b._p = p;
       b.setAttribute("aria-label", t("Show this account"));
       b.append(svg("", 13, 2));
       b.firstChild.setAttribute("viewBox", "0 0 24 24");
       paint(b);
       b.onclick = (e) => {
         e.stopPropagation();
-        const on = !shown.has(low(u));
-        for (const k of kin(u)) on ? shown.add(k) : shown.delete(k);
+        const on = !shown.has(sk(p, u));
+        for (const k of kin(u, p)) on ? shown.add(k) : shown.delete(k);
         redraw();
       };
       return b;
