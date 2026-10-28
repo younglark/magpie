@@ -63,10 +63,12 @@ type cRequest struct {
 	Stop                json.RawMessage `json:"stop,omitempty"`
 	Stream              bool            `json:"stream,omitempty"`
 	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
-	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"`
-	ServiceTier         string          `json:"service_tier,omitempty"`
-	PromptCacheKey      string          `json:"prompt_cache_key,omitempty"`
-	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
+	// OpenCode deepseekChat / Kimi thinking switch ({"type":"enabled"|"disabled"})
+	Thinking          json.RawMessage `json:"thinking,omitempty"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
+	ServiceTier       string          `json:"service_tier,omitempty"`
+	PromptCacheKey    string          `json:"prompt_cache_key,omitempty"`
+	ResponseFormat    json.RawMessage `json:"response_format,omitempty"`
 	// not a Chat field: OpenCode merges a model's options into its body
 	// whichever API it speaks, and a Codex model it asks on Chat is asked
 	// on Responses (Request.AccessPrograms)
@@ -101,6 +103,22 @@ func readChat(body []byte, facts bool) (*Request, error) {
 		r.Thinking = true
 	}
 	r.ThinkOff = strings.EqualFold(strings.TrimSpace(c.ReasoningEffort), "none")
+	// OpenCode deepseekChat sends thinking:{type} (sometimes without
+	// reasoning_effort for a toggle); take it as ThinkOff / Thinking when
+	// the client already shaped the request that way.
+	var th struct {
+		Type string `json:"type"`
+	}
+	if decodeJSON(c.Thinking, &th) == nil {
+		switch strings.ToLower(strings.TrimSpace(th.Type)) {
+		case "disabled":
+			r.ThinkOff = true
+		case "enabled":
+			if !r.ThinkOff {
+				r.Thinking = true
+			}
+		}
+	}
 	var stop string
 	if decodeJSON(c.Stop, &stop) == nil && stop != "" {
 		r.Stop = []string{stop}
@@ -320,6 +338,15 @@ func chatReplaysReasoning(host, model string) bool {
 	return strings.Contains(host, "deepseek") || strings.Contains(strings.ToLower(model), "deepseek") || host == provider.CommandCodePlanID || host == "qoder" || host == "qoder-cn"
 }
 
+// chatWantsThinkingType is whether a Chat upstream takes OpenCode's
+// thinking:{type:"enabled"|"disabled"} switch beside reasoning_effort
+// (DeepSeek's API, and DeepSeek-named models on other hosts such as
+// OpenCode Go's deepseek-v4.1-flash). Command Code alone replays
+// reasoning_content but is not sent this body field.
+func chatWantsThinkingType(host, model string) bool {
+	return strings.Contains(host, "deepseek") || strings.Contains(strings.ToLower(model), "deepseek")
+}
+
 func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	var msgs []map[string]any
 	if r.System != "" {
@@ -508,6 +535,14 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	showSeen()
 	msgs, _ = withoutSilentAssistants(msgs)
 	msgs = pairToolMessages(msgs)
+	// DeepSeek's Chat takes response_format text or json_object only: a
+	// schema goes as a JSON object, the schema told in a system message
+	// of its own after the conversation, so the prefix the upstream
+	// cached is left as it was (deepseekSchemaLine)
+	objectOnly := r.Format != nil && r.Format.Type == "json_schema" && chatTakesObjectOnly(host, model)
+	if objectOnly {
+		msgs = append(msgs, map[string]any{"role": "system", "content": deepseekSchemaLine(r.Format.Schema)})
+	}
 	out := map[string]any{"model": model, "messages": msgs, "stream": r.Stream}
 	if r.CacheKey != "" {
 		out["prompt_cache_key"] = r.CacheKey
@@ -554,6 +589,18 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 		} else if r.Effort != "" {
 			out["reasoning_effort"] = r.Effort
 		}
+	} else if chatWantsThinkingType(host, model) {
+		// OpenCode deepseekChat: effort none → only thinking disabled (no
+		// reasoning_effort); otherwise reasoning_effort + thinking enabled.
+		switch {
+		case r.ThinkOff || r.Effort == "none":
+			out["thinking"] = map[string]any{"type": "disabled"}
+		case r.Effort != "":
+			out["reasoning_effort"] = r.Effort
+			out["thinking"] = map[string]any{"type": "enabled"}
+		case r.Thinking:
+			out["thinking"] = map[string]any{"type": "enabled"}
+		}
 	} else if r.Effort != "" {
 		out["reasoning_effort"] = r.Effort
 	}
@@ -577,7 +624,9 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 			out["parallel_tool_calls"] = *r.Parallel
 		}
 	}
-	if r.Format != nil {
+	if objectOnly {
+		out["response_format"] = map[string]any{"type": "json_object"}
+	} else if r.Format != nil {
 		out["response_format"] = r.Format.chat()
 	}
 	if r.WebSearch && host == "openrouter.ai" {

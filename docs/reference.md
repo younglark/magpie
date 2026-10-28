@@ -2475,6 +2475,7 @@ or build locally:
 ```sh
 make build            # ./magpie with the desktop app (needs cgo + the platform webview)
 make app              # macOS: magpie.app, a menu bar app with no Dock icon
+make install-app      # build, install (macOS: /Applications; Linux: ~/.local/bin), and open
 make cli              # terminal-only build, no cgo, cross-compiles anywhere
 make release          # dist/: native app build + cli builds for every platform
 make release-windows  # dist/: the Windows app, amd64 and arm64 (cross-compiles)
