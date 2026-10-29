@@ -218,7 +218,9 @@ type providerJSON struct {
 	// first, the gateway still trying them in their order
 	KeepLoginAs string `json:"keepLoginAs,omitempty"`
 	// SwitchOnly: magpie only moves Codex's own sign-in between its
-	// accounts, never routing its requests for failover (#1907)
+	// accounts, never routing its requests for failover (#1907); on
+	// Claude's, the accounts are kept to Claude Code's own sign-in and
+	// serve no request through magpie (myduso on Discord)
 	SwitchOnly bool `json:"switchOnly,omitempty"`
 	// CapStop and CapCareful: how its accounts end at their caps
 	// (plugins#349), set on their own with capstop and capcareful
@@ -686,7 +688,7 @@ func providerInfoWith(p provider.Provider, agents []agentUse, desktop map[string
 		}
 		key := restKey(k)
 		if r, ok := keyRestOf(key); ok {
-			out.KeyList[i].Rest = &provider.KeyRest{Why: r.Why, Status: r.Status, Until: r.Until, Key: key}
+			out.KeyList[i].Rest = &provider.KeyRest{Why: r.Why, Status: r.Status, Until: r.Until, Key: key, Probed: r.Probed}
 		}
 	}
 	if !out.Key.Set && p.Ready() {
@@ -996,6 +998,10 @@ var (
 func moveContext(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Minute)
 }
+
+// appLink hands an app's import link over once something here opens it
+// (agent.OpenAppLink); tests stand in for the system's answer.
+var appLink = agent.OpenAppLink
 
 func providerRoutes(mux *http.ServeMux, w Windows) {
 	importAppsRoutes(mux)
@@ -2381,10 +2387,17 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 		// again: that one pane, not System Settings' scheme at large
 		if strings.HasPrefix(in.URL, "https://") || strings.HasPrefix(in.URL, "http://") || strings.HasPrefix(in.URL, agent.CindyScheme) || strings.HasPrefix(in.URL, agent.LodyScheme) || strings.HasPrefix(in.URL, agent.AionUiScheme) || in.URL == autostart.LoginItemsURL {
 			open := w.OpenURL
-			if strings.HasPrefix(in.URL, agent.LodyScheme) {
+			// an app's import link is handed over only when something
+			// here opens it: the system says nothing when nothing does,
+			// and Add magpie did nothing at all (sungt, 10-29)
+			app := func(u string) error { return appLink(u, w.OpenURL) }
+			switch {
+			case strings.HasPrefix(in.URL, agent.LodyScheme):
 				// Lody on Linux is run with the link, which xdg-open
 				// turned away (agent.OpenLody)
-				open = func(u string) error { return agent.OpenLody(u, w.OpenURL) }
+				open = func(u string) error { return agent.OpenLody(u, app) }
+			case strings.HasPrefix(in.URL, agent.CindyScheme), strings.HasPrefix(in.URL, agent.AionUiScheme):
+				open = app
 			}
 			// Open again on a sign-in says why it didn't open (#2043)
 			if err := open(in.URL); err != nil {

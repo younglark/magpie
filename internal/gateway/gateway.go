@@ -254,8 +254,12 @@ func namesInCatalog() map[string]bool {
 }
 
 // switchedOff says a request for model went nowhere because p, which
-// serves it, is switched off in magpie (provider.Provider.Off).
+// serves it, is switched off in magpie (provider.Provider.Off), or kept to
+// Claude Code's own sign-in (provider.Provider.KeptToAgent).
 func switchedOff(p provider.Provider, model string) string {
+	if p.KeptToAgent() {
+		return fmt.Sprintf("%s's accounts are kept to Claude Code's own sign-in in Magpie, so %q is not served; untick \"Only switch Claude Code's sign-in\" under its accounts in Magpie's Providers to use it", p.Name, model)
+	}
 	return fmt.Sprintf("%s is switched off in Magpie, so %q is not served; switch it on again in Magpie's Providers to use it", p.Name, model)
 }
 
@@ -435,6 +439,9 @@ type Server struct {
 	// codexLeads is the model each Codex conversation's own turns last
 	// went on, for its side calls to follow (codexFollowTo)
 	codexLeads codexLeads
+	// codexSpawns is the model each Codex subagent thread was spawned on,
+	// which a resumed one goes back on (codexResumeTo)
+	codexSpawns codexSpawns
 	// the listener, swapped when the gateway is shared on the network or
 	// taken off it (see Relisten)
 	lnMu sync.Mutex
@@ -631,6 +638,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// loops' next look (#3185)
 	go filememo.Watch(freshCtx, pluginrt.Path(), settings.Path(), provider.Path(), plugin.ListPath(), plugin.ToolsPath(), access.Path())
 	go pluginrt.KeepFresh(freshCtx, filememo.OthersEvery, settings.Path(), provider.Path(), plugin.ListPath(), plugin.ToolsPath(), access.Path())
+	// and the MCP hub's servers that the Library no longer gives are ended
+	go keepHubPruned(freshCtx)
 	srv := &http.Server{Handler: s.closesWhenHandedOff(s.Front()), ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute, ConnState: s.unread.note}
 	// the magpie serving the gateway, and only it, keeps the saved accounts
 	// signed in, so two never refresh one sign-in at once
@@ -705,6 +714,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		s.subscription.abortAll()
 		provider.FlushServed() // what answered last, kept for the next start and the CLI
 		flushSticks()          // who answered which conversation, for the next start or the magpie handed over to
+		// the MCP servers the hub started end with the gateway
+		StopHub()
 	}()
 	for {
 		err := srv.Serve(ln)
@@ -809,11 +820,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /videos/{id}/content", s.videosContent)
 	mux.HandleFunc("POST "+claudeMCPPath+"{token}", s.subscription.mcpCall)
 	mux.HandleFunc("/mcp/{name}", s.mcpProxy)
+	mux.HandleFunc("/mcp/run/{name}", runMCP)
 	mux.HandleFunc(SearchMCPPath, s.searchMCP)
 	mux.HandleFunc(VisionMCPPath, s.visionMCP)
 	mux.HandleFunc(ImageMCPPath, s.imageMCP)
 	mux.HandleFunc(ImageMCPFiles+"{name}", s.imageMCPFile)
 	mux.HandleFunc(ToolsMCPPath, s.toolsMCP)
+	mux.HandleFunc(HubMCPPath+"{agent}", s.hubMCP)
+	mux.HandleFunc(HubMCPAll, s.hubMCP)
 	mux.HandleFunc(CodexPath+"/", s.codexBackend)
 	mux.HandleFunc("GET "+CodexCatalogPath, s.codexCatalog)
 	mux.HandleFunc("GET /v1beta/models", s.geminiModels)
@@ -850,7 +864,7 @@ var catalogSize stamped[struct{}, int]
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"name": "magpie", "version": Version, "models": catalogSize.get(struct{}{}, func() int { return len(provider.Catalog()) }), "window": Window,
-		"apis": []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/systemone", "/v1beta/models/{model}:generateContent", "/v1/images/generations", "/v1/images/edits", "/v1/videos", "/v1/embeddings", "/v1/rerank", "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/magpie/quotas", "/v1/magpie/quotas/history", "/v1/magpie/usage", "/v1/magpie/usage/requests", "/v1/magpie/route", "/v1/magpie/trace", SearchMCPPath, VisionMCPPath, ImageMCPPath, ToolsMCPPath}}
+		"apis": []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/systemone", "/v1beta/models/{model}:generateContent", "/v1/images/generations", "/v1/images/edits", "/v1/videos", "/v1/embeddings", "/v1/rerank", "/v1/audio/transcriptions", "/v1/audio/translations", "/v1/magpie/quotas", "/v1/magpie/quotas/history", "/v1/magpie/usage", "/v1/magpie/usage/requests", "/v1/magpie/route", "/v1/magpie/trace", SearchMCPPath, VisionMCPPath, ImageMCPPath, ToolsMCPPath, HubMCPAll, HubMCPPath + "{agent}"}}
 	// which process serves, for another magpie on this computer to name it
 	// on its Routing page (#2606); not told to another machine
 	if local(r) {
@@ -1737,10 +1751,17 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	var maskedHits maskHits
 	maskDone, sentWhole := false, false
 	unmask := func() {}
-	defer func() { unmask() }()
-	// the reply's model the member that answered, when asked for (#822)
+	// the reply's model the member that answered, when asked for (#822).
+	// Both writers hold a whole body until the handler is done, the namer
+	// outside: the values are put back first, into the namer, and then it
+	// writes what it holds. The other way round it wrote nothing, and the
+	// values came back after it, into a buffer no one wrote: a 200 with
+	// an empty body whenever a value was masked (#4129)
 	w, r, named := withMemberNames(w, r)
-	defer named()
+	defer func() {
+		unmask()
+		named()
+	}()
 	// an observer may want the bodies uncut (the OTLP export, #538): the
 	// request is already whole in memory, so keep it as it came, and the
 	// reply goes to a spool as it streams
@@ -2212,7 +2233,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			scope += "|" + words
 		}
 	} else {
-		cands, pl = s.plan(p, model, from)
+		// a routing group among the fallbacks is routed as a request to it
+		// would be, its pause rules too (pausedOut's)
+		cands, pl = s.planPaused(p, model, from, func(fg provider.Group, fms []provider.Member) []provider.Member {
+			folder := ""
+			if provider.PausesByFolder(fg, fms) {
+				folder = factsOf(from, body).dir
+			}
+			kept, _ := provider.PausedOut(fg, fms, agent, folder, ruleClock())
+			return kept
+		})
 		if handedOnOf(r) != nil {
 			// Codex's own sign-in, asked as often as it is asked: only
 			// the fallbacks are left (codexFallBack)
@@ -2612,6 +2642,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				// is back: none is asked, and the agent is told so at once
 				// (#1772)
 				cands = cands[:i+1]
+			}
+		}
+		if !autoReset && c.onCredits() {
+			// going to the account on its credits, its week used up: a
+			// reset it spends by itself when the week runs out goes
+			// first (resetBeforeCredits)
+			if out, ok := s.resetBeforeCredits(r.Context(), c); ok {
+				autoReset = true
+				resetFirst = &AutoReset{Who: c.p.Account.User, Text: out.Text(), Agent: c.p.Account.Agent}
 			}
 		}
 		last := i == len(cands)-1
@@ -5458,7 +5497,9 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r.Effort, req = e, &r
 		}
 	}
-	if p.IsVertex() {
+	if p.IsVertex() && !provider.VertexPartner(model) {
+		// Gemini's levels; a partner model on chat completions is sent
+		// its effort as any OpenAI-compatible vendor is
 		req = vertexEffort(req, p.Efforts(model))
 	}
 	// the names in force, read once however many endpoints the request is
