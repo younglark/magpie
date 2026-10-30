@@ -82,7 +82,8 @@ var logAppends struct {
 func (s *logSnapshot) sawHost(r Record) {
 	h, _, _ := strings.Cut(r.Host, " as ") // a subscription's "host as user"
 	h = strings.ToLower(strings.TrimSpace(h))
-	if h == "" || r.Provider == "" || strings.EqualFold(r.Provider, h) || r.IsRejected() {
+	// an MCP tool call's host is its server's name, not a provider's
+	if h == "" || r.Provider == "" || strings.EqualFold(r.Provider, h) || r.IsRejected() || r.Source == SourceMCP {
 		return
 	}
 	if s.hosts == nil {

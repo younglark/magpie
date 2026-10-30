@@ -175,6 +175,13 @@ type Request struct {
 	// Windows with Claude Code in WSL), so the run's own prompt describes
 	// another machine than the one the tools run on (envElsewhereNote).
 	envElsewhere bool
+	// envUnknown: the caller is on another computer (remoteCaller) and its
+	// instructions name no working directory, so the run's own prompt
+	// describes a machine no tool runs on, and nothing says which does
+	// (envUnknownNote).
+	envUnknown bool
+	// remoteCaller: the request came from another computer (not local).
+	remoteCaller bool
 	// hourMarks has the cache marks magpie adds on Anthropic's Messages
 	// (anthropicBody) last an hour: a Responses client's (Codex's), whose
 	// turns are often more than five minutes apart and whose own vendor
@@ -182,6 +189,9 @@ type Request struct {
 	// client asked prompt_cache_retention "in_memory", or the upstream
 	// turned the ttl away (hourMarksRefused).
 	hourMarks bool
+	// draws asks the model for images beside text: a drawing asked on
+	// Gemini's API of a model not named for images (drawCodeAssist).
+	draws bool
 
 	Model      string
 	System     string
@@ -251,6 +261,14 @@ type Request struct {
 	// Anthropic upstream: a relay that serves only Claude Code turns a
 	// request without it away (#359).
 	Metadata json.RawMessage
+	// ImageConfig is a Gemini client's generationConfig.imageConfig, the
+	// size and shape it asks an image model to draw at (imageSize,
+	// aspectRatio, and Vertex AI's fields beside them), which goes on as
+	// it was sent when the request is built again for an upstream that
+	// speaks Gemini, inside Code Assist's envelope too
+	// (buildCodeAssistSent). Left out, the picture came back at the
+	// model's default size (#3820). No other API is known to take it.
+	ImageConfig json.RawMessage
 	// Safeguards are the caller's safety context, opaque to the gateway.
 	Safeguards    json.RawMessage
 	SafeguardBeta string

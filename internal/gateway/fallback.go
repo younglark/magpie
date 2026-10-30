@@ -1076,14 +1076,18 @@ func restingOf(c candidate) (Rest, bool) {
 // exhausted" for the moment it switched upstreams, and every request,
 // the agent's retry first, was answered from its 15-minute rest. A
 // subscription account isn't held so: its resets may be spent for it
-// (autoReset), and its windows are read again as it is planned.
+// (autoReset), and its windows are read again as it is planned. Nor is a
+// model of another computer's magpie (Rest.there): that magpie holds its
+// own rests, and the user may have changed what it serves since
+// (zaidu259434 on X: a group there moved off a spent vendor, and its
+// refusal was still given here until the time it named).
 func quotaHeld(cs []candidate) (Rest, time.Time, bool) {
 	var first Rest
 	var back time.Time
 	now := time.Now()
 	for i, c := range cs {
 		r, ok := restingOf(c)
-		if !ok || c.p.Account != nil || r.Why != failQuota && r.Why != failCredit || !quotaStatus(r.Status) || r.said == "" {
+		if !ok || c.p.Account != nil || r.there || r.Why != failQuota && r.Why != failCredit || !quotaStatus(r.Status) || r.said == "" {
 			return Rest{}, time.Time{}, false
 		}
 		at := r.asksAt(now)
@@ -1628,10 +1632,38 @@ func passing(status int, header http.Header, body []byte, again int) (time.Durat
 		return wait, again < lastRetries
 	case status == 429:
 		// a relay's 429 often says nothing of when (#503: "负载已饱和，请稍
-		// 后再试"); a plan used up or no money left won't clear in seconds
-		return wait, again < rateRetries && failure(status, body) == failRate && !creditWords.Match(wordsOf(body))
+		// 后再试"); a plan used up or no money left won't clear in seconds,
+		// nor an account's token wall (walled)
+		return wait, again < rateRetries && failure(status, body) == failRate && !creditWords.Match(wordsOf(body)) && !walled(body)
 	}
 	return 0, false
+}
+
+// wallCodes are the error codes a vendor gives a 429 for an account's
+// own token throughput used up, a bucket that refills slowly over minutes
+// (plugins#512, cycocyco): SenseTime Raccoon's user_model_rate_limited,
+// "您的模型请求频率超限，请稍后重试", with no Retry-After. It reads as a
+// rate limit and rests as one, a minute and longer each time it comes
+// back (rateRest), but no moment clears it: the same-one retries and a
+// patience's rounds sent the whole request again eight times in 38s, each
+// one drawing on the bucket it waited for. The next account is asked, or
+// the agent has the error at once.
+var wallCodes = map[string]bool{"user_model_rate_limited": true}
+
+// walled says whether body is a refusal whose error.code is one of
+// wallCodes: the code where the vendor puts it, not the words anywhere in
+// the body (a prompt or a message quoting it).
+func walled(body []byte) bool {
+	var e struct {
+		Error struct {
+			Code json.RawMessage `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &e) != nil {
+		return false
+	}
+	var code string
+	return json.Unmarshal(e.Error.Code, &code) == nil && wallCodes[code]
 }
 
 // withRoom is, of the candidates left, those another member than c's may
@@ -1918,6 +1950,10 @@ type holdWriter struct {
 	// before it was complete" and its 429 halfway went to the summary
 	// as the only answer, the next account never asked
 	wantWhole bool
+
+	// upstreamKeys are the headers of the vendor's reply heardUpstream put
+	// in header (#4145)
+	upstreamKeys []string
 }
 
 // onLoop sets what is told of a loop before it ends the reply (reask),
@@ -2903,17 +2939,23 @@ const refusedStatus = http.StatusBadRequest
 
 // filterReasons are how a vendor says its safety filter stopped the reply:
 // Anthropic's stop_reason, OpenAI's finish_reason and incomplete reason,
-// an OpenAI or Azure error's code, and Gemini's finishReason and
-// blockReason.
+// an OpenAI or Azure error's code, Factory's error code, and Gemini's
+// finishReason and blockReason.
 var filterReasons = map[string]string{
 	"refusal":                  "refusal",
 	"content_filter":           "content_filter",
 	"content_policy_violation": "content_filter",
-	"SAFETY":                   "safety",
-	"PROHIBITED_CONTENT":       "safety",
-	"BLOCKLIST":                "safety",
-	"SPII":                     "safety",
-	"IMAGE_SAFETY":             "safety",
+	// Factory's usage policy check, a 403 whose code droid 0.245.0 tells
+	// apart from an account's 403 the same way (the Factory plugin keeps
+	// the code on the error it hands magpie): handed on as its 403, the
+	// agent took it for a failed sign-in (sweanng on Discord, ZCode:
+	// "Provider authentication failed", reason=auth_failed status=403)
+	"content_policy_rejected": "content_policy_rejected",
+	"SAFETY":                  "safety",
+	"PROHIBITED_CONTENT":      "safety",
+	"BLOCKLIST":               "safety",
+	"SPII":                    "safety",
+	"IMAGE_SAFETY":            "safety",
 }
 
 // refusedNote is what a refusal is noted as: the vendor's own reason.
@@ -3341,8 +3383,11 @@ func policyRefusal(raw []byte) (string, bool) {
 	}
 	note := func(reason string) (string, bool) {
 		if msg = strings.TrimSpace(msg); msg != "" {
-			if len(msg) > 300 {
-				msg = msg[:300] + "…"
+			// long enough for the vendor's own advice after its words:
+			// Factory's "start a new session…" and OpenAI's Daybreak
+			// link were cut off at 300
+			if len(msg) > 1000 {
+				msg = msg[:1000] + "…"
 			}
 			return refusedNote(reason) + " — " + msg, true
 		}

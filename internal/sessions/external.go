@@ -34,16 +34,41 @@ type ExternalSession struct {
 // reader; magpie's own record of one is deleted by DeleteGateway.
 func MergeExternal(native []Session, external []ExternalSession) []Session {
 	names := desktopExternalTitles(external)
-	seen := map[string]bool{}
+	// keyed by the pair, not "agent|id": a string made for each of ~5000
+	// sessions on each of a poll's listings, and the set and the list grown
+	// an append at a time, were ~200 MB in 80s of polls (#2278)
+	type agentID struct{ agent, id string }
+	seen := make(map[agentID]struct{}, len(native))
 	for _, s := range native {
-		seen[s.Agent+"|"+s.ID] = true
+		// GatewayKeys, as pairs
+		seen[agentID{s.Agent, s.ID}] = struct{}{}
+		if s.Agent == "raft" {
+			seen[agentID{"pi", s.ID}] = struct{}{}
+		}
+		if s.App != "" {
+			seen[agentID{s.App, s.ID}] = struct{}{}
+		}
 		for _, id := range s.Copies {
-			seen[s.Agent+"|"+id] = true
+			seen[agentID{s.Agent, id}] = struct{}{}
+		}
+		for _, id := range s.Subs {
+			seen[agentID{s.Agent, id}] = struct{}{}
 		}
 	}
-	out := append([]Session(nil), native...)
+	added := func(e ExternalSession) bool {
+		_, dup := seen[agentID{e.Agent, e.ID}]
+		return e.Agent != "" && e.ID != "" && !dup
+	}
+	n := len(native)
 	for _, e := range external {
-		if e.Agent == "" || e.ID == "" || seen[e.Agent+"|"+e.ID] {
+		if added(e) {
+			n++
+		}
+	}
+	out := make([]Session, len(native), n)
+	copy(out, native)
+	for _, e := range external {
+		if !added(e) {
 			continue
 		}
 		s := Session{ReadOnly: true, Gateway: true, Transcript: true, Agent: e.Agent, ID: e.ID, Title: cmp.Or(names[e.Agent+"|"+e.ID], e.Title, e.ID), Start: e.Start, Last: e.Last, Models: []Model{}, Unpriced: e.Unpriced}
@@ -157,6 +182,18 @@ func MergeExternalStats(st Stats, days []ExternalDayUsage, external []ExternalSe
 		}
 	}
 	names := desktopExternalTitles(external)
+	// grown once for every external: a Clip and then an append a session
+	// copied the whole list again and again, ~110 MB a minute of polls on a
+	// full history (#2278)
+	n := 0
+	for _, e := range external {
+		if e.ID != "" && e.Agent != "" {
+			n++
+		}
+	}
+	if n > 0 {
+		st.Sessions, sessionsOwn = slices.Grow(slices.Clip(st.Sessions), n), true
+	}
 	for _, e := range external {
 		if e.ID == "" || e.Agent == "" {
 			continue
@@ -187,9 +224,6 @@ func MergeExternalStats(st Stats, days []ExternalDayUsage, external []ExternalSe
 		for _, m := range e.Models {
 			s.Models = append(s.Models, m.Model)
 			s.Priced = s.Priced && m.Priced
-		}
-		if !sessionsOwn {
-			st.Sessions, sessionsOwn = slices.Clip(st.Sessions), true
 		}
 		st.Sessions = append(st.Sessions, s)
 	}

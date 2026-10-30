@@ -209,6 +209,7 @@ func droidIn(at place) *Agent {
 		// droid's requests to a custom model carry factory-cli/<version>
 		UA:  []string{"factory-cli"},
 		Bin: "droid", Dir: dir, Path: path,
+		ListOnly: true,
 		Sync: func() error {
 			for _, c := range droidCustoms(path, droidModels) {
 				if strings.HasPrefix(c.id, droidID) {

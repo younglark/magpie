@@ -222,7 +222,7 @@ function renderGatewayKeys() {
     tick.onclick = () => gatewayKeyAction(k.off ? "on-key" : "off-key", { key: k.id });
     // the copy sits by the key it copies (the owner: stranded among the
     // badges it read as nobody's); Rotate and Remove wait in the row's menu
-    row.append(tick, gatewayRename(k), el("span", "plan mono", k.masked), copyCallerKeyBtn(k), el("span", "grow"), gatewayModelsBadge(k), gatewayQuotasBadge(k), gatewayLimitBadge(k), gatewayKeyMore(k));
+    row.append(tick, gatewayRename(k), el("span", "plan mono", k.masked), copyCallerKeyBtn(k), el("span", "grow"), ...(k.readOnly ? [gatewayReadOnlyTag()] : []), gatewayModelsBadge(k), gatewayQuotasBadge(k), gatewayLimitBadge(k), gatewayKeyMore(k));
     const under = gatewayLimit?.id === k.id ? [gatewayLimitEditor(k)] : keyUsed(k).map((u) => gatewayLimitLine(k, u));
     if (under.length) row.classList.add("with-limit"), row.append(...under);
     list.append(row);
@@ -234,6 +234,7 @@ function renderGatewayKeys() {
 
 const ROTATE_GLYPH = "M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3.25h-3.25";
 const REMOVE_GLYPH = "M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5M7 7v4M9 7v4";
+const POWER_GLYPH = "M8 2.5v5M4.8 4.6a4.75 4.75 0 1 0 6.4 0";
 function gatewayKeyMore(k) {
   const more = el("button", "copy gw-key-more");
   more.type = "button";
@@ -244,12 +245,34 @@ function gatewayKeyMore(k) {
   more.onclick = (e) => {
     e.stopPropagation();
     if (more.classList.contains("open")) return closeAgentMenu();
+    // off and on again here too, by name, beside Remove (wei_VC on X:
+    // the tick alone wasn't seen as a switch, so a key was removed and
+    // added again)
     openRowMenu(more, [
+      { name: k.off ? "Enable key" : "Disable key", icon: POWER_GLYPH, run: () => gatewayKeyAction(k.off ? "on-key" : "off-key", { key: k.id }) },
+      // read-only (Steven on Discord: a desk display's key reads quotas
+      // and usage, and uses nothing); the sharing key is given to agents
+      k.readOnly
+        ? { name: "Give full access", icon: EYE_GLYPH, run: () => gatewayKeyAccess(k, false) }
+        : { name: "Make read-only", icon: EYE_GLYPH, run: () => gatewayKeyAccess(k, true), off: k.lan, why: k.lan ? t("The sharing key is given to agents, so it can't be read-only") : "" },
       { name: "Rotate key", icon: ROTATE_GLYPH, run: () => askGatewayKey(k, true) },
       { name: "Remove", icon: REMOVE_GLYPH, sep: true, run: () => askGatewayKey(k, false) },
     ]);
   };
   return more;
+}
+
+const EYE_GLYPH = "M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8zM8 9.9a1.9 1.9 0 1 0 0-3.8 1.9 1.9 0 0 0 0 3.8z";
+async function gatewayKeyAccess(k, readOnly) {
+  const out = await gatewayKeyAction("access-key", { key: k.id, readOnly });
+  if (out) status(t(readOnly ? "{name} is read-only" : "{name} has full access", { name: k.name }), "ok");
+}
+// a read-only key says so in its row, always: it reads quotas and usage
+// and uses no model
+function gatewayReadOnlyTag() {
+  const tag = el("span", "amodels key-readonly set", t("Read only"));
+  tag.title = t("This key only reads quotas and usage. It can't use models or MCP servers, or change anything.");
+  return tag;
 }
 
 function askGatewayKey(k, rotate) {
@@ -302,9 +325,13 @@ function gatewayModelsBadge(k) {
   b.textContent = !ms.length && !as.length ? t("All models")
     : ms.length ? (ms.length === 1 && !as.length ? ms[0] : t("{n} models", { n: ms.length }))
       : (as.length === 1 ? accountShown(as[0]) : t("{n} accounts", { n: as.length }));
+  // an account picked and no model holds the key to the accounts'
+  // providers' models (access.HeldModels, Linka on Discord): it is not
+  // let off to every other provider's
   b.title = (ms.length ? t("Only these models: {list}", { list: ms.join(", ") }) : t("Pick the models this key may use"))
     + (as.length ? "\n" + t("Only these accounts: {list}", { list: as.map(accountShown).join(", ") })
-      + "\n" + t("A provider with no account picked is used on every account; to keep the key off it, pick only other providers' models") : "");
+      + "\n" + (ms.length ? t("A provider with no account picked is used on every account; to keep the key off it, pick only other providers' models")
+        : t("No model is picked, so this key may use only the picked accounts' providers' models")) : "");
   b.setAttribute("aria-label", t("Models this key may use"));
   b.setAttribute("aria-haspopup", "menu");
   b.setAttribute("aria-expanded", "false");
@@ -322,10 +349,20 @@ function gatewayModelsBadge(k) {
     // every one, and its unticked accounts say so (#2077: unticking all of
     // Codex's left Codex's models served)
     const named = new Set(as.map((v) => v.split("/")[0].toLowerCase()));
+    // a provider the key's models leave out is used on none of its
+    // accounts: with no model picked, every provider no account is
+    // picked of (access.HeldModels)
+    const modelsReach = (pid) => ms.some((m) => {
+      const head = m.split("/")[0].toLowerCase();
+      return head === pid || head.includes("*");
+    });
     for (const a of accounts || []) {
       accountsSet.add(a.id);
-      const note = as.length && !named.has(String(a.provider).toLowerCase())
-        ? t("Used: no {provider} account is picked", { provider: a.providerName })
+      const pid = String(a.provider).toLowerCase();
+      const note = as.length && !named.has(pid)
+        ? (ms.length && modelsReach(pid)
+          ? t("Used: no {provider} account is picked", { provider: a.providerName })
+          : t("Not used: no {provider} model or account is picked", { provider: a.providerName }))
         : a.plan ? a.providerName + " · " + a.plan : a.providerName;
       const o = { v: a.id, name: a.name, note, literalName: true };
       ofProvider.set(a.provider, [...(ofProvider.get(a.provider) || []), o]);
@@ -375,7 +412,10 @@ function gatewayModelsBadge(k) {
         const pickedModels = picked.filter((v) => !accountsSet.has(v));
         const pickedAccounts = picked.filter((v) => accountsSet.has(v));
         const out = await gatewayKeyAction("models-key", { key: k.id, models: pickedModels });
-        if (out) status(t(pickedModels.length ? "{name} may use only the models picked" : "{name} may use every model", { name: k.name }), "ok");
+        if (out) {
+          status(t(pickedModels.length ? "{name} may use only the models picked"
+            : pickedAccounts.length ? "{name} may use only the picked accounts' models" : "{name} may use every model", { name: k.name }), "ok");
+        }
         if (pickedAccounts.length !== as.length || pickedAccounts.some((v) => !as.includes(v))) {
           await gatewayKeyAction("accounts-key", { key: k.id, accounts: pickedAccounts });
         }

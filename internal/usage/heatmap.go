@@ -207,7 +207,9 @@ const (
 // while only the chunks of those days change. A session file a call is
 // written to now can hold older calls too, and those are taken to stay as
 // they were: an agent appends to its file. What changes them anyway, a
-// file written again or a thread's identity learnt, shows within this.
+// file written again or a thread's identity learnt, shows within this:
+// the days are named again (heatSettledKey), and counted again only when
+// the name changed.
 var heatOldFresh = 10 * time.Minute
 
 // heatOld is the heatmap's days before cut, from a pairing of every
@@ -222,6 +224,8 @@ type heatOld struct {
 	parts   map[uint64]*chunkPart
 	// before is the recent chunks' rows before cut, which days counts
 	before heatSum
+	// key names what days were counted of (heatSettledKey); "" unnamed
+	key string
 }
 
 // heatSum is a sum of rows as read, to tell a change in them.
@@ -235,6 +239,7 @@ type heatSum struct {
 // rollout forked from an old one), and they change the days the last
 // pairing of every chunk counted.
 func heatBefore(cut time.Time, recent [3][]*rowChunk) heatSum {
+	priceStubs(recent[0])
 	rows := lentRows()
 	defer rows.release()
 	var s heatSum
@@ -292,7 +297,23 @@ func heatSplit(since, now time.Time, gateways, chunks, others []*rowChunk, f Fil
 	if ok {
 		before = heatBefore(cut, recent)
 	}
-	if !ok || old == nil || !old.cut.Equal(cut) || !slices.Equal(old.settled, serials) || old.before != before || time.Since(old.at) >= heatOldFresh {
+	var key string
+	named := false
+	kept := ok && old != nil && old.cut.Equal(cut) && slices.Equal(old.settled, serials) && old.before == before && time.Since(old.at) < heatOldFresh
+	if ok && !kept {
+		// the days are counted again only when what they were counted of
+		// changed: kept, or on disk from the last run
+		if key, named = heatSettledKey(cache.disk, cut, since, f, identities, settled, before); named {
+			if old != nil && old.key == key && old.cut.Equal(cut) && old.before == before {
+				fresh := *old
+				fresh.settled, fresh.at = serials, time.Now()
+				old, kept = &fresh, true
+			} else if days, found := heatDiskRead(key); found {
+				old, kept = &heatOld{cut: cut, settled: serials, at: time.Now(), days: days, before: before, key: key}, true
+			}
+		}
+	}
+	if !kept {
 		if heatPairing != nil {
 			heatPairing(len(gateways) + len(chunks) + len(others))
 		}
@@ -305,7 +326,13 @@ func heatSplit(since, now time.Time, gateways, chunks, others []*rowChunk, f Fil
 				kept = old.parts
 			}
 			recentDays(kept, parts)
-			cache.heatOldNext = &heatOld{cut: cut, settled: serials, at: time.Now(), days: slices.Clip(days[:n]), parts: parts, before: before}
+			next := &heatOld{cut: cut, settled: serials, at: time.Now(), days: slices.Clip(days[:n]), parts: parts, before: before}
+			if named {
+				next.key = key
+				// not written, the days are counted again on the next start
+				_ = heatDiskWrite(key, next.days)
+			}
+			cache.heatOldNext = next
 		}
 		return heatmapFrom(since, now, days)
 	}

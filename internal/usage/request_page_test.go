@@ -324,7 +324,7 @@ func TestVisibleLocalLeavesOutRepeatedMessages(t *testing.T) {
 	b.add(Row{}, "msg_3", 2, false)
 	b.add(Row{}, "msg_2", 3, false)
 	a, b = a.pack(), b.pack()
-	got := visibleLocal([]*rowChunk{a, b})
+	got := refMap(visibleLocal([]*rowChunk{a, b}))
 	if len(got) != 2 || !got[rowRef{b, 0}] || !got[rowRef{b, 3}] {
 		t.Fatalf("left out %v, want b's rows 0 and 3 only", got)
 	}
@@ -332,7 +332,8 @@ func TestVisibleLocalLeavesOutRepeatedMessages(t *testing.T) {
 
 // A read keeps one chunk a source, the map's and the page's both: a copy
 // for each was 13.5 MB after 34k sessions' start (#2278). A chunk an
-// earlier read published is copied once, never changed under its page.
+// earlier read published is taken as it is, its use counted on it: a copy
+// on every read was 255 MB in 80s of polls (#2278).
 func TestRequestBlocksKeepOneChunkASource(t *testing.T) {
 	pageHome(t)
 	now := holdClock(t, time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local))
@@ -345,7 +346,7 @@ func TestRequestBlocksKeepOneChunkASource(t *testing.T) {
 	shared.adopt(st)
 	read := func() (*rowChunk, *requestIndex) {
 		idx := shared.private()
-		b := readRequestBlocks(idx, st, All, now, sessions.ReadCallSource, true)
+		b := readRequestBlocks(idx, st, All, now, time.Time{}, sessions.ReadCallSource, true)
 		defer b.priced.release()
 		if len(b.chunks) != 1 {
 			t.Fatalf("%d chunks, want 1", len(b.chunks))
@@ -353,13 +354,13 @@ func TestRequestBlocksKeepOneChunkASource(t *testing.T) {
 		return b.chunks[0], idx
 	}
 	built, idx := read()
-	if idx.chunks[path] != built || built.Used != idx.tick {
+	if idx.chunks[path] != built || built.lastUse() != idx.tick {
 		t.Fatalf("a built chunk is copied: map %p, page %p", idx.chunks[path], built)
 	}
 	shared.keep(idx, map[string]bool{path: true})
-	used := built.Used
+	used := built.lastUse()
 	again, idx := read()
-	if again == built || idx.chunks[path] != again || again.Used != idx.tick || built.Used != used {
-		t.Fatalf("a published chunk read again: %p (was %p), map %p, used %d (was %d)", again, built, idx.chunks[path], built.Used, used)
+	if again != built || idx.chunks[path] != again || again.lastUse() != idx.tick || idx.tick <= used {
+		t.Fatalf("a published chunk read again: %p (was %p), map %p, used %d (was %d)", again, built, idx.chunks[path], again.lastUse(), used)
 	}
 }

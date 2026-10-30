@@ -26,6 +26,7 @@ The gateway can't import the library (the library imports the gateway), so the g
    Another app does the same at `/mcp/magpie/hub`, under the same guard: from another computer it needs a gateway key, as every LAN request does.
 3. `tools/call` finds the tool by its hub name in the same list, holds it to the key's limit, and calls `Call` under `hubCallWait` (50s, under the 60s an MCP client gives a call). The server's result goes back as it gave it.
 4. An error comes back as `isError` text naming the server: `The MCP server S couldn't run T: <why>`, where why is how it exited and its last line on stderr, a sign-in it needs, its command not found, or `it didn't answer in 50s`.
+5. Each call is a row of the request log (`serveMCP`'s `callMCPTool`): the hub's tool name, the Library server as its host, the agent of the path, how long it took and its error, never its arguments. It counts in no total ([Calls to magpie's own MCP tools](gateway-sessions.md#calls-to-magpies-own-mcp-tools)).
 
 ## Constraints and failure behavior
 

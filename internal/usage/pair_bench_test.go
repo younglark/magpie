@@ -40,8 +40,8 @@ func BenchmarkPairRows(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ps := pairRows(All, now, gateways, locals, nil, nil)
-		if len(ps.matched) != 200000 {
-			b.Fatal(len(ps.matched))
+		if ps.matched.count() != 200000 {
+			b.Fatal(ps.matched.count())
 		}
 	}
 }

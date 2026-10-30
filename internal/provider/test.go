@@ -60,7 +60,8 @@ func (p Provider) Test(ctx context.Context) []Result {
 			return []Result{{Protocol: proto, Error: zenPublicNone}}
 		}
 		url, body := tiny(q, proto, UpstreamName(p, model))
-		return []Result{probe(ctx, q, proto, url, q.tested(asClient(client, proto, body)), model, testWait)}
+		ctx, b := q.tested(ctx, asClient(client, proto, body))
+		return []Result{probe(ctx, q, proto, url, b, model, testWait)}
 	}
 	if p.isClaudeAccount() {
 		return []Result{p.testClaude(ctx, p.testModel(p, Anthropic))}
@@ -88,7 +89,8 @@ func (p Provider) Test(ctx context.Context) []Result {
 			continue
 		}
 		url, body := tiny(q, proto, UpstreamName(p, model))
-		out = append(out, probe(ctx, q, proto, url, q.tested(body), model, testWait))
+		ctx, b := q.tested(ctx, body)
+		out = append(out, probe(ctx, q, proto, url, b, model, testWait))
 	}
 	if len(out) == 0 && p.zenPublic() {
 		out = append(out, Result{Protocol: Chat, Error: zenPublicNone})
@@ -195,7 +197,10 @@ func (p Provider) mantleBase(base, model string) string {
 func tinyBody(q Provider, proto Protocol, model string) (url, body string) {
 	switch proto {
 	case Chat:
-		if q.IsBedrock() || q.IsAzure() {
+		if q.IsBedrock() || q.IsAzure() || OpenAIHost(HostOf(q.Base(Chat))) {
+			// OpenAI's own API, Azure's and Bedrock's turn max_tokens away
+			// on their reasoning models (GoxxKintBlade on X: every model
+			// of an OpenAI key red, "Use 'max_completion_tokens' instead")
 			return q.mantleBase(q.Chat, model) + "/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":16}`, model)
 		}
 		return q.Base(Chat) + "/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_tokens":16}`, model)
@@ -347,7 +352,8 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 		r := probe(ctx, q, proto, url, []byte(body), model, drawWait)
 		if !r.OK && ((r.Status == 404 || r.Status == 405) && HostOf(q.Chat) != "openrouter.ai" || r.Status == 400 && catalog.PointsToChat(r.Error)) {
 			url, body := tiny(q, proto, model)
-			if c := probe(ctx, q, proto, url, q.tested(body), model, testWait); c.OK {
+			ctx, b := q.tested(ctx, body)
+			if c := probe(ctx, q, proto, url, b, model, testWait); c.OK {
 				return c
 			}
 		}
@@ -416,7 +422,8 @@ func (p Provider) testOn(ctx context.Context, client string, proto Protocol, mod
 	if client != "" {
 		body = asClient(client, proto, body)
 	}
-	return probe(ctx, p, proto, url, p.tested(body), model, testWait)
+	ctx, b := p.tested(ctx, body)
+	return probe(ctx, p, proto, url, b, model, testWait)
 }
 
 // keyFor is p using the first key on that works with proto: one made for
@@ -553,7 +560,21 @@ func (p Provider) ownRequests(ctx context.Context, kind string) context.Context 
 // it: the vendor's error, a stream's error after its 200 too. Do would
 // write the status alone, so a failed test's row said nothing of why
 // (ysm119 on Discord: "no answer", and no error to find anywhere).
-func probe(ctx context.Context, p Provider, proto Protocol, url string, body []byte, model string, wait time.Duration) (r Result) {
+func probe(ctx context.Context, p Provider, proto Protocol, url string, body []byte, model string, wait time.Duration) Result {
+	r := probeOnce(ctx, p, proto, url, body, model, wait)
+	if proto == Chat && r.Status == http.StatusBadRequest {
+		// a vendor whose 400 names the other reply-length field as the
+		// one to send (a relay in front of OpenAI's reasoning models, or
+		// one that reads max_tokens alone) is asked once more with it, as
+		// the gateway asks it (forward)
+		if b, ok := WithTokenField(body, TokenFieldWanted([]byte(r.Error))); ok {
+			return probeOnce(ctx, p, proto, url, b, model, wait)
+		}
+	}
+	return r
+}
+
+func probeOnce(ctx context.Context, p Provider, proto Protocol, url string, body []byte, model string, wait time.Duration) (r Result) {
 	r = Result{Protocol: proto, Model: model}
 	if model == "" {
 		r.Error = "no model to try: expose one, or refresh the model list"

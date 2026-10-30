@@ -1103,8 +1103,16 @@ func (p Provider) planModels(ms []catalog.Model) []catalog.Model {
 		}
 	}
 	if len(out) == 0 {
+		var images map[string]bool
+		if r := p.regionOf(pr); r != nil {
+			images = r.Images
+		}
 		for _, id := range models {
-			out = append(out, catalog.Model{ID: id, Name: id})
+			m := catalog.Model{ID: id, Name: id}
+			if v, ok := images[id]; ok {
+				m.ImageInput, m.Images = &v, v
+			}
+			out = append(out, m)
 		}
 	}
 	if len(free) == 0 && p.IsCline() {
@@ -1496,8 +1504,9 @@ func (p Provider) ServesNone() bool { return p.NoModels && len(p.Models) == 0 }
 func (p Provider) waitsForPicks() bool { return len(p.Models) == 0 && len(p.Delisted) > 0 }
 
 // Exposed lists the models magpie offers to agents for this provider: the
-// user's picks; else the preset's; else everything, when that is few; none
-// after Select none (ServesNone).
+// user's picks; else the preset's; else everything, when that is few, the
+// newest of each family only under Best in family; none after Select none
+// (ServesNone).
 func (p Provider) Exposed() []catalog.Model {
 	if p.ServesNone() || p.waitsForPicks() {
 		return nil
@@ -1549,7 +1558,11 @@ func (p Provider) Exposed() []catalog.Model {
 	}
 	// a model listed on none of the APIs the provider has a URL for is
 	// left out before the first 24 are taken (#2094)
-	avail = slices.DeleteFunc(slices.Clone(avail), func(m catalog.Model) bool { return p.NoAPIFor(m.ID) })
+	avail = p.servable(avail)
+	// Best in family: the newest of each family the list has
+	if p.BestInFamily {
+		avail = catalog.BestInFamily(avail)
+	}
 	// another magpie's list is already the models its user exposed
 	if len(avail) <= manyModels || p.IsRemoteMagpie() {
 		return avail
@@ -1558,6 +1571,19 @@ func (p Provider) Exposed() []catalog.Model {
 	// vendor's own list — theirs run newest first — and let the user pick
 	// from the rest; nothing here is compiled in.
 	return avail[:manyModels]
+}
+
+// servable is avail less the models NoAPIFor leaves out.
+func (p Provider) servable(avail []catalog.Model) []catalog.Model {
+	return slices.DeleteFunc(slices.Clone(avail), func(m catalog.Model) bool { return p.NoAPIFor(m.ID) })
+}
+
+// NewestInFamily is the models Best in family would serve of avail, the
+// vendor's list (Available), before the first 24 are taken: the newest of
+// each family among those it can be asked for (catalog.BestInFamily),
+// whichever mode is on, so the editor can draw them before it is saved.
+func (p Provider) NewestInFamily(avail []catalog.Model) []catalog.Model {
+	return catalog.BestInFamily(p.servable(avail))
 }
 
 // NoAPIFor says the provider has a URL for none of the APIs the vendor's
@@ -1841,12 +1867,14 @@ var makerCatalogs = sync.OnceValue(func() []string {
 // account is at Anthropic's. A remote magpie's is what that magpie counts
 // the model at, as its list says (remotePrice). A model no catalog prices
 // is at the price its plugin lists it at (pluginListPrice), else, when the
-// plugin says the plan serves it free, costs nothing (pluginFree).
+// plugin says the plan serves it free, costs nothing (pluginFree). Codex's
+// auto-review through the Codex subscription costs nothing too, as OpenAI
+// serves it a ChatGPT sign-in (codexReviewFree).
 func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 	if pr, ok := p.remotePrice(model); ok {
 		return pr, true
 	}
-	if p.clineFreeModel(model) || p.kiloFreeModel(model) {
+	if p.clineFreeModel(model) || p.kiloFreeModel(model) || p.codexReviewFree(model) {
 		// served at no cost: not at the price of the model it is free of
 		return catalog.Price{}, true
 	}
@@ -1873,7 +1901,7 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 		if pr, ok := catalog.PricedBy(priceCatalogs(cats), m); ok {
 			return pr, true
 		}
-		if pr, ok := catalog.PricedBy(makerPriceCatalogs(), m); ok {
+		if pr, ok := makerListPrice(m); ok {
 			return pr, true
 		}
 	}
@@ -2144,11 +2172,25 @@ var kimiCodeAPI = map[string]string{
 // gone since.
 func MakerPrice(model string) (catalog.Price, bool) {
 	for _, m := range pricedNames(model) {
-		if pr, ok := catalog.PricedBy(makerPriceCatalogs(), m); ok {
+		if pr, ok := makerListPrice(m); ok {
 			return pr, true
 		}
 	}
 	return catalog.Price{}, false
+}
+
+// makerListPrice is a model id's list price at its maker: the price of
+// the models.dev provider that lists it as its own model
+// (catalog.MakerPriced), else the first maker preset's that lists it. The
+// lab's own comes first, so a model a maker preset resells (Mistral's
+// DeepSeek V4.1 Flash) is costed at what its lab charges, the official
+// price a subscription's call is estimated at (bestony on Discord, on
+// Command Code).
+func makerListPrice(m string) (catalog.Price, bool) {
+	if pr, ok := catalog.MakerPriced(makerPriceCatalogs(), m); ok {
+		return pr, true
+	}
+	return catalog.PricedBy(makerPriceCatalogs(), m)
 }
 
 // SamePriceIn is the maker's list price of the model the user said
@@ -2223,7 +2265,13 @@ func priceOf(s settings.Settings, p Provider, known bool, model string) (catalog
 		}
 	}
 	if !known {
+		if p.codexReviewFree(model) { // signed out since: still a ChatGPT sign-in's
+			return catalog.Price{}, true
+		}
 		if pr, ok := MakerPrice(model); ok {
+			if k := p.PeakOf(model); k != "" {
+				pr.Peak = k
+			}
 			return pr, true
 		}
 		return SamePriceIn(s, id, model)
@@ -2234,6 +2282,10 @@ func priceOf(s settings.Settings, p Provider, known bool, model string) (catalog
 	}
 	if !ok {
 		pr, ok = SamePriceIn(s, id, model)
+	} else if k := p.PeakOf(model); k != "" {
+		// billed by the hour it is made at (PeakOf), never a price the
+		// user set above, nor the one of the model they said it is
+		pr.Peak = k
 	}
 	// what the provider bills against it (#819)
 	if ok && p.PriceRate > 0 {
@@ -2272,6 +2324,30 @@ func EntryPricer(st settings.Settings, find func(string) (Group, []Member, bool)
 			first = pr
 		}
 		return first, true
+	}
+}
+
+// AgentPricer is EntryPricer for the model list magpie writes into an
+// agent's own config (Pi's, omp's, OpenCode's cost): a group whose
+// members cost the same is priced as EntryPricer prices it, and one whose
+// members differ at the member it sends to first — a manual group's pick,
+// else its first member not switched off — since that is the member a
+// request goes to while it answers, and an agent that prices calls by its
+// config (omp's custom provider, taotao7 on Discord) otherwise counts
+// every call to the group at 0. A first member in a fast mode, or with no
+// known price, leaves the group unpriced, as before. The list is read
+// afresh at each Sync, so the price follows the group's members.
+func AgentPricer(st settings.Settings, find func(string) (Group, []Member, bool)) func(Entry) (catalog.Price, bool) {
+	same, all := EntryPricer(st, find), All()
+	return func(e Entry) (catalog.Price, bool) {
+		if pr, ok := same(e); ok || e.Group == "" {
+			return pr, ok
+		}
+		_, ms, ok := find(e.ID)
+		if !ok || len(ms) == 0 || ms[0].Fast {
+			return catalog.Price{}, false
+		}
+		return priceIn(st, all, ms[0].Provider.ID, ms[0].Model)
 	}
 }
 
@@ -2352,7 +2428,7 @@ func pricedNames(model string) []string {
 func PricedName(model string) string {
 	n := pricedNames(model)
 	for _, name := range n {
-		if _, ok := catalog.PricedBy(makerPriceCatalogs(), name); ok {
+		if _, ok := makerListPrice(name); ok {
 			return name
 		}
 	}
@@ -2362,7 +2438,14 @@ func PricedName(model string) string {
 // PricedNameFor is PricedName for a call to that provider: a Kimi Code
 // membership's k3 is priced as the API's kimi-k3 (kimiCodeAPI).
 func PricedNameFor(providerID, model string) string {
-	if p, ok := byIDOrWas(providerID); ok && p.kimiCodeMember() {
+	p, ok := byIDOrWas(providerID)
+	if !ok {
+		p = Provider{ID: providerID}
+	}
+	if p.codexReviewFree(model) {
+		return model // free, not priced as another model (codexReviewFree)
+	}
+	if ok && p.kimiCodeMember() {
 		if id, ok := kimiCodeAPI[strings.ToLower(strings.TrimSpace(model))]; ok {
 			return id
 		}
@@ -2463,21 +2546,43 @@ type Entry struct {
 // provider not kept unlisted. A provider switched off has none in it.
 func Catalog() []Entry { return catalogKeeping(nil) }
 
-// catalogOf is the catalog agent's lists start from: Catalog, and for
-// Codex the ChatGPT accounts' own models as well when they are kept out
-// of the lists, the codex provider used only through routing groups
-// (Provider.Unlisted) or a group listing alone (Group.Unlists). Codex
-// reaches those on its own sign-in, its app lists them from the ChatGPT
-// backend, and keeping them for routing groups is about magpie's offer to
-// the other agents and /v1/models: Codex's list kept no Codex section, so
-// the app lost GPT while Codex's picker still offered it (士奇 on
-// Discord). The user takes them out of Codex's list there (HiddenModels,
-// PickedModels), which the gateway follows (CodexNativeHidden).
+// catalogOf is the catalog agent's lists start from: Catalog, with the
+// models of the user's signed-in subscriptions (SubscriptionKept) that a
+// group listing alone (Group.Unlists) keeps out of it. A group is added
+// on top of what the agents had: switching one on that names a ChatGPT
+// account's GPT models took its Codex section out of every agent's list,
+// Hermes Agent's and WorkBuddy's among them, and switched off they were
+// back (士奇 on Discord, a third time: a3ee00c05 kept them in Codex's list
+// alone). The gateway's /v1/models for a client that is no agent ("")
+// still lists the group alone, as #1783 asked.
+//
+// For Codex, the ChatGPT accounts' own models are kept too when the
+// codex provider is used only through routing groups (Provider.Unlisted):
+// Codex reaches those on its own sign-in, its app lists them from the
+// ChatGPT backend, and the codex provider's switch is about magpie's
+// offer to the other agents and /v1/models. The user takes them out of
+// Codex's list there (HiddenModels, PickedModels), which the gateway
+// follows (CodexNativeHidden).
 func catalogOf(agent string) []Entry {
-	if !strings.EqualFold(agent, "codex") {
+	if agent == "" {
 		return Catalog()
 	}
-	return catalogKeeping(CodexOwn)
+	codex := strings.EqualFold(agent, "codex")
+	return catalogKeeping(func(e Entry) bool { return SubscriptionKept(e) || codex && CodexOwn(e) })
+}
+
+// CatalogOf is the catalog agent's lists start from, before its
+// visibility and picks narrow it (CatalogFor): every model that agent may
+// be given by name.
+func CatalogOf(agent string) []Entry { return catalogOf(agent) }
+
+// SubscriptionKept reports whether e is one of a signed-in subscription's
+// own models (a ChatGPT, Claude, Copilot or plugin account's) that only a
+// group listing alone could keep out: such a group doesn't take it from
+// the agents' lists. A provider the user keeps for routing groups itself
+// (Provider.Unlisted, "Only through routing groups") still keeps it out.
+func SubscriptionKept(e Entry) bool {
+	return e.Group == "" && e.Provider.Account != nil && !e.Provider.Unlisted
 }
 
 // catalogKeeping is Catalog with the unlisted models keep says, too.
@@ -2529,15 +2634,16 @@ func Served() []Entry {
 	})
 }
 
-// Unlisted are the models Served has and Catalog doesn't: those of the
-// providers kept for routing groups (Provider.Unlisted), and those a group
-// keeps out of the lists (Group.Unlists), which agents aren't offered.
+// Unlisted are the models Served has and agents aren't offered: those of
+// the providers kept for routing groups (Provider.Unlisted), and those a
+// group keeps out of the lists (Group.Unlists) but a signed-in
+// subscription's, which agents keep (SubscriptionKept).
 func Unlisted() []Entry {
 	var out []Entry
 	entries := providerEntries()
 	kept := unlistedByGroups(entries)
 	for _, e := range entries {
-		if e.Provider.Unlisted || kept[e.ID] {
+		if e.Provider.Unlisted || kept[e.ID] && !SubscriptionKept(e) {
 			out = append(out, e)
 		}
 	}

@@ -391,16 +391,16 @@ func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, m
 	}
 	duplicates, actors, compactions := duplicateCodexCalls(logs)
 	pairs := codexResponseMatches(recs, logs, duplicates)
-	deduplicate := map[rowRef]bool{}
+	deduplicate := refSet{}
 	for index := range duplicates {
-		deduplicate[rowRef{local, index}] = true
+		deduplicate.add(rowRef{local, index})
 	}
 	responsePairs := make(map[rowRef]rowRef, len(pairs))
 	for record, call := range pairs {
 		responsePairs[rowRef{gateway, record}] = rowRef{local, call}
 	}
 	matched := map[int]bool{}
-	for ref := range matchedBlocks([]*rowChunk{gateway}, []*rowChunk{local}, deduplicate, responsePairs, time.Time{}, false) {
+	for ref := range matchedBlocks([]*rowChunk{gateway}, []*rowChunk{local}, deduplicate, responsePairs, time.Time{}, false).all() {
 		matched[ref.Index] = true
 	}
 	for index := range duplicates {

@@ -33,6 +33,7 @@ var purposeKinds = func() map[string]PurposeKind {
 	add("Test", "provider_test")     // magpie's own (probelog.KindTest)
 	add("Detect APIs", "api_detect") // probelog.KindDetect
 	add("Model list", "model_list")  // probelog.KindList
+	add("MCP tool", KindMCP)         // an MCP tool call (SourceMCP)
 	return out
 }()
 
