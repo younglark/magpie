@@ -189,6 +189,8 @@ const All = 5000
 
 // state is what one file's parse has come to, enough to read on from Off.
 type state struct {
+	// the agent whose file it is, for its parseVersions
+	Agent                 string            `json:"agent,omitempty"`
 	Codex                 *codexUsageState  `json:"-"`
 	Claude                *claudeUsageState `json:"claude,omitempty"`
 	DBRevision            string            `json:"db_revision,omitempty"`
@@ -652,7 +654,7 @@ func allFiles() []file {
 	}
 	// each lister asked Reads already; a file listed under another
 	// agent's name is held to that agent too
-	return allowed(distinctOf(append(callFileLists(codexFiles()), openCodeFiles(), piFiles(), raftFiles(),
+	return allowed(distinctOf(append(callFileLists(codexFiles()), openCodeFiles(), piFiles(), raftFiles(), cindyFiles(),
 		wslFiles("pi", "raft", "omp", "kimi"), zcodeFiles(), dshFiles(), clineFiles(), ccFiles("qoder", QoderDir("qoder")), ccFiles("qoder-cn", QoderDir("qoder-cn")),
 		grokFiles(), workbuddyFiles(), codebuddyFiles(), droidFiles(), ompFiles(), cursorFiles(), hermesFiles(), almaFiles(), kimiFiles(), agyFiles())...))
 }
@@ -764,6 +766,13 @@ func Dirs() []string {
 			named = append(named, fi)
 		}
 		out = append(out, d.dir)
+	}
+	// Cindy's Pi sessions, by their own folder: Cindy's is the app's
+	// whole data
+	for _, d := range cindySessionDirs() {
+		if _, err := os.Stat(d); err == nil {
+			out = append(out, d)
+		}
 	}
 	out = append(out, HermesDirs()...)
 	out = append(out, wslDirs()...)
@@ -1055,11 +1064,22 @@ func CachePath() string { return filepath.Join(filepath.Dir(catalog.CachePath())
 // 27: Factory Droid's skills (its Skill tool and /<name> prompts).
 // 28: OpenCode 2's, Cline's and dsh's tool calls and skills.
 // 29: Claude Code's entrypoint (Entry), Desktop's Code tab apart.
+//
+// A change to how one agent's files are read raises that agent's
+// parseVersions instead: a raise of cacheVersion reads every file of every
+// agent again, minutes of CPU for a long history after each update (#2278).
 const cacheVersion = 29
 
+// parseVersions is cacheVersion for one agent's parses, 0 when not listed:
+// raised, the parses of that agent's files kept by an older magpie are read
+// again, and the rest stand.
+var parseVersions = map[string]int{}
+
 type cacheFile struct {
-	Version int               `json:"version"`
-	Zone    string            `json:"zone"` // the time zone its days are dates in
+	Version int    `json:"version"`
+	Zone    string `json:"zone"` // the time zone its days are dates in
+	// Parsers is parseVersions as the parses were made
+	Parsers map[string]int    `json:"parsers,omitempty"`
 	Files   map[string]*state `json:"files"`
 }
 
@@ -1094,19 +1114,32 @@ func loadCache() {
 // parse starts from a clone), so a copy of the map is a snapshot; saves in a
 // row are folded into the latest, and one is written saveGap after the
 // last at the soonest.
-func saveCache() {
-	snap := save{cacheFile{Version: cacheVersion, Zone: zone(), Files: savable()}, CachePath()}
+func saveCache() { saveCacheWithin(saveGap) }
+
+// saveCacheWithin is saveCache written gap after the last save at the
+// soonest; saves folded into one wait the shortest gap any of them asked.
+func saveCacheWithin(gap time.Duration) {
+	snap := save{cacheFile{Version: cacheVersion, Zone: zone(), Parsers: parseVersions, Files: savable()}, CachePath()}
 	saving.Lock()
 	defer saving.Unlock()
+	if saving.next == nil || gap < saving.gap {
+		saving.gap = gap
+	}
 	saving.next = &snap
 	if saving.running {
+		if gap < saveGap {
+			select { // a save waiting out a longer gap looks again
+			case saveNow <- struct{}{}:
+			default:
+			}
+		}
 		return
 	}
 	saving.running = true
 	go func() {
 		for {
 			saving.Lock()
-			wait := saveGap - time.Since(saving.wrote)
+			wait := saving.gap - time.Since(saving.wrote)
 			if saving.hurry {
 				wait = 0
 			}
@@ -1115,6 +1148,7 @@ func saveCache() {
 				select {
 				case <-time.After(wait):
 				case <-saveNow:
+					continue // hurried, or a shorter gap asked: look again
 				}
 			}
 			saving.Lock()
@@ -1147,6 +1181,18 @@ func saveCache() {
 // read again then. Saved does not wait it out.
 var saveGap = time.Minute
 
+// A refresh that reads scanFiles files or more is a scan (a first start, a
+// lost or outdated index), not a poll catching up with a live session. Its
+// checkpoints wait scanSaveGap, not saveGap, and its last save waits for
+// nothing: under saveGap a scan's later checkpoints and its end waited a
+// minute after its first checkpoint, and a magpie quit or updated within
+// it kept a few hundred of 17,000 files, so each start read 22 GB of
+// rollouts again (15 to 28 s before Sessions showed, 70 to 94 s of CPU).
+var (
+	scanFiles   = 32
+	scanSaveGap = 15 * time.Second
+)
+
 // saveNow wakes a save waiting out saveGap once saving.hurry is set.
 var saveNow = make(chan struct{}, 1)
 
@@ -1155,8 +1201,9 @@ var saving struct {
 	*sync.Cond
 	running bool
 	next    *save
-	wrote   time.Time // when the last save was written
-	hurry   bool      // Saved is waiting: no save waits out saveGap
+	gap     time.Duration // the shortest gap the saves folded into next asked
+	wrote   time.Time     // when the last save was written
+	hurry   bool          // Saved is waiting: no save waits out saveGap
 }
 
 type save struct {
@@ -1220,6 +1267,7 @@ func writeCache(c *save) {
 func refresh(want, all []file) {
 	defer func() { trimSummaryRevisions(time.Now()) }()
 	var todo, waits []file
+	named := false
 	for _, f := range want {
 		if f.cold {
 			continue // in a stopped WSL distro: what was read of it stands
@@ -1239,6 +1287,13 @@ func refresh(want, all []file) {
 			// publish closed a nil channel (#2932)
 			parsing[f.path] = make(chan struct{})
 			todo = append(todo, f)
+		} else if s.Agent != f.agent && parsing[f.path] == nil {
+			// kept by a magpie that didn't name the agent: named now, so
+			// a raise of another agent's parseVersions keeps it
+			n := *s
+			n.Agent = f.agent
+			cache[f.path] = &n
+			named = true
 		}
 	}
 	if len(waits) > 0 {
@@ -1260,7 +1315,7 @@ func refresh(want, all []file) {
 	}
 	trimSummaryRevisions(time.Now())
 	if len(todo) == 0 {
-		if gone {
+		if gone || named {
 			saveCache()
 		}
 		return
@@ -1298,7 +1353,7 @@ func refresh(want, all []file) {
 				j := &jobs[i]
 				// its file's calls lock is taken before a read slot, as
 				// readCalls takes them
-				calls := callsAlong(j.f)
+				calls := callsAlong(j.f, j.old)
 				release := readSlot()
 				end := readBegin()
 				if parseHook != nil {
@@ -1307,6 +1362,11 @@ func refresh(want, all []file) {
 				j.parsed = parseWith(j.f, j.old, calls)
 				end()
 				release()
+				if j.parsed.Agent != j.f.agent {
+					n := *j.parsed // a parser may hand back old, which readers hold
+					n.Agent = j.f.agent
+					j.parsed = &n
+				}
 				if (j.parsed.Claude != nil && !windows[j.f.path]) || (j.parsed.Claude == nil && !recentRevision(j.parsed.Mod, j.parsed.revisionWeight(), time.Now())) {
 					j.parsed = j.parsed.withoutRevisions()
 				}
@@ -1337,6 +1397,10 @@ func refresh(want, all []file) {
 	// end: a first read of a long history on a slow disk runs for minutes,
 	// and a magpie quit before the end (its CPU full, #1665) kept nothing
 	// of it, so the next start read it all again.
+	checkpointGap, endGap := saveGap, saveGap
+	if len(jobs) >= scanFiles {
+		checkpointGap, endGap = min(scanSaveGap, saveGap), 0
+	}
 	tick := time.NewTicker(checkpointEvery)
 	defer tick.Stop()
 	unsaved := false
@@ -1354,7 +1418,7 @@ func refresh(want, all []file) {
 			}
 			mu.Lock()
 			if generation == cacheGeneration {
-				saveCache()
+				saveCacheWithin(checkpointGap)
 			}
 			mu.Unlock()
 			unsaved = false
@@ -1363,7 +1427,7 @@ func refresh(want, all []file) {
 	mu.Lock()
 	progress.finish()
 	if generation == cacheGeneration {
-		saveCache()
+		saveCacheWithin(endGap)
 	}
 }
 
@@ -1508,23 +1572,42 @@ func Reset() {
 	cache, loaded = nil, false
 	cacheGeneration++
 	forgetKeptStats()
+	forgetKeptList()
 }
 
 // List reads the latest sessions of every agent, the most recently active
 // first, at most limit of them (Limit when 0).
 func List(limit int) []Session {
+	out, _, _ := ListUnless(limit, -1)
+	return out
+}
+
+// ListUnless is List, and a number for its listing that changes whenever
+// the listing is made again: at least once a listing has stood
+// listKeptFor. When that number is made, the listing is still the one
+// the caller had it with, and no copy of it is given (same). The Sessions
+// page asks for every session each 15 s, and an unchanged list was
+// copied, rowed, encoded and hashed again, only to answer X-Magpie-Same.
+func ListUnless(limit, made int) (out []Session, now int, same bool) {
 	// read before the locks: it reads settings.json
 	alias := provider.UsageAlias()
-	out := listSessions(limit)
+	out, now, same = listing(limit, made)
 	if alias != nil {
 		for i := range out {
 			aliasSession(&out[i], alias)
 		}
 	}
-	return out
+	return out, now, same
 }
 
 func listSessions(limit int) []Session {
+	out, _, _ := listing(limit, -1)
+	return out
+}
+
+// listing is the listing at limit, kept or made now, and keptList.made
+// for it: none when the kept one is made, the number the caller had.
+func listing(limit, made int) ([]Session, int, bool) {
 	storeMu.RLock()
 	defer storeMu.RUnlock()
 	if limit <= 0 {
@@ -1536,6 +1619,18 @@ func listSessions(limit int) []Session {
 
 	defer useDBs()()
 	files := allFiles()
+	// every changed file, not just the latest sessions': the first read
+	// indexes them all in one run the page can show, and the stats read
+	// after it has nothing left to do
+	refresh(files, files)
+	price, titles := pricer(), codexTitleOf()
+	if out, ok := keptListing(files, limit, price, titles); ok {
+		if keptList.made == made {
+			return nil, made, true
+		}
+		return slices.Clone(out), keptList.made, false
+	}
+	price, titles = keepListing(files, limit, price, titles)
 	groups := byKey(files, nil)
 	latest := make(map[string]time.Time, len(groups))
 	for _, f := range files {
@@ -1556,17 +1651,12 @@ func listSessions(limit int) []Session {
 	// the keys are not truncated yet: assemble below drops an empty
 	// session, and a nonempty one must take its place rather than the
 	// page going short - an empty file is not a session (#1320)
-	// every changed file, not just the latest sessions': the first read
-	// indexes them all in one run the page can show, and the stats read
-	// after it has nothing left to do
-	refresh(files, files)
 	identities := codexIdentitySnapshot(files)
 	taskTitles := codexSubagentTaskTitles(files)
 
 	copies, branches := ccFamily(files)
 	copyIDs := copiesByKeeper(copies, groups)
 
-	price, titles := pricer(), codexTitleOf()
 	// made for the page at once, not grown an append at a time (#2278)
 	out := make([]Session, 0, min(limit, len(keys)))
 	for _, k := range keys {
@@ -1585,7 +1675,8 @@ func listSessions(limit int) []Session {
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Last.After(out[j].Last) })
-	return out
+	keepList(out)
+	return out, keptList.made, false
 }
 
 // sortSessionFiles puts a session's own file first; for Codex the earliest
@@ -1783,7 +1874,7 @@ func parserFor(agent string) sessionParser {
 		return sessionParser{whole: parseCursor}
 	case "codex":
 		return sessionParser{line: codexBody}
-	case "pi", "raft", "omp":
+	case "pi", "raft", "cindy", "omp":
 		return sessionParser{line: piParse}
 	case "workbuddy", "codebuddy":
 		return sessionParser{line: workbuddyLine}
@@ -1798,9 +1889,11 @@ func parse(f file, old *state) *state { return parseWith(f, old, nil) }
 // parseWith is parse with calls, when not nil, reading the file's calls on
 // the same pass.
 func parseWith(f file, old *state, calls *callsRide) *state {
-	if calls != nil {
-		defer calls.release()
-	}
+	defer func() {
+		if calls != nil {
+			calls.release()
+		}
+	}()
 	// Summary caches contain aggregates only. After a restart, a changed
 	// Codex file rebuilds its transient response index from the source.
 	if f.agent == "codex" && old != nil && old.Codex == nil {
@@ -1835,6 +1928,10 @@ func parseWith(f file, old *state, calls *callsRide) *state {
 	line := func(b []byte, _, _ int64) bool {
 		parser.line(s, b, f.main)
 		return true
+	}
+	if calls != nil && (s.Off != 0 || calls.st.Off != 0) {
+		calls.release() // a read goes on from where it was
+		calls = nil
 	}
 	if calls != nil {
 		head, line = calls.ride(head, line)
@@ -2253,13 +2350,51 @@ func (z *zstdFile) Close() error {
 	return z.f.Close()
 }
 
+// lastIndex is bytes.LastIndex(b, key), found going forward. LastIndex
+// goes back a byte at a time (Rabin-Karp), and over Claude Code's lines,
+// one holding a tool's whole output, it was ~8 s of a first start's CPU
+// on a 14 GB history (#2278); Index skips ahead with the CPU's vector
+// instructions. The line's tail is looked at first, where Claude Code
+// writes the timestamp.
+func lastIndex(b, key []byte) int {
+	const tail = 1 << 10
+	if len(key) == 0 {
+		return len(b)
+	}
+	if len(b) > tail {
+		if i := forwardLast(b[len(b)-tail:], key); i >= 0 {
+			return len(b) - tail + i
+		}
+	}
+	return forwardLast(b, key)
+}
+
+// forwardLast is the last key in b, found by Index from each one before;
+// even a 1 KB tail took LastIndex ~1 µs.
+func forwardLast(b, key []byte) int {
+	last := -1
+	for off := 0; off < len(b); {
+		i := bytes.Index(b[off:], key)
+		if i < 0 {
+			break
+		}
+		last = off + i
+		off = last + 1
+	}
+	return last
+}
+
 // tsAt reads the time of a line from its first (or last) "timestamp" key,
 // without decoding the rest of it.
 func tsAt(b []byte, last bool) time.Time {
 	key := []byte(`"timestamp":"`)
-	i := bytes.Index(b, key)
+	// the first is looked for only when it is the one asked: found before
+	// each last one too, it was ~2 s of a first start's CPU (#2278)
+	var i int
 	if last {
-		i = bytes.LastIndex(b, key)
+		i = lastIndex(b, key)
+	} else {
+		i = bytes.Index(b, key)
 	}
 	if i < 0 {
 		return time.Time{}
@@ -2326,7 +2461,11 @@ func priceOf(s settings.Settings, model string) (catalog.Price, bool) {
 		return catalog.Price{}, false
 	}
 	if pid, rest, ok := strings.Cut(m, "/"); ok {
-		if pr, ok := provider.EffectivePriceIn(s, pid, rest); ok {
+		// without a rate window's rate (#2463): a session sums its calls by
+		// model, not by time, so the window of the hour it is read in
+		// would price all of them at it, and the same session read 3× at
+		// the peak and 1× off it
+		if pr, ok, _ := provider.BasePriceIn(s, pid, rest); ok {
 			return pr, true
 		}
 	}

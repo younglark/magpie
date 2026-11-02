@@ -34,6 +34,9 @@ var readOnlyRoutes = map[string]bool{
 	"GET /v1/magpie/usage/requests":   true,
 	"GET /v1/magpie/limit":            true,
 	"GET /v1/magpie/concurrency":      true,
+	"GET " + OwnMCPPath:               true,
+	"GET " + KeyPagePath:              true,
+	"GET " + keyPageData:              true,
 }
 
 // ReadOnlyCode is the error code a read-only key is refused a route with.

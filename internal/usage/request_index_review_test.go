@@ -92,7 +92,7 @@ func TestQueryPageIOOutsideCacheLock(t *testing.T) {
 func TestPackedGatewayRetainsOversizedSnapshot(t *testing.T) {
 	c := &rowChunk{}
 	now := time.Now().Round(0)
-	for i := 0; i < 170000; i++ {
+	for i := 0; i < 180000; i++ {
 		c.add(Row{Record: Record{Time: now.Add(time.Duration(i) * time.Second), Agent: "codex", Provider: "relay", Model: "m", Input: 10, RequestID: fmt.Sprint(i)}}, "", int64(i), false)
 	}
 	if c.Bytes <= 32<<20 {
@@ -185,7 +185,7 @@ func matchedLocalLegacy(gateway *rowChunk, chunks []*rowChunk, skip map[rowRef]b
 	for _, c := range chunks {
 		for i, p := range c.Rows {
 			ref := rowRef{c, i}
-			if skip[ref] || p.Time.Before(since) {
+			if skip[ref] || p.Time().Before(since) {
 				continue
 			}
 			id := c.Strings[c.text(&p, 11)]
@@ -218,7 +218,7 @@ func matchedLocalLegacy(gateway *rowChunk, chunks []*rowChunk, skip map[rowRef]b
 	for _, c := range chunks {
 		for j, p := range c.Rows {
 			ref := rowRef{c, j}
-			if skip[ref] || matched[ref] || p.Time.Before(since) {
+			if skip[ref] || matched[ref] || p.Time().Before(since) {
 				continue
 			}
 			s := c.Strings[c.text(&p, 13)]

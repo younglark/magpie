@@ -30,6 +30,55 @@ type Stats struct {
 	// line — and a session whose last line is a setting or a fork's seed,
 	// written long after its last call, was listed but not counted.
 	Keys []string `json:"keys"`
+	// gateway are the sessions magpie knows only from the gateway's
+	// records (MergeExternalStats), the most recently active first. They
+	// are kept apart from Sessions, which the merge copied whole to add
+	// them: ~10 MB over a full history beside the Sessions it was copied
+	// from, kept for each range (#2278).
+	gateway []Summary
+	// shift is the days added to a session's days for the range's: the
+	// gateway's history can start before Sessions' From.
+	shift int
+}
+
+// eachSession calls f with Sessions and the gateway's, the most recently
+// active first, a Sessions one first of two as recent.
+func (st *Stats) eachSession(f func(*Summary)) {
+	i, j := 0, 0
+	for i < len(st.Sessions) || j < len(st.gateway) {
+		if j == len(st.gateway) || i < len(st.Sessions) && !st.gateway[j].Last.After(st.Sessions[i].Last) {
+			f(&st.Sessions[i])
+			i++
+		} else {
+			f(&st.gateway[j])
+			j++
+		}
+	}
+}
+
+// AllSessions is every session st counts, the gateway's among them, in
+// eachSession's order, each with its days in the range's: a copy, for a
+// reader that wants them as one list.
+func (st Stats) AllSessions() []Summary {
+	out := make([]Summary, 0, len(st.Sessions)+len(st.gateway))
+	st.eachSession(func(s *Summary) { out = append(out, st.shifted(*s)) })
+	return out
+}
+
+// shifted is s with its days in the range's.
+func (st Stats) shifted(s Summary) Summary {
+	if st.shift == 0 {
+		return s
+	}
+	s.Days = slices.Clone(s.Days)
+	for j := range s.Days {
+		s.Days[j] += st.shift
+	}
+	s.perDay = slices.Clone(s.perDay)
+	for j := range s.perDay {
+		s.perDay[j].day += st.shift
+	}
+	return s
 }
 
 // Summary is one session's share of a range.
@@ -679,29 +728,30 @@ func (st Stats) Overview(agent, model, cwd string, n int) Overview {
 	// the sessions are pointed to, not copied: a Summary is ~400 bytes, and
 	// the Sessions page's poll copied all of them four times, ~1.5 GB in
 	// two minutes over 34k sessions while an agent worked (#2278)
-	in := make([]*Summary, 0, len(st.Sessions))
-	spent := make([]int, 0, len(st.Sessions))
-	for i := range st.Sessions {
-		s := &st.Sessions[i]
+	all := len(st.Sessions) + len(st.gateway)
+	in := make([]*Summary, 0, all)
+	spent := make([]int, 0, all)
+	st.eachSession(func(s *Summary) {
 		if agent != "" && s.Agent != agent || cwd != "" && s.Cwd != cwd || model != "" && !slices.Contains(s.Models, model) {
-			continue
+			return
 		}
 		in = append(in, s)
 		spent = append(spent, s.Input+s.Output)
 		for _, d := range s.Days {
-			if d >= 0 && d < len(out.Days) {
+			if d += st.shift; d >= 0 && d < len(out.Days) {
 				out.Days[d]++
 			}
 		}
 		for _, pd := range s.perDay {
-			if d := pd.day; d >= 0 && d < len(out.Days) {
+			if d := pd.day + st.shift; d >= 0 && d < len(out.Days) {
 				out.Messages[d] += pd.messages
 				out.Output[d] += pd.output
 			}
 		}
-	}
+	})
 	out.Shape = shapes(in)
-	out.Tools = toolUse(in, first, n)
+	// a session's days are after the day st.shift days after From
+	out.Tools = toolUse(in, first.AddDate(0, 0, st.shift), n)
 	out.Skills = skillUse(in, n)
 	out.Count = len(in)
 	if len(spent) > 0 {
@@ -724,7 +774,7 @@ func (st Stats) Overview(agent, model, cwd string, n int) Overview {
 		}
 		out.Top[by] = make([]Summary, k)
 		for i, s := range top[:k] {
-			out.Top[by][i] = *s
+			out.Top[by][i] = st.shifted(*s)
 		}
 	}
 	return out
@@ -766,10 +816,13 @@ func shapes(in []*Summary) map[string]Shape {
 	return out
 }
 
-// toolUse sums up the sessions' tool calls, the n most called.
+// toolUse sums up the sessions' tool calls, the n most called. The callers
+// spell a tool's name either way ("bash", "Bash"), so its spellings are one
+// tool here, shown as its summary spells it.
 func toolUse(in []*Summary, first time.Time, n int) ToolUse {
 	out := ToolUse{Top: []ToolStat{}, Categories: []ToolStat{}, Weeks: []ToolWeek{}}
 	tools, cats := map[string]*ToolStat{}, map[string]*ToolStat{}
+	shown, said := map[string]string{}, map[string]int{} // the spelling a tool is shown by, the calls each spelling has
 	weeks := map[string]map[string]int{}
 	for _, s := range in {
 		if s.ToolCalls == 0 {
@@ -777,24 +830,35 @@ func toolUse(in []*Summary, first time.Time, n int) ToolUse {
 		}
 		out.Sessions++
 		out.Calls += s.ToolCalls
-		seen := map[string]bool{}
+		seen, seenTool := map[string]bool{}, map[string]bool{}
 		for _, tc := range s.tools {
 			name, c := tc.name, tc.n
-			t := tools[name]
+			key := strings.ToLower(name) // one tool apiece, its spellings together
+			t := tools[key]
 			if t == nil {
-				t = &ToolStat{Name: name, Category: ToolCategory(name)}
-				tools[name] = t
+				t = &ToolStat{Name: name}
+				tools[key] = t
 			}
 			t.Calls += c
-			t.Sessions++
-			cat := cats[t.Category]
+			if !seenTool[key] {
+				seenTool[key] = true
+				t.Sessions++
+			}
+			said[name] += c
+			if best := shown[key]; best == "" || said[name] > said[best] || (said[name] == said[best] && name < best) {
+				shown[key] = name // its most called spelling, the first in byte order on a tie
+			}
+			// the legend counts each spelling under its own category, as
+			// the weeks do (pd.tools): "task" and "Task" are two there
+			k := ToolCategory(name)
+			cat := cats[k]
 			if cat == nil {
-				cat = &ToolStat{Name: t.Category}
-				cats[t.Category] = cat
+				cat = &ToolStat{Name: k}
+				cats[k] = cat
 			}
 			cat.Calls += c
-			if !seen[t.Category] {
-				seen[t.Category] = true
+			if !seen[k] {
+				seen[k] = true
 				cat.Sessions++
 			}
 		}
@@ -814,7 +878,12 @@ func toolUse(in []*Summary, first time.Time, n int) ToolUse {
 			}
 		}
 	}
-	for _, t := range tools {
+	for key, t := range tools {
+		t.Name = shown[key]
+		t.Category = ToolCategory(t.Name)
+		if strings.EqualFold(t.Name, t.Category) {
+			t.Name = t.Category // "bash" shown as the summary's "Bash"
+		}
 		out.Top = append(out.Top, *t)
 	}
 	for _, c := range cats {

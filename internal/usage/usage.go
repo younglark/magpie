@@ -44,6 +44,9 @@ type Record struct {
 	ProviderAccount string `json:"providerAccount,omitempty"`
 	CallerKeyID     string `json:"callerKeyId,omitempty"`
 	CallerKeyName   string `json:"callerKeyName,omitempty"`
+	// CallerIssuerID is the key CallerKeyID was issued under (an issued,
+	// short-lived key: access.IssueKey), whose limits count this call too.
+	CallerIssuerID string `json:"callerIssuerId,omitempty"`
 	// SessionProvider is the provider ID recorded by the agent. SessionAccount
 	// identifies the session's creator, not the account used for an API request.
 	// Neither field establishes an upstream route from today's configuration.
@@ -111,8 +114,13 @@ type Record struct {
 	// native Codex call established whether a gateway row compacted.
 	Compaction *bool `json:"compaction,omitempty"`
 	// FirstReasoning is the start of paced visible reasoning, absent for hidden reasoning.
-	FirstReasoning  int64 `json:"first_reasoning_ms,omitempty"`
-	ReasoningHidden bool  `json:"reasoning_hidden,omitempty"`
+	FirstReasoning int64 `json:"first_reasoning_ms,omitempty"`
+	// ReasoningHidden: the reply reasoned and its stream doesn't tell how
+	// much — sealed or summarised, or streamed with no reasoning count in
+	// its usage (#4545: Anthropic's usage never has one), when Reasoning is
+	// 0 for unknown, not for none. A reply of no text then tells no speed
+	// (Decode).
+	ReasoningHidden bool `json:"reasoning_hidden,omitempty"`
 	// Sent: ms from the request to its answering try going out to the
 	// vendor, its body written, as TTFT is counted: magpie's own time and
 	// the tries that failed first are before it, and TTFT-Sent is how
@@ -1004,6 +1012,18 @@ type Via struct {
 // agent id and the session's id ("codex|<id>"), the most calls first.
 func Vias(since time.Time) ViaIndex {
 	return cachedVias(since)
+}
+
+// LogVersion is a number for the log as it stands, which changes when a
+// call is written to it, and whether there is one: a synthetic log
+// (LogCalls), or one not read to its end, has none; no log yet is one. The Sessions page
+// keys an unchanged list on it.
+func LogVersion() (uint64, bool) {
+	if LogCalls != nil {
+		return 0, false
+	}
+	s := readLogSnapshot()
+	return s.version, s.info == nil || s.complete()
 }
 
 // A provider renamed since is listed by the id it has now (renames): the

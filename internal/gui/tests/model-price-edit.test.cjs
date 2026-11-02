@@ -27,6 +27,8 @@ function serve(lang, posts) {
     // billed by the hour (treeMan on Discord): the list price is off-peak
     { id: "model-5", name: "Model 5", on: true, efforts: [], images: false, list: { ...list, peak: "deepseek" } },
     { id: "model-6", name: "Model 6", on: true, efforts: [], images: false, list: { ...list, peak: "weekdays" } },
+    // Ollama Cloud's: its own hours, 12:00 to 18:00 UTC (hayden4608 on Discord)
+    { id: "model-7", name: "Model 7", on: true, efforts: [], images: false, list: { ...list, peak: "ollama" } },
   ];
   const provider = { id: "relay", name: "Relay", icon: "generic", chat: "https://relay.example/v1", responses: "", anthropic: "", models, agents: [], key: { set: true, masked: "sk-…1234" }, ready: true };
   const providers = { providers: [provider], presets: [], excluded: [], gateway: { running: true, window: true } };
@@ -61,6 +63,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
@@ -82,13 +85,20 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // whose list price it is: models.dev's, or the other magpie's
       assert.match(await row("model-1").locator(".mprice").getAttribute("title"), zh ? /留空即官方价格/ : /empty: its list price/);
       assert.match(await row("model-4").locator(".mprice").getAttribute("title"), zh ? /留空即另一台 magpie 计费用的价格/ : /empty: what the other magpie counts it at/);
-      // an off-peak list price says when it counts double, DeepSeek's own
-      // but for China's public holidays
-      const peak = zh ? /闲时价/ : /Off-peak list price/, holiday = zh ? /节假日除外/ : /Chinese public holidays/;
+      // an off-peak list price says when it counts double, and that a
+      // price set here does too; DeepSeek's own but for China's public
+      // holidays
+      const peak = zh ? /闲时价（官方价格或在此设置的价格）/ : /Off-peak price, the list's or one set here/, holiday = zh ? /节假日除外/ : /Chinese public holidays/;
       assert.doesNotMatch(await row("model-1").locator(".mprice").getAttribute("title"), peak);
       assert.match(await row("model-5").locator(".mprice").getAttribute("title"), holiday);
       assert.match(await row("model-6").locator(".mprice").getAttribute("title"), peak);
       assert.doesNotMatch(await row("model-6").locator(".mprice").getAttribute("title"), holiday);
+      const ollama = await row("model-7").locator(".mprice").getAttribute("title");
+      assert.match(ollama, peak);
+      assert.match(ollama, zh ? /周一至周五 UTC 12:00–18:00/ : /from 12:00 to 18:00 UTC, Monday to Friday/);
+      assert.doesNotMatch(ollama, /01:00/);
+      assert.doesNotMatch(ollama, holiday);
+      assert.doesNotMatch(await row("model-6").locator(".mprice").getAttribute("title"), /12:00/);
 
       // a part typed, the others the list's; Restore default drops a price
       const y = await page.evaluate(() => scrollY);

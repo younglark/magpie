@@ -175,15 +175,21 @@ func resolveDrawing(id string) (provider.Provider, string, bool) {
 // drawsFamily is whether a subscription whose image models magpie lists
 // itself (codexDrawers, grokDrawers) draws id, a model of the family those
 // are of: any grok-imagine-image* on a Grok subscription, any gpt-image-*
-// on a ChatGPT account. The vendor's newer ones work before magpie names
-// them, as grok-imagine-video* do for videos; one it doesn't serve is
-// refused by the vendor, in its own words.
+// on a ChatGPT account, and any gpt-image-* on a keyed relay at a Responses
+// base (a Codex backend relay such as sub2api) whose own list draws one of
+// that family already (#4432). The vendor's newer ones work before magpie
+// names them, as grok-imagine-video* do for videos; one it doesn't serve is
+// refused by the vendor, in its own words. A relay whose list draws no
+// GPT Image isn't taken to: a Codex turn on it draws with the Settings
+// pick, as it did (TestCodexDrawingFallsBackToImageSetting).
 func drawsFamily(p provider.Provider, id string) bool {
 	switch {
 	case drawsGrok(p):
 		return strings.HasPrefix(id, grokDrawerFamily)
 	case drawsCodex(p):
 		return strings.HasPrefix(id, codexDrawerFamily)
+	case p.Account == nil && p.Base(provider.Responses) != "" && strings.HasPrefix(id, codexDrawerFamily):
+		return slices.ContainsFunc(Drawers(p), func(m catalog.Model) bool { return strings.HasPrefix(m.ID, codexDrawerFamily) })
 	}
 	return false
 }
@@ -266,7 +272,13 @@ func drawsCodex(p provider.Provider) bool {
 // own picks named for images, and those the user said draw (#1399), less
 // those they said make videos; a ChatGPT account's GPT Image, a Grok
 // subscription's Grok Imagine, a WorkBuddy plan's those its config lists.
-func Drawers(p provider.Provider) []catalog.Model {
+func Drawers(p provider.Provider) []catalog.Model { return DrawersOf(p, p.Available) }
+
+// DrawersOf is Drawers with p's model list from avail, called only when
+// it is wanted: the Providers page has each provider's list at hand, and
+// reading it again for each was 15 MB of what twenty window polls
+// allocated. What avail gives is only read.
+func DrawersOf(p provider.Provider, avail func() []catalog.Model) []catalog.Model {
 	if drawsWorkBuddy(p) {
 		return wbDrawers(p)
 	}
@@ -284,7 +296,7 @@ func Drawers(p provider.Provider) []catalog.Model {
 		// the image models a Google sign-in lists (Antigravity's
 		// gemini-3.1-flash-image), which draw on Code Assist (#757)
 		var out []catalog.Model
-		for _, m := range p.Available() {
+		for _, m := range avail() {
 			if catalog.DrawsID(m.ID) {
 				m.Provider = p.ID
 				out = append(out, m)
@@ -302,7 +314,7 @@ func Drawers(p provider.Provider) []catalog.Model {
 		// when it says it gives images or is named for them (XYenon's
 		// Google AI Studio plugin).
 		var out []catalog.Model
-		for _, m := range p.Available() {
+		for _, m := range avail() {
 			if p.ModelKind(m.ID) == provider.KindVideo {
 				continue
 			}
@@ -522,6 +534,9 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			return
 		}
 		g, ms, isGroup := drawingGroup(d.Model, p, model)
+		if isGroup {
+			r = heldByGroup(r, g) // held to the group's accounts, if it is
+		}
 		keyWho, keyHeld := keyHolds(r)
 		if keyHeld && named && (isGroup && !groupAllowed(keyWho, g, ms) || !isGroup && !modelAllowed(keyWho, p, model)) {
 			fail(403, keyModelError(keyWho, d.Model))
@@ -1301,6 +1316,9 @@ func (s *Server) drawImages(ctx context.Context, p provider.Provider, model stri
 	}
 	if isArk(p) {
 		return s.drawArk(ctx, p, model, d)
+	}
+	if dashScopeDraws(p, model) {
+		return s.drawDashScope(ctx, p, model, d)
 	}
 	base := strings.TrimRight(p.Base(provider.Chat), "/")
 	if base == "" {

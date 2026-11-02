@@ -49,8 +49,23 @@ input intact while excluding client environment/instruction notices from recall.
 Empty identity fields must not be interpreted as authenticated user identity.
 
 `origin` is host-derived: `local` for a direct loopback request without
-forwarding headers or a named gateway key, `gateway-key` for a named key
-(including one used on loopback), otherwise `remote`. Forwarded traffic stays
+forwarding headers or a named gateway key; `magpie-key` for the sharing key
+magpie made itself (`access.Identity.Default`: the key marked `lan`, the one
+`LANKeyID` names, or an older magpie's settings-only key) when it comes from
+this computer (`ownComputer`: loopback, one of this computer's own
+addresses, or a WSL distro's network; never with forwarding headers, a
+trusted proxy's included, nor through magpie web's page port), which is
+where magpie writes it into the owner's own agents; `gateway-key` for any
+other named key, on loopback too (one the owner made for someone else, a
+value a user brought, a `sk-magpie-` key that didn't authenticate), and for
+the sharing key from anywhere else: Gateway keys lists it with a Copy
+button and offers it to connect other computers, so a friend may hold it;
+otherwise `remote`. magpie has no "this named key is mine" mark, so every
+key the owner made reads `gateway-key`. A plugin that serves the owner's own
+agents beyond `local` checks `magpie-key`, never `gateway-key`
+(plugins#526). Hosts before `magpie-key` (v0.1.2208) sent `gateway-key` for
+the sharing key too, so a plugin that trusts only `local` sees both as
+not local, as before. Forwarded traffic stays
 remote even with `MAGPIE_TRUST_PROXY=1`. No key, key name, peer address or
 client-supplied origin claim is exposed. Missing origin on an older host means
 unknown. This classification is not a user identity; plugins that export

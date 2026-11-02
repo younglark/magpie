@@ -126,9 +126,9 @@ func ompRoot(home string) string {
 // it names.
 func ompDir(home string) (dir string, shared bool) {
 	root := ompRoot(home)
-	p, set := os.LookupEnv("OMP_PROFILE")
+	p, set := appdir.LookupEnv("OMP_PROFILE")
 	if !set {
-		p = os.Getenv("PI_PROFILE")
+		p = appdir.Getenv("PI_PROFILE")
 	}
 	if p = strings.TrimSpace(p); ompProfileOK(p) {
 		return filepath.Join(root, "profiles", p, "agent"), false
@@ -193,7 +193,7 @@ func ompProfiles(home string) []*Agent {
 // known), and without one its models offer xhigh rather than a max an older
 // omp would refuse.
 func ompIn(at place) *Agent {
-	return ompAt(at, filepath.Join(at.home, ".omp", "agent"), func() ompProviderEntry { return ompProviderAt(at.gw(), at.version) })
+	return ompAt(at, at.join(".omp", "agent"), func() ompProviderEntry { return ompProviderAt(at.gw(), at.version) })
 }
 
 // ompAt is omp with its agent folder at dir, magpie's entry in its
@@ -342,7 +342,7 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 				return dropMagpie()
 			},
 			Options: func(cur map[string]string) []Option {
-				opts := append(ompOwnOptions(pick("models"), cur[key]), viaMagpie("omp", magpieID+"/")...)
+				opts := append(ompOwnOptions(pick("models"), cur[key]), viaMagpieShared("omp", magpieID+"/")...)
 				// a catalog model with a thinking level is offered as it
 				// reads, beside the model: that keeps the level, the model
 				// alone clears it
@@ -492,7 +492,7 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 			}
 			scopeGoneRename(gone, from, to)
 			for _, w := range was {
-				s := stashLoad()[w]
+				s := stashShared()[w]
 				ns := move(s)
 				if ompYAMLList(s) {
 					t, err := edit.EditYAMLTextStrings(edit.YAMLText(s), move)
@@ -638,7 +638,9 @@ func ompTakesMax(v string) bool {
 // baseUrl/responses; one on Anthropic's Messages API to the gateway's
 // /v1/messages (omp adds the /v1). That one thinks adaptively when it takes
 // nothing else, else on a budget: omp's anthropic-budget-effort would also
-// send output_config.effort, which Sonnet 4.5 and Haiku 4.5 refuse.
+// send output_config.effort, which Sonnet 4.5 and Haiku 4.5 refuse. One on
+// Gemini's API goes to the gateway's /v1beta on google-generative-ai
+// (#4277, ompGeminiMode).
 func ompProvider() ompProviderEntry { return ompProviderAt(gateway.URL(), ompVersion()) }
 
 // ompProviderAt is ompProvider for an omp of version (as ompVersion) that
@@ -646,7 +648,7 @@ func ompProvider() ompProviderEntry { return ompProviderAt(gateway.URL(), ompVer
 func ompProviderAt(gw, version string) ompProviderEntry {
 	takesMax := ompTakesMax(version)
 	ms := []ompModel{}
-	for _, m := range magpieModels("omp") {
+	for _, m := range sharedModels("omp") {
 		e := ompModel{ID: m.ID, Name: m.Name, Context: m.Context, MaxTokens: maxTokens(m)}
 		if p := m.Price; p != nil {
 			e.Cost = &ompCost{Input: p.Input, Output: p.Output, CacheRead: p.CacheRead, CacheWrite: p.CacheWrite}
@@ -661,6 +663,14 @@ func ompProviderAt(gw, version string) ompProviderEntry {
 			if gateway.AdaptiveThinking(m.ID) {
 				mode = "anthropic-adaptive"
 			}
+		case slices.Contains(m.APIs, string(provider.Gemini)):
+			// #4277: a Gemini model on Gemini's own API at the gateway's
+			// /v1beta, as OmO's; omp posts to baseUrl/models/<id>:
+			// streamGenerateContent?alt=sse with x-goog-api-key, the key
+			// being "N/A" (kNoAuth) under auth: none, which loopback takes
+			// (pi-ai providers/google.ts, 16.0.0 to 18.14.0)
+			e.API, e.BaseURL = "google-generative-ai", gw+"/v1beta"
+			mode = ompGeminiMode(m.ID)
 		}
 		// Without input omp takes it from a bundled model its fuzzy id match
 		// finds, else text only; a model the source never answered for is
@@ -701,6 +711,21 @@ func ompProviderAt(gw, version string) ompProviderEntry {
 		e.Auth, e.APIKey = "", key
 	}
 	return e
+}
+
+// ompGeminiMode is how omp asks a Gemini model on google-generative-ai
+// to think. Gemini 3 and later take thinkingConfig.thinkingLevel
+// (google-level: omp sends minimal to high as MINIMAL to HIGH, xhigh and max
+// as HIGH); Gemini 2.x and earlier take a thinkingBudget and refuse a level,
+// so they go on budget, which omp sends as -1, the model's own (pi-ai
+// stream.ts and pi-catalog's gemini.kdl, omp 18.14.0). "effort" there is a
+// budget too, the same -1.
+func ompGeminiMode(id string) string {
+	name := strings.ToLower(id[strings.LastIndex(id, "/")+1:])
+	if strings.HasPrefix(name, "gemini-1") || strings.HasPrefix(name, "gemini-2") {
+		return "budget"
+	}
+	return "google-level"
 }
 
 // ompKept is magpie's entry e laid over the one in the models.yml at path.

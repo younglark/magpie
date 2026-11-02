@@ -15,8 +15,11 @@ import (
 
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/browsermcp"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/claudebridge"
+	"github.com/yetone/magpie/internal/claudecode"
+	"github.com/yetone/magpie/internal/claudetui"
 	"github.com/yetone/magpie/internal/codexrelay"
 	"github.com/yetone/magpie/internal/davsync"
 	"github.com/yetone/magpie/internal/gateway"
@@ -88,15 +91,16 @@ const usage = `magpie — one place to pick every agent's model
                                   or only the models ticked for it, a new one off until it is ticked
   magpie search [add <api> <key>|rm <api>]   Tavily, Brave, Exa, Firecrawl, You.com, DeepSeek, Doubao Search (Volcengine), Yuanbao Search (Tencent Cloud) or SearXNG for web search when no provider can search
   magpie groups                   routing groups: several models agents pick as one, group/<id>
-  magpie group add <name> models=<m1>,<m2> [routing=smart|order|rotate|usage|pace|weight|free|fast] [stays=auto|session|turn|off]
+  magpie group add <name> models=<m1>,<m2> [routing=smart|order|rotate|usage|pace|weight|free|fast|cheap|drain] [stays=auto|session|turn|off]
   magpie group <id> | set <id> k=v… | rm <id>   show, change or remove one (magpie group help for more)
   magpie accounts [agent] [--json]  every subscription magpie knows, with each one's allowance used and when it resets
   magpie accounts add <agent>     sign in to one more Claude, ChatGPT or Google (Gemini CLI, Antigravity) subscription
   magpie accounts add copilot [--host <name>.ghe.com]   one more Copilot account, on github.com or an enterprise's GHE.com
   magpie accounts discovery [on|off]   read agents' sign-ins (default on; MAGPIE_NO_ACCOUNTS=1 disables too)
-  magpie accounts import <codex|claude|antigravity|factory> <file>... [--yes]   bring in accounts from other tools' files (Codex's auth.json, Cockpit Tools, CLIProxyAPI, Sub2API); the tool a ChatGPT or Claude file came from is signed out of it
-  magpie accounts switch <agent> <email>   sign the agent in to another of them
-  magpie accounts refresh         renew the saved ChatGPT sign-ins now (the gateway does it daily)
+  magpie accounts import <codex|claude|antigravity|factory> <file>... [--yes]   bring in accounts from other tools' files (Codex's auth.json, Cockpit Tools, CLIProxyAPI, Sub2API, claude-swap); the tool a ChatGPT or Claude file came from is signed out of it
+  magpie accounts switch <agent> <email|name>   sign the agent in to another of them, by its email or the name you gave it
+  magpie accounts switch <claude|codex> next   to the next account in order with room, or the one with the most left
+  magpie accounts refresh         renew the saved ChatGPT and Claude sign-ins now (the gateway does it every 8 days)
   magpie accounts checkin         WorkBuddy's daily check-in (签到) for each WorkBuddy account, now (Settings can do it daily)
   magpie accounts project <gemini|antigravity> <email> <project>   the Google Cloud project a Google account's requests go to
   magpie accounts alias <agent> <email> [<name>|--clear]   a name of your own for an account, shown on its card, in the menu bar and in magpie quota
@@ -120,11 +124,18 @@ const usage = `magpie — one place to pick every agent's model
   magpie heap [<file>]            a Go heap profile of the running magpie, with its memory numbers, for a report of it using too much memory
   magpie cpu [<file>] [--seconds N]   a Go CPU profile of the running magpie over 30s (5..120) while you use it, for a report of it using too much CPU
   magpie goroutines [<file>]      every goroutine of the running magpie, its stack and how long it waited, for a report of it stuck at something
+  magpie log [--path] [-n N] [-f]  where magpie's logs are, to send with a report: the app's (app.log), the service's; -n prints the app log's last N lines, -f follows it
   magpie gateway-key list|add <name> [--read-only]|rotate <id>|remove <id>   manage the keys clients use to call a shared gateway
   magpie gateway-key limit <id> [list|off|reset [n]|remove <n>|[add] day|week|month|<N>d|<N>h --tokens N --cost USD --cache-reads]   a key's own limits, and what it used
   magpie gateway-key models <id> [all|<provider>/<model>|<provider>/* ...]   the models a key may use, every one unless it names some
   magpie gateway-key quotas <id> [on|off]   whether a key held to a budget, models or accounts is told the quotas of what it may use
   magpie gateway-key access <id> [read-only|full]   read-only: the key reads quotas and usage (GET /, /v1/magpie/quotas, /v1/magpie/usage) and uses no model, MCP server or write
+  magpie gateway-key move <id> <place>   put a key at a place in the list (from 1), the order list and the app show them in
+  magpie gateway-key issue --ttl 1h [--name n] [--models a,b] [--accounts a,b] [--tokens N] [--cost USD] [--read-only] [--from <id>] [--json]
+                                         a short-lived key (1m to 30 days) that stops working by itself; --from holds it to a key that issues keys; prints the key
+  magpie gateway-key issuer <id> [on|off]   let a key issue short-lived keys under itself (POST /v1/magpie/keys with it), each held to its models, accounts, limits and life
+  magpie gateway-key oidc add --key <id> --repo owner/name [--ref refs/heads/main] [--environment name] [--claim name=value]… [--ttl 1h] [--issuer URL] [--audience aud]
+                                         let a CI job's OIDC token (GitHub Actions by default) be traded for a key issued under <id> (POST /v1/magpie/keys/oidc); oidc list | remove <rule id>
   magpie mcp image                the image and video generation MCP server an agent is given from the library (stdio)
   magpie tools [<name>]           the tools magpie's MCP servers give agents (images, vision, web search, plugins'), with their parameters
   magpie tool <name> [--<param> <value>…] [<words>] [-o <file|folder>] [--json]   call one through the running magpie; an image or video it makes is saved
@@ -143,6 +154,8 @@ const usage = `magpie — one place to pick every agent's model
   magpie statusline [<provider|account>]   one line for Claude Code's status line: the session's model and each account's windows
   magpie sync                     refresh the model catalog and vendor model lists
   magpie agents                   list every supported agent
+  magpie settings [list|get <key>|set <key> <value>|reset <key>] [--json]
+                                  every setting the window's Settings page saves, read and set as it saves them (magpie settings help)
   magpie update [check] [--proxy <url>] [--mirror <prefix>]
                                   install the newest release (check: only say if there is one); --proxy: an
                                   http(s):// or socks5:// proxy for it; --mirror: a GitHub download mirror put
@@ -301,6 +314,11 @@ func run(args []string) error {
 		// the running magpie's goroutines: asks it, and moves nothing here
 		return goroutinesCmd(args[1:])
 	}
+	if len(args) > 0 && (args[0] == "log" || args[0] == "logs") {
+		// where magpie's logs are, and the app log's last lines: reads
+		// files, and moves nothing
+		return logCmd(args[1:])
+	}
 	if len(args) == 2 && args[0] == agent.DryRunArg {
 		// an agent disconnected on a copy of its files under a temporary
 		// home, for the Agents page to show what disconnecting changes
@@ -318,9 +336,24 @@ func run(args []string) error {
 	if len(args) > 0 {
 		switch args[0] {
 		case "mcp":
+			if len(args) > 1 && args[1] == "browser" {
+				return browsermcp.Run(args[2:])
+			}
+			if len(args) > 1 && args[1] == "search" {
+				return browsermcp.RunSearch(args[2:])
+			}
+			if len(args) > 1 && args[1] == "vision" {
+				return browsermcp.RunVision(args[2:])
+			}
 			return imagemcp.Run(args[1:])
 		case "claude-mcp-helper": // internal: stdio MCP subprocess spawned by Claude Code
 			return claudebridge.RunMCP(args[1:])
+		case claudetui.Command: // internal: Claude Code's interactive mode for the bridge
+			// it ends its Claude Code and removes its files on SIGINT,
+			// SIGTERM and SIGHUP itself: magpie dying of the signal first
+			// left them behind
+			leaveSignals()
+			return claudetui.Run(args[1:])
 		case "statusline":
 			return statuslineCmd(args)
 		case "tools":
@@ -376,6 +409,10 @@ func run(args []string) error {
 	// and Claude Science's daemon, which a restart of the computer ends,
 	// started on the gateway again while it is connected
 	gateway.WhileServing = append(gateway.WhileServing, agent.KeepClaudeScience)
+	// and the Claude Code magpie downloaded for a machine with none (a
+	// server's, a container's), at Claude Code's newest release: its runs
+	// turn its own updater off
+	gateway.WhileServing = append(gateway.WhileServing, claudecode.KeepCurrent)
 	// and the request archive, when it is on, goes to the bucket sync is to
 	gateway.ArchiveBucket = func() (gateway.Putter, bool) {
 		if b, ok := davsync.S3Bucket(); ok {
@@ -509,6 +546,8 @@ func run(args []string) error {
 		return githubCmd(args[1:])
 	case "claude-code":
 		return claudeCodeCmd(args[1:])
+	case "settings":
+		return settingsCmd(args[1:])
 	}
 
 	// the agent of a plugin that is gone (deleted on disk) is no agent
