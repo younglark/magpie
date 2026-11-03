@@ -447,8 +447,10 @@ its end, however long the burst took to come: one whose content came in under
 a quarter of its window (`flow_ms`, from a tenth of its bytes to nine tenths,
 scaled to the whole), or that reasoned and whose answer would have come over
 20 times faster than its reasoning came before its first text (its text came
-with the burst). The time a burst takes to come is not the time it took to
-write, and that time isn't seen. History is read the same way, as it keeps the
+with the burst), or whose window was under a second after a wait over four
+times longer (`usage.HeldWindowMs`: 392 tokens 0.25 s after an 8.2 s first
+token read 1,539 tok/s from gpt-6.1-sol). The time a burst takes to come is
+not the time it took to write, and that time isn't seen. History is read the same way, as it keeps the
 reasoning, the first text and the flow; a record from before the flow was kept
 is told by its reasoning's pace alone.
 
@@ -550,7 +552,12 @@ vendors, and it answers from what it has kept (`GET /v1/magpie/quotas/cards`).
 A card's refresh here has it read that card once more
 (`POST /v1/magpie/quotas/refresh`, at most once in 30 seconds a card); until it
 has read anything, the remote's one card says so. Their history is shown with
-its own. A Codex reset or a check-in is pressed on that computer, not here.
+its own. A check-in is pressed on that computer, not here. A Codex card's
+reset can be used from here (#3850): **Use one…** asks first, as for this
+computer's accounts, and that magpie spends it on its account
+(`POST /v1/magpie/quotas/codex-reset`, below). It takes the provider's key
+with full access there; a read-only or held key is told so. A GLM team's
+resets are still used on bigmodel.cn.
 
 Codex's native image tool first asks the provider that served its conversation
 turn for the requested image model. If that provider does not list the model,
@@ -2261,11 +2268,17 @@ The accounts that answered through the gateway in the last 30 days are
 shown, every one when none has; `magpie statusline claude` (a provider, or
 an account's email, login or name) keeps only those. It works however Claude
 Code signs in to the gateway, unlike the `anthropic-ratelimit-*` headers,
-which Claude Code reads only while signed in to claude.ai. magpie doesn't
-write it into Claude Code's settings, where another status line may be;
-add it to `~/.claude/settings.json` yourself:
-`"statusLine": {"type": "command", "command": "magpie statusline"}`. With
-the gateway not running it prints an empty line.
+which Claude Code reads only while signed in to claude.ai. The status
+line square on Claude Code's row in the Agents page (or `magpie claude
+statusline on`) turns it on: it writes `statusLine` in
+`~/.claude/settings.json` to run this magpie by its full path
+(`"statusLine": {"type": "command", "command": "/Applications/Magpie.app/Contents/MacOS/magpie statusline"}`),
+and off, or Disconnect, takes out only a status line that runs
+`magpie statusline`. A status line of the user's own (claude-hud, a script)
+is never written over: the square isn't shown while one is there, and on is
+refused. Claude Code runs a changed status line in its open sessions too,
+so nothing needs a restart. It is offered for Claude Code on this computer,
+not in a WSL distro. With the gateway not running it prints an empty line.
 
 `magpie heap [<file>]` is for a report of magpie holding too much memory: a
 macOS `sample` of the app shows Go's frames as `???`. It asks the running
@@ -2377,6 +2390,23 @@ told none of the cards is answered `/v1/magpie/quotas/cards` 403
 that nothing was read. `/v1/magpie/concurrency` and `/v1/magpie/usage`
 still refuse it.
 
+A Codex account's rate-limit reset can be used through the gateway as
+the Usage page's **Use a reset** does (#3850, the same code):
+`POST /v1/magpie/quotas/codex-reset?user=<email>` spends one of that
+account's resets (`&credit=<id>` one of its `resets.each`, else the one
+that runs out first) and answers `{"code": "reset", "windows": 2}`, or
+`no_credit` or `nothing_to_reset` with nothing spent. It can't be
+undone, so it takes an enabled gateway key with full access, from this
+computer too: a request without a key is refused 401 even on loopback, a
+browser page or app the gateway otherwise lets in there (Origin `null`, an
+app's scheme, a `*.localhost` page) included; a read-only key 403
+`gateway_key_read_only`; a key held to a budget, models or accounts 403
+`gateway_key_held`, whether or not it is told quotas. The account is
+always named (400 without `user`). A second ask for the same account
+while one is out is answered 409. Another magpie's Codex card uses this,
+and so can an app reading `/v1/magpie/quotas/cards`, such as a DSH
+provider plugin, with a key of full access.
+
 An app of your own can read the Usage page's numbers too.
 `GET /v1/magpie/usage?period=<today|week|month|all>` is the page's summary,
 the same JSON as the window's `/api/usage` (`path` is left out for another
@@ -2453,7 +2483,8 @@ curl -s http://127.0.0.1:3425/v1/magpie/usage/requests \
   be before `ttft_ms` or after `ms`. `flow_ms` is how long the content
   took to come, from where the speed is timed: the time from a tenth of
   it to nine tenths, times 10/8 (at most `ms` × 10/8). A reply whose
-  content came in under a quarter of its window was held and let go in a
+  content came in under a quarter of its window, or whose window was under
+  a second after a wait over four times longer, was held and let go in a
   burst, and tells no speed. Leave out what you don't know.
 - **Pricing:** a record without `cost` is priced at magpie's prices for
   its provider and model.

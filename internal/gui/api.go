@@ -447,7 +447,7 @@ type settingsJSON struct {
 	VisionMissing string `json:"visionMissing,omitempty"`
 	// VisionNotMarked are the custom providers (AddedByAddress) with a model left
 	// out of VisionModels only because nothing says it takes images: the
-	// user can say so in the provider's Names & levels (nexnull on Discord)
+	// user can say so in the provider's Names, prices & levels (nexnull on Discord)
 	VisionNotMarked []string `json:"visionNotMarked,omitempty"`
 	// the reasoning levels of the model that describes images now, and the
 	// one it is asked at when one is picked (VisionEffort fitted to them)
@@ -594,6 +594,9 @@ type searchChoiceJSON struct {
 	// Own is a Google sign-in or an AI Studio key, which searches for its
 	// own models first
 	Own bool `json:"own,omitempty"`
+	// Search is a ChatGPT account, which searches by the ChatGPT backend's
+	// search ("<id>/@search") besides its models
+	Search bool `json:"search,omitempty"`
 }
 
 type searchVendorJSON struct {
@@ -632,7 +635,7 @@ func searchState(s *settingsJSON) {
 	s.SearchChoices = []searchChoiceJSON{}
 	for _, c := range gateway.Searchers() {
 		p := c.Provider
-		j := searchChoiceJSON{ID: p.ID, Name: p.Name, Icon: p.Icon, Small: c.Small, SmallName: names[p.ID+"/"+c.Small], Models: []modelRef{}, Service: c.Service, Own: c.Own}
+		j := searchChoiceJSON{ID: p.ID, Name: p.Name, Icon: p.Icon, Small: c.Small, SmallName: names[p.ID+"/"+c.Small], Models: []modelRef{}, Service: c.Service, Own: c.Own, Search: c.Search}
 		for _, m := range c.Models {
 			id := p.ID + "/" + m.ID
 			j.Models = append(j.Models, modelRef{ID: id, Name: cmp.Or(names[id], m.Name, m.ID), Provider: p.ID, PName: p.Name, Icon: p.Icon})
@@ -838,10 +841,19 @@ func settingsState() settingsJSON {
 		}
 	}
 	// the routing groups with a member that draws (7up6666 on X): a
-	// group picked here draws on its members in its routing's order
+	// group picked here draws on its members in its routing's order. One
+	// of image models only isn't served to agents (jzw690 on X), so it is
+	// listed from the groups themselves
+	listed := map[string]bool{}
 	for _, e := range provider.Served() {
 		if e.Group != "" && gateway.GroupDraws(e.ID) {
+			listed[e.ID] = true
 			s.ImageGenModels = append(s.ImageGenModels, modelRef{ID: e.ID, Name: e.Name, PName: e.Group})
+		}
+	}
+	for _, g := range provider.Groups() {
+		if ref := g.Ref(); !g.Hidden && !g.Disabled && !listed[ref] && gateway.GroupDraws(ref) {
+			s.ImageGenModels = append(s.ImageGenModels, modelRef{ID: ref, Name: cmp.Or(g.Name, g.ID), PName: g.ID})
 		}
 	}
 	if v := gateway.ListedDrawer(s.ImageGen); v != s.ImageGen {

@@ -80,7 +80,9 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 	// newer: the backend serves a model only to a client that knows it
 	provider.SawCodexClient(r.Header)
 	rest := strings.TrimPrefix(r.URL.Path, CodexPath)
-	body, ok := s.readRequestBody(w, r, provider.Responses, 0)
+	// a turn of Codex's own is read to codexBodyLimit, one for a magpie
+	// model held to the limit of every other route once it is named
+	body, ok := s.readRequestBody(w, r, provider.Responses, s.codexLimitOf())
 	if !ok {
 		return
 	}
@@ -180,6 +182,11 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 		// The namespace owns the route even if a model is not in the catalog.
 		// Unknown providers/groups must fail locally, never fall through to OpenAI.
 		if strings.Contains(model, "/") {
+			if most := s.bodyLimitOf(); int64(len(body)) > most {
+				writeError(w, provider.Responses, http.StatusRequestEntityTooLarge, overLimit(most).Error()+
+					"; this limit is for a magpie model, and one of Codex's own models takes up to "+sizeWord(s.codexLimitOf()))
+				return
+			}
 			if rest == "/responses/compact" {
 				writeError(w, provider.Responses, 400, "/responses/compact is not supported for Magpie models; use a compaction_trigger on /responses")
 				return
@@ -1139,6 +1146,12 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		appendUsage(r, rec)
 		tried = append(tried, fmt.Sprintf("openai: %d %s", status, msg))
 	}
+	// handOut is handOn for a try the account was out for (codexAccountOut),
+	// the trace saying why as a routed try's does
+	handOut := func(status int, msg string, body []byte) {
+		handOn(status, msg, 0)
+		s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1].Fail = failure(status, body) })
+	}
 	// askAgain pauses wait, Codex kept alive meanwhile, for the turn to be
 	// asked again; false when Codex went away in it
 	askAgain := func(status int, msg string, wait time.Duration) bool {
@@ -1375,6 +1388,17 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				s.codexFallBack(w0, r, body0, kept)
 				return
 			}
+			if overload && codexAccountOut(res.StatusCode, msg) && s.codexFallsBack(modelOf(body), body) {
+				// the account out of its allowance (its credits and resets
+				// looked at above): the fallbacks answer, as they do for a
+				// turn through magpie's accounts, rather than Codex handed
+				// the refusal (adorable_piglet on Discord)
+				said := provider.APIError(msg, res.Status)
+				handOut(res.StatusCode, said, msg)
+				end(res.StatusCode, said, 0, 0)
+				s.codexFallBack(w0, r, body0, kept)
+				return
+			}
 			if said, ok := codexSaidNothing(rest, modelOf(body), codexWho(base, on), res, msg); ok {
 				// a failure with nothing said of it, which Codex shows as
 				// "Unknown error" alone (#409), or a web page Codex shows
@@ -1483,6 +1507,16 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				return
 			}
 		}
+		if hw.mayAskAgain() && hw.failure != 0 && !hw.refused && codexAccountOut(hw.failure, hw.errBody()) && r.Context().Err() == nil && s.codexFallsBack(modelOf(body), body) {
+			// the account out of its allowance, said on its stream before
+			// any of the reply: the fallbacks answer
+			said := "OpenAI: " + string(hw.errBody())
+			res.Body.Close()
+			handOut(hw.failure, said, hw.errBody())
+			end(hw.failure, said, 0, 0)
+			s.codexFallBack(w0, r, body0, kept)
+			return
+		}
 		hw.release()
 		break
 	}
@@ -1585,6 +1619,25 @@ func codexRouteUnmasked(on *provider.Provider) bool {
 		return false
 	}
 	return unredactedRoute(*p, false, nil)
+}
+
+// codexAccountOut says the ChatGPT backend turned away a turn on Codex's
+// own sign-in for the account, not the request: out of its allowance
+// (usage_limit_reached, a plan without Codex), of its credits, or rate
+// limited — what a turn through magpie's accounts goes on past to the
+// next. A 401 is never one: Codex renews its own sign-in on it.
+func codexAccountOut(status int, body []byte) bool {
+	if status == http.StatusUnauthorized {
+		return false
+	}
+	if status == http.StatusForbidden && bytes.Contains(body, []byte("usage_not_included")) {
+		return true
+	}
+	switch failure(status, body) {
+	case failQuota, failCredit, failRate:
+		return true
+	}
+	return false
 }
 
 // codexFallsBack says Codex's turn on one of its own models has fallbacks

@@ -166,6 +166,18 @@ type Provider struct {
 	// Code's own sign-in, which magpie still moves: the gateway serves no
 	// request on them (KeptToAgent; myduso on Discord).
 	SwitchOnly bool `json:"switchOnly,omitempty"`
+	// RestartApp, on Codex's subscription, has magpie restart the Codex
+	// app's own app-server for a change it makes by itself that the app
+	// works without: the switch back once the account it moved off has
+	// room (SwitchWhenSpent), and giving Codex its account back at the
+	// reset. The ChatGPT app shows an ended app-server as an error and
+	// relaunches (#4550), so it is off unless the user turns it on
+	// (atom0964 on Discord); the app then stays on its account until it
+	// is restarted, from the switch notice or by hand. A switch the user
+	// makes, a Connect or Disconnect, and whatever leaves the app on a
+	// used-up account (a switch off it, becoming its provider for it)
+	// restart it either way: the app greys Send there (8b0132b3d).
+	RestartApp bool `json:"restartApp,omitempty"`
 
 	// MaxConcurrency is how many requests may be out at the vendor at once
 	// on each of its keys or accounts (Discord, Lemon: a Codex account is
@@ -273,6 +285,16 @@ type Provider struct {
 	// has its headers passed on. One magpie writes itself, or that would
 	// act on magpie's address, never is (ReplyHeaderPassable).
 	ReplyHeaders []string `json:"replyHeaders,omitempty"`
+
+	// PassHeaders are headers of the agent's request passed on to the
+	// vendor as it sent them, whatever their case (3jRzfF52Qx on X): a
+	// value that changes per request or per client, which a fixed Header
+	// can't give. The client's stands over a Header of the same name;
+	// with none sent the Header goes. Every API, count_tokens, a group's
+	// member, a plugin's fetch; a signed-in account's signing has the
+	// last word. One that carries magpie's key or the connection's own
+	// never is (RequestHeaderPassable).
+	PassHeaders []string `json:"passHeaders,omitempty"`
 
 	// Searches says the vendor answers a web search tool offered on its
 	// Anthropic or Responses API by itself (web_search_20250305,
@@ -427,6 +449,11 @@ type Provider struct {
 	// It is magpie's own: the vendor's or plugin's sign-in never sees it
 	// (see account_names.go).
 	AccountNames map[string]string `json:"accountNames,omitempty"`
+	// KeySpendCaps is, for a provider of API keys, how much each key the
+	// user capped may spend, in USD as the Usage page prices its calls,
+	// a day, a month or in all, by its KeyID: past it, routing takes the
+	// key for used up until the period renews (see key_spend.go).
+	KeySpendCaps map[string]SpendCap `json:"keySpendCaps,omitempty"`
 
 	// BalanceURL, when set, is where the vendor tells what is left on a
 	// key, asked with the key the way a chat request carries it; BalancePath
@@ -775,9 +802,11 @@ func (p Provider) clone() Provider {
 	p.Headers = maps.Clone(p.Headers)
 	p.ExtraBody = maps.Clone(p.ExtraBody)
 	p.ReplyHeaders = slices.Clone(p.ReplyHeaders)
+	p.PassHeaders = slices.Clone(p.PassHeaders)
 	p.AccountProxies = maps.Clone(p.AccountProxies)
 	p.AccountCaps = maps.Clone(p.AccountCaps)
 	p.AccountNames = maps.Clone(p.AccountNames)
+	p.KeySpendCaps = maps.Clone(p.KeySpendCaps)
 	if p.AccountWindowCaps != nil {
 		m := make(map[string]map[string]int, len(p.AccountWindowCaps))
 		for k, v := range p.AccountWindowCaps {
@@ -873,7 +902,7 @@ func withPicks(a, pk Provider) Provider {
 func accountSettings(a, pk Provider) Provider {
 	a.PickedFrom, a.Delisted, a.DelistedAt = pk.PickedFrom, pk.Delisted, pk.DelistedAt
 	a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
-	a.SwitchOnly = pk.SwitchOnly
+	a.SwitchOnly, a.RestartApp = pk.SwitchOnly, pk.RestartApp
 	a.Sink, a.NoModels, a.BestInFamily = pk.Sink, pk.NoModels, pk.BestInFamily
 	a.NativeCompaction = pk.NativeCompaction
 	a.PromptAsWritten = pk.PromptAsWritten
@@ -912,6 +941,8 @@ func accountSettings(a, pk Provider) Provider {
 	a.HiddenDrawers = pk.HiddenDrawers
 	// and the headers of its replies passed on (#4145)
 	a.ReplyHeaders = pk.ReplyHeaders
+	// and the headers of the agent's requests passed on
+	a.PassHeaders = pk.PassHeaders
 	return a
 }
 
@@ -1535,6 +1566,7 @@ func normalize(p Provider) Provider {
 	p.AccountCaps = normalAccountCaps(p.AccountCaps)
 	p.AccountWindowCaps = normalWindowCaps(p.AccountWindowCaps)
 	p.AccountNames = normalAccountNames(p.AccountNames)
+	p.KeySpendCaps = normalKeySpendCaps(p.KeySpendCaps)
 	if len(p.Models) > 0 {
 		p.NoModels = false // a pick is no longer Select none
 	}
@@ -1656,6 +1688,7 @@ func normalize(p Provider) Provider {
 	p.Headers = cleanHeaders(p.Headers)
 	p.ExtraBody = cleanExtraBody(p.ExtraBody)
 	p.ReplyHeaders = cleanReplyHeaders(p.ReplyHeaders)
+	p.PassHeaders = cleanRequestHeaders(p.PassHeaders)
 	if pr := Preset(p.Preset); pr != nil {
 		if p.Icon == "" {
 			p.Icon = pr.Icon
@@ -1713,10 +1746,65 @@ func cleanHeaders(h map[string]string) map[string]string {
 			out[k] = strings.TrimSpace(v)
 		}
 	}
+	out = userIDHeader(out)
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// userIDHeader is h with a header named by digits alone and no value
+// read as the new-api user id it is, New-Api-User: the user id typed in
+// a header's name box, where magpie's old hint asked for a header
+// (zxc56823 on Discord, "272298" with its value left empty). Sent as it
+// was, the relay is told a header it never reads and still no user. One
+// with a New-Api-User of its own already has it; the digits are dropped.
+// h itself when it has none.
+func userIDHeader(h map[string]string) map[string]string {
+	var out map[string]string
+	for k, v := range h {
+		if strings.TrimSpace(v) != "" || !allDigits(strings.TrimSpace(k)) {
+			continue
+		}
+		if out == nil {
+			out = maps.Clone(h)
+		}
+		delete(out, k)
+		has := false
+		for n, w := range out {
+			if strings.EqualFold(n, NewAPIUserHeader) && strings.TrimSpace(w) != "" {
+				has = true
+			}
+		}
+		if !has {
+			for n := range out {
+				if strings.EqualFold(n, NewAPIUserHeader) {
+					delete(out, n)
+				}
+			}
+			out[NewAPIUserHeader] = strings.TrimSpace(k)
+		}
+	}
+	if out == nil {
+		return h
+	}
+	return out
+}
+
+// NewAPIUserHeader is where a new-api relay's /api/user/self wants the
+// user's id, beside the access token.
+const NewAPIUserHeader = "New-Api-User"
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func contains(xs []string, x string) bool {
