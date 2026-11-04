@@ -46,7 +46,10 @@ install:
 # One step: build the desktop app and put it where the release installer
 # does, then open it. macOS: magpie.app in /Applications (~/Applications
 # when that is not writable) and ~/.local/bin/magpie. Linux: the binary
-# there, plus a menu entry. MAGPIE_OPEN=0 skips launching.
+# there, plus a menu entry. Windows: %LOCALAPPDATA%\Programs\magpie with the
+# Start menu shortcut and the magpie command (build/install-app.ps1).
+# MAGPIE_OPEN=0 skips launching.
+INSTALL_PS = powershell -NoProfile -ExecutionPolicy Bypass -File build/install-app.ps1
 install-app:
 ifeq ($(shell uname -s),Darwin)
 	@$(MAKE) --no-print-directory app
@@ -54,6 +57,8 @@ ifeq ($(shell uname -s),Darwin)
 else ifeq ($(shell uname -s),Linux)
 	@$(MAKE) --no-print-directory build
 	@build/install-app.sh
+else ifeq ($(OS),Windows_NT)
+	@$(INSTALL_PS) $(if $(filter 0,$(MAGPIE_OPEN)),-NoOpen)
 else
 	@$(MAKE) --no-print-directory install
 	@echo "  installed with go install (no app bundle on this OS)"
