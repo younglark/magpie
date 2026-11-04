@@ -51,6 +51,7 @@ type modelJSON struct {
 	Listed     int     `json:"listed,omitempty"`    // its window before the user's: its vendor's list's, else models.dev's
 	Max        int     `json:"max,omitempty"`       // the most its context may be set to, above Listed
 	Free       bool    `json:"free,omitempty"`      // costs the subscription nothing
+	Zero       bool    `json:"zero,omitempty"`      // listed at $0 on this provider (provider.PricedFree), where Free is the vendor's word
 	Rate       float64 `json:"rate,omitempty"`      // the credits a request costs the subscription, as a multiple
 	RateWas    float64 `json:"rateWas,omitempty"`   // the rate before a discount running now
 	// Load is how busy its plugin last said the model is, a percent, when
@@ -293,8 +294,13 @@ type providerJSON struct {
 	DrawIDs   []string    `json:"drawIds,omitempty"` // those models' ids, listed apart in its editor
 	// those of them unticked in its editor (provider.HiddenDrawers)
 	HiddenDrawers []string `json:"hiddenDrawers,omitempty"`
-	Unlisted      bool     `json:"unlisted"` // its models serve only through routing groups
-	NoModels      bool     `json:"noModels"` // Select none: none of its models served (#1818)
+	// its video models (gateway.Videomakers), listed apart in its editor
+	// as its image models are, and those unticked there
+	// (provider.HiddenVideomakers)
+	FilmIDs           []string `json:"filmIds,omitempty"`
+	HiddenVideomakers []string `json:"hiddenVideomakers,omitempty"`
+	Unlisted          bool     `json:"unlisted"` // its models serve only through routing groups
+	NoModels          bool     `json:"noModels"` // Select none: none of its models served (#1818)
 	// Best in family: with nothing picked, only the newest model of each
 	// family it lists is served (provider.Provider.BestInFamily)
 	BestInFamily bool `json:"bestInFamily"`
@@ -507,6 +513,13 @@ type gatewayJSON struct {
 	// LANPublic are those of LANURLs at an internet address, which anyone
 	// online reaches, not only this network
 	LANPublic []string `json:"lanPublic,omitempty"`
+	// Container: LANURLs are a container's own addresses, which other
+	// devices, and containers on other Docker networks, can't reach: the
+	// page offers the host's it was opened at first (lanShown)
+	Container bool `json:"container,omitempty"`
+	// ContainerHost: where other containers on this host reach the
+	// gateway while magpie runs in one (gateway.ContainerHostURL)
+	ContainerHost string `json:"containerHost,omitempty"`
 	// OnNetwork: MAGPIE_ADDR puts it beyond loopback (a server, a Docker
 	// image), so every caller is shown a gateway key, and LAN is true too:
 	// callers from elsewhere, a container's host among them, need one
@@ -877,6 +890,7 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 		}
 		window := p.WindowOf(m)
 		j := modelJSON{ID: m.ID, Name: m.Name, Efforts: provider.EffortsOf(m), On: on, Context: window, Output: provider.OutputWithin(window, p.ReplyLimitIn(m, set)), Listed: provider.ListedWindow(m), Max: m.MaxContext, Free: m.Free, Rate: m.Rate, RateWas: m.RateWas, Images: images, ImageSet: imageSet, Own: own, Best: newest[m.ID]}
+		j.Zero = !m.Free && p.PricedFree(set, m.ID)
 		// a plugin reports a model's load by its own id, not one the user
 		// lists it by (axelburks on Discord)
 		ownID := p.OwnModelID(m.ID)
@@ -1001,6 +1015,14 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 			out.HiddenDrawers = append(out.HiddenDrawers, id)
 		}
 	}
+	// its video models likewise (axelburks on Discord: an Ark key's
+	// Seedance had nowhere to be ticked)
+	for _, m := range gateway.VideomakersOf(p, func() []catalog.Model { return ls.Available }) {
+		out.FilmIDs = append(out.FilmIDs, m.ID)
+		if p.VideomakerHidden(m.ID) {
+			out.HiddenVideomakers = append(out.HiddenVideomakers, m.ID)
+		}
+	}
 	if t, ok := p.Listed(); ok {
 		out.Fetched = &t
 	}
@@ -1122,6 +1144,7 @@ func providersState() providersJSON {
 	if s.Gateway.LAN {
 		s.Gateway.LANURLs = gateway.LANURLs()
 		s.Gateway.LANPublic = gateway.PublicURLs(s.Gateway.LANURLs)
+		s.Gateway.Container, s.Gateway.ContainerHost = gateway.ContainerAddrs(), gateway.ContainerHostURL()
 		if u := gateway.PublicURL(); slices.Contains(s.Gateway.LANURLs, u) {
 			s.Gateway.PublicURL = u
 		}
@@ -1663,6 +1686,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				pr.Routing, pr.Affinity, pr.Sink = in.Routing, in.Affinity, in.Sink
 				pr.Unlisted = in.Unlisted
 				pr.HiddenDrawers = in.HiddenDrawers
+				pr.HiddenVideomakers = in.HiddenVideomakers
 				pr.AccountProxies = in.AccountProxies
 				if in.Name != "" {
 					pr.Name = in.Name
@@ -1904,6 +1928,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				// shows them all (321sssrt on X)
 				if in.HiddenDrawers == nil && old != nil {
 					in.HiddenDrawers = old.HiddenDrawers
+				}
+				if in.HiddenVideomakers == nil && old != nil {
+					in.HiddenVideomakers = old.HiddenVideomakers
 				}
 				// a Zhipu key's team likewise: {} clears it
 				if in.ZhipuTeam == nil && old != nil {

@@ -620,8 +620,11 @@ starting with `sk-magpie-`, unlike any other key); left empty, magpie makes
 one. The list shows only its last four characters, and it is counted,
 limited and restricted as any other key, from this computer too.
 Rename, disable, rotate or remove keys independently; rotation and removal
-ask for confirmation. Rotation keeps the name, enabled state and usage
-history; other keys are unchanged. While sharing is on, **Gateway → Connect**
+ask for confirmation. Rotation keeps the name, enabled state, limits and usage
+history; other keys are unchanged. Its dialog takes an optional value of
+your own, checked as a new key's is (8–256 printable ASCII characters, no
+spaces, not starting with `sk-magpie-`, no other gateway key's and none of
+your providers' API keys); left empty, magpie makes one. While sharing is on, **Gateway → Connect**
 offers loopback and shared addresses, plus enabled gateway keys, for all
 connection examples. With sharing off, Connect keeps the original **API key**
 field and local `magpie` token, without a gateway-key picker. Its arbitrary
@@ -634,6 +637,7 @@ magpie gateway-key add "Remote laptop" # prints the new credential once
 magpie gateway-key add Family --key -  # keeps a key clients already send, read from stdin
 magpie gateway-key list                # ids, names, enabled state and masked keys
 magpie gateway-key rotate <id>         # prints the replacement; identity stays the same
+magpie gateway-key rotate <id> --key -  # gives it a value of your own instead, read from stdin
 magpie gateway-key remove <id>         # revokes remote access
 magpie gateway-key limit <id> week --tokens 2m --cost 5   # its own limit
 magpie gateway-key limit <id> list     # each limit, used, left and reset
@@ -1153,6 +1157,43 @@ export const LemonPlugin = async () => ({
 In TypeScript, `icon` and `placeholder` aren't in OpenCode's types: build
 the hook as a variable (or cast it), or put the icon in `package.json`.
 
+#### Web search APIs from a plugin
+
+A plugin can add a web search API to Settings › Models › Web search with a
+`search` hook (magpie's own; OpenCode ignores it). It is listed after
+Tavily, Brave and the rest under its own name, and added, keyed, switched
+off, reordered and removed like them (`magpie search add <plugin>:<id> <key>`
+on the command line). magpie keeps its keys (several, tried in turn, a refused
+one resting), its order and its place in the request log, masks the query
+as it does for every search API, and asks the plugin only while the
+plugin is on and the Web search plugin is.
+
+```js
+export const MojeekSearch = async () => ({
+  search: {
+    mojeek: {                      // [a-z0-9-], at most 32; the API is `<plugin>:mojeek`
+      name: "Mojeek",              // its name in the list
+      keysURL: "https://www.mojeek.com/services/api/", // "Get a key" link, optional
+      keyOptional: false,          // true: it answers with no key
+      url: false,                  // true: the user gives its address (a SearXNG's)
+      async execute({ query, count, key, url }, ctx) {
+        const r = await fetch(`https://api.mojeek.com/search?fmt=json&q=${encodeURIComponent(query)}&t=${count}&api_key=${key}`, { signal: ctx.abort })
+        if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status }) // 401, 402, 403, 429 rest the key
+        const j = await r.json()
+        return j.response.results.map((x) => ({ title: x.title, url: x.url, text: x.desc }))
+      },
+    },
+  },
+})
+```
+
+`execute` returns `[{ title, url, text?, age? }]` (or `{ results: [...] }`);
+magpie strips tags and cuts each page's text. A throw with a numeric
+`status` (and `retryAfter`, its Retry-After) is the API refusing the key,
+treated as a built-in's 401/402/403/429 is; any other throw is a failure
+and the next search API is asked. It has the time a search API has
+(a quarter of a search's limit); `ctx.abort` fires then.
+
 #### Gateway middleware
 
 A plugin can also be gateway middleware: `onRequest(body, ctx)` sees each
@@ -1607,9 +1648,8 @@ one provider serves it.
 `listed=no` (the group editor's **Model lists: The group alone**) keeps the
 models a group names, and those its patterns match, out of `magpie models`,
 `/v1/models` and every agent's list, so a client offers the group alone.
-A signed-in subscription's own models (a ChatGPT, Claude, Copilot or plugin
-account's) stay in every agent's list: the group is added on top of them,
-and only a client that is no agent is given the group alone.
+A signed-in subscription's models leave the lists too. Codex alone keeps its
+ChatGPT sign-in's own models, which its app reaches on that sign-in.
 They are still served: the group routes over them, and a request naming one
 as `provider/model` is answered. A group in it keeps its own setting, and a
 group switched off keeps nothing out. `listed=yes` lists them again. To keep
@@ -2280,6 +2320,20 @@ refused. Claude Code runs a changed status line in its open sessions too,
 so nothing needs a restart. It is offered for Claude Code on this computer,
 not in a WSL distro. With the gateway not running it prints an empty line.
 
+Claude Code on another computer than magpie (magpie in Docker, on a server)
+can't be switched on from the square: magpie can't write that computer's
+settings.json, and the command would name a binary inside the container.
+`GET` or `POST /v1/magpie/statusline` answers the same line as plain text, so
+that computer needs only curl. The optional `?session=<id>` (or, in a POST,
+the `session_id` of the JSON Claude Code sends on stdin) adds the model like
+`/v1/magpie/route`, and `?only=` (comma separated, repeatable) keeps the
+accounts as `magpie statusline claude` does. A caller that isn't this
+computer needs a gateway key, a read-only one included (it gets the windows
+without the model); a key held to a budget, models or accounts sees only
+what it may. On the computer Claude Code runs on:
+`"statusLine": {"type": "command", "command": "curl -fsS -m 1 -H 'Authorization: Bearer <gateway key>' --data-binary @- http://<host>:3425/v1/magpie/statusline || true"}`.
+`magpie web` shows this command with its own address under Settings → About.
+
 `magpie heap [<file>]` is for a report of magpie holding too much memory: a
 macOS `sample` of the app shows Go's frames as `???`. It asks the running
 magpie that serves the gateway (the app, the menu bar, `magpie serve` or
@@ -2928,6 +2982,12 @@ published on the host) for the address it shows and prints to be the one
 other machines use; behind a reverse proxy, set it to that external base URL
 and follow the [authentication requirements above](#connecting-anything-else),
 especially when the proxy reaches magpie over loopback.
+Other containers on the same host reach the gateway at the host's Docker
+bridge address on the published port, `http://172.17.0.1:3425` on the default
+bridge; magpie reads it from the container's default route and lists it as
+"Other containers on this host" (in the browser UI and in `magpie web`'s log).
+On Linux `host.docker.internal` is there only for a container given
+`extra_hosts: ["host.docker.internal:host-gateway"]`.
 
 For the browser UI run the image with `magpie web --addr 0.0.0.0:3430 --no-open`
 in place of the default `serve`, and open
@@ -3299,6 +3359,28 @@ MAGPIE_OTEL_ENABLED=true MAGPIE_OTEL_ENDPOINT=http://localhost:4318 magpie serve
 - `MAGPIE_OTEL_BODIES_WHOLE`: `true` or `false`, off by default; with bodies on,
   keeps them entire rather than cut at 256 KB. A long reply is written to a
   temporary file; a body too large for the collector is still refused.
+- `OTEL_RESOURCE_ATTRIBUTES`: the standard OpenTelemetry variable, merged into
+  the resource of both traces and metrics, for example to tell servers apart:
+
+  ```sh
+  OTEL_RESOURCE_ATTRIBUTES='service.instance.id=magpie-prod-01,host.name=server-a,deployment.environment.name=production' \
+    MAGPIE_OTEL_ENABLED=true MAGPIE_OTEL_ENDPOINT=http://localhost:4318 magpie serve
+  ```
+
+  Comma-separated `key=value` pairs, as the
+  [OTel resource SDK spec](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/resource/sdk.md#specifying-resource-information-via-an-environment-variable)
+  has them: keys and values are trimmed and percent-decoded (write `,` as
+  `%2C`, `=` as `%3D` and `%` as `%25`; `+` stays a plus), every value is a
+  string, and the last of a repeated key wins. Any invalid entry (no `=`, an
+  empty key, a bad escape, bytes that aren't UTF-8 once decoded, an empty
+  entry such as a trailing comma) discards the whole variable: magpie logs
+  which entry, never its contents, and exports with the default resource.
+  Nothing else about the machine is looked up or sent.
+- `OTEL_SERVICE_NAME`: the resource's `service.name`, over a `service.name` in
+  `OTEL_RESOURCE_ATTRIBUTES`. With neither set, or set empty, it is `magpie`.
+
+  Neither variable turns export on, and both are read in the process that
+  exports (the app, or `magpie serve`), so restart it after changing them.
 
 For Langfuse, pick **Collector › Langfuse**, then the host (Cloud EU
 `https://cloud.langfuse.com`, Cloud US `https://us.cloud.langfuse.com`, or
@@ -3545,6 +3627,8 @@ The gateway and usage:
   page's history
 - `affinity.json` — which key or account answered each conversation, so a
   restart keeps it there while the vendor has it cached
+- `vision-cache.jsonl` — successful inline-image descriptions reused after a
+  restart (0600); `vision-cache.jsonl.lock` serializes writers during handover
 - `served.json` — when each account and key last answered
 - `quotas.json` — the last allowance each account reported
 - `quota-history.json`, `balance-history.json` — allowance and balance

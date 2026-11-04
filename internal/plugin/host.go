@@ -29,6 +29,7 @@ import (
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -491,6 +492,83 @@ type host struct {
 	proxyAt time.Time
 	// addr is the gateway's address the host was told (hostAddr)
 	addr string
+	// output is the child's stdout and stderr, read apart from its Wait,
+	// and waited gives what that Wait said; both are nil in the tests'
+	// fake hosts, which have no child
+	output *proc.Output
+	waited func() error
+}
+
+// wait is the child's end: what Wait said, once it has ended and the
+// reader is done with its stdout.
+func (h *host) wait() error {
+	if h.waited == nil {
+		return h.cmd.Wait()
+	}
+	return h.waited()
+}
+
+// reap ends the host the moment its child ends, not once its stdout
+// does. A program the host started that kept the host's stdout (a
+// plugin's Bun.spawn given a copy of fd 1, a daemon it left behind) held
+// the pipe open past the host's end, so the reader never reached EOF,
+// the child was never waited for, and every host stopped left a
+// <defunct> magpie-bun behind until magpie quit (acezan on Discord: 57
+// after 47 hours as a systemd service). proc.Output waits for the child
+// at once and closes the pipe a moment later, which ends the reader too.
+func (h *host) reap() {
+	h.fail(quitErr(h.wait()))
+	live.Lock()
+	delete(live.hosts, h)
+	live.Unlock()
+}
+
+// live are the hosts started and not yet reaped, the retired ones on their
+// way out among them.
+var live = struct {
+	sync.Mutex
+	hosts map[*host]bool
+	// ended is set by EndHosts: no host starts after it
+	ended bool
+}{hosts: map[*host]bool{}}
+
+// errHostsEnded is a host asked for once EndHosts has run.
+var errHostsEnded = errors.New("magpie is restarting; the plugins are back in a moment")
+
+// EndHosts stops every plugin host, waits until each has been waited for,
+// and starts none after: what magpie runs before it puts a new version in
+// its own place (update.Reexec). A host still running at the exec was one
+// nothing waited for after it, so each restart to update (magpie web's
+// AutoRestart) left one <defunct> magpie-bun under magpie's pid for as long
+// as it ran (#3285, found by skygunner and AAEE86; acezan on Discord saw
+// 57 after 47 hours as a systemd service).
+func EndHosts() {
+	live.Lock()
+	live.ended = true
+	hs := make([]*host, 0, len(live.hosts))
+	for h := range live.hosts {
+		hs = append(hs, h)
+	}
+	live.Unlock()
+	hostMu.Lock()
+	current = nil
+	hostMu.Unlock()
+	var wg sync.WaitGroup
+	for _, h := range hs {
+		wg.Go(func() {
+			h.stop()
+			_ = h.wait()
+		})
+	}
+	wg.Wait()
+}
+
+// quitErr is the error of a host whose child ended with err.
+func quitErr(err error) error {
+	if err == nil {
+		err = errors.New("the plugin host quit")
+	}
+	return fmt.Errorf("the plugin host quit: %v", err)
 }
 
 // lineLimit is the longest line this host reads from the child.
@@ -539,6 +617,8 @@ type Loaded struct {
 	ServedBy map[string]string `json:"servedBy,omitempty"`
 	// Tools are the tools its tool hook gives (tools.go)
 	Tools []Tool `json:"tools,omitempty"`
+	// Searches are the web search APIs its search hook gives (search.go)
+	Searches []SearchDef `json:"searches,omitempty"`
 }
 
 // Clash is a provider id more than one plugin signs in to. The host runs
@@ -999,15 +1079,22 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	out, err := cmd.StdoutPipe()
+	// stdout and stderr are read apart from Wait (proc.Output), so the
+	// child is reaped when it ends, whatever holds a copy of them
+	output, err := proc.NewOutput(cmd)
 	if err != nil {
 		return nil, false, err
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, false, err
+	// started and counted live under one lock, so EndHosts misses none
+	live.Lock()
+	if live.ended {
+		live.Unlock()
+		output.Close()
+		return nil, false, errHostsEnded
 	}
-	if err := cmd.Start(); err != nil {
+	waited, err := output.Start(cmd)
+	if err != nil {
+		live.Unlock()
 		return nil, false, err
 	}
 	hctx, hcancel := context.WithCancel(context.Background())
@@ -1025,10 +1112,18 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		proxy:    proxy,
 		proxyAt:  time.Now(),
 		addr:     addr,
+		output:   output,
+		waited:   waited,
 	}
-	go drainStderr(stderr)
+	live.hosts[h] = true
+	live.Unlock()
+	go func() {
+		drainStderr(output.Err)
+		output.ErrRead()
+	}()
 
-	go h.read(out)
+	go h.read(output.Out)
+	go h.reap()
 	go h.writerLoop()
 	go h.ctrlLoop()
 	generation.Add(1)
@@ -1076,6 +1171,7 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 	}
 	h.loaded = res.Plugins
 	noteTools(res.Plugins)
+	noteSearches(res.Plugins)
 	for _, p := range res.Plugins {
 		if p.Error != "" {
 			log.Printf("plugin %s didn't load: %s", p.Spec, p.Error)
@@ -1132,11 +1228,10 @@ func (h *host) read(out io.Reader) {
 			break
 		}
 	}
-	err := h.cmd.Wait()
-	if err == nil {
-		err = errors.New("the plugin host quit")
+	if h.output != nil {
+		h.output.OutRead()
 	}
-	h.fail(fmt.Errorf("the plugin host quit: %v", err))
+	h.fail(quitErr(h.wait()))
 }
 
 var (
