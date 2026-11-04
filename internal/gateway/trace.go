@@ -299,6 +299,10 @@ type Weighed struct {
 	Known    bool    `json:"known,omitempty"`  // the vendor said what the account has left
 	Learns   bool    `json:"learns,omitempty"` // not known, but its answer will tell
 	Used     float64 `json:"used"`             // share of the allowance counting the model, used
+	// WeekLow: Used is at 90% or more for its week alone, so Smart and Use
+	// before expiry keep it with those that have room rather than for
+	// last (routes.Seat.WeekLow); false under another routing
+	WeekLow bool `json:"weekLow,omitempty"`
 	// Amount of Limit in Unit: the count that share is of, when the
 	// vendor counts it so (WorkBuddy's credits, #659)
 	Amount float64 `json:"amount,omitempty"`
@@ -312,6 +316,7 @@ type Weighed struct {
 	Due      *time.Time        `json:"due,omitempty"`      // when the allowance window used for pace resets
 	Tokens   float64           `json:"tokens,omitempty"`   // least used: tokens it served lately
 	Free     bool              `json:"free,omitempty"`     // its model costs nothing there (free first)
+	Expires  *time.Time        `json:"expires,omitempty"`  // free quota by expiry: when a free one's quota is first lost
 	LateTTFT float64           `json:"lateTtft,omitempty"` // speed first: its ms to the first token lately, 0 if not measured (speed.go)
 	LateTPS  float64           `json:"lateTps,omitempty"`  // speed first: its tokens a second lately, 0 if not told
 	Price    *SeatPrice        `json:"price,omitempty"`    // cheapest first: what its model costs on it now, nil if not known
@@ -541,6 +546,7 @@ func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from 
 	}
 	if l, ok := wg.lefts[c.allowanceKey()]; ok {
 		w.Known, w.Used, w.Renews, w.Pace, w.Credits, w.CreditsFirst = true, l.used, l.renews, l.pace, l.credits, l.first
+		w.WeekLow = l.weekLow && keepsWeek(p.Routing)
 		if !l.fullest.IsZero() {
 			ur := l.fullest
 			w.UsedRenews = &ur
@@ -573,6 +579,9 @@ func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from 
 	}
 	if wg.free != nil {
 		w.Free = wg.free[c.rest]
+	}
+	if t, ok := wg.expires[c.rest]; ok {
+		w.Expires = &t
 	}
 	if sp, ok := wg.speed[c.restID()]; ok {
 		w.LateTTFT, w.LateTPS = math.Round(sp[0]), math.Round(sp[1]*10)/10

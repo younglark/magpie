@@ -11927,15 +11927,15 @@ const ROUTINGS = [
   ["drain", "Until used up", "Requests stay on one until it is used up, then go to the next in the list and stay there: one before it that renews meanwhile doesn't take them back. One rate limited or failing is passed over while it rests, and requests come back to it after."],
   ["rotate", "In turn", "Each turn of a conversation goes to the next one, spreading the load evenly; the requests within a turn stay where it began, so the prompt cache holds, and one that fails is passed over while it rests."],
   ["usage", "Least used first", "Each request goes to the one used least: a subscription by the share of its allowance used, a key by the tokens it served in the last hours."],
-  ["pace", "Use before expiry", "Each request goes to the subscription with the most left per hour until it is lost — its week at its reset, or credits in it that expire sooner — so less is lost to resets and expiry; one at 90% or more waits until the others can't answer. A key goes by the tokens it served in the last hours."],
+  ["pace", "Use before expiry", "Each request goes to the subscription with the most left per hour until it is lost, at its reset or as credits expire; one at 90% of its five hours waits until the others can't answer, a week at 90% is still spent before its reset. A key goes by the tokens it served in the last hours."],
   ["weight", "By weight", "Requests spread over the keys or accounts by the weight set beside each: one weighing 3 takes three requests for every one weighing 1 takes, evenly over a few requests. One that fails is passed over while it rests, and the others share its requests; a conversation stays with it as Stays says."],
   ["free", "Free first", "Requests go to what costs nothing first: the models their vendor serves at no cost to this subscription's allowance or credits, in their listed order, and only when those can't answer to one that spends them. Nothing that cost nothing is left unused."],
   ["fast", "Speed first", "Requests go to the one that has answered this model fastest lately, by its time to the first token and how fast it writes; those within a tenth of each other keep their listed order. One not measured lately gets one request in five, so it is measured again, and one that fails is passed over while it rests."],
 ];
 // the routings besides Smart are the built-in plugin rotation's
-// (plugins/rotation): off, their options leave the page, as anything marked
-// data-feature does, and Smart is left — one in use keeps it on
-const ROTATION = new Set(["order", "drain", "rotate", "usage", "pace", "weight", "free", "fast", "cheap"]);
+// (plugins/rotation): off, their options leave the page (data-feature),
+// and Smart is left — one in use keeps it on
+const ROTATION = new Set(["order", "drain", "rotate", "usage", "pace", "weight", "free", "fast", "cheap", "expiring"]);
 // jsRoutings: the routings JS gateway plugins serve now ("<plugin>/<name>",
 // settings' jsRoutings, plugins/middleware's), and saved, a routing none
 // serves now, shown as it is: its pool is tried in its listed order
@@ -13577,14 +13577,10 @@ function loginUsageOf(agent) {
 const SIGN_IN_GONE = /sign-in has (expired|lapsed)|sign in again/i;
 
 function quotaError(err, q) {
-  // first-run screens the helper can't pass (#4817)
   if (/^Claude Code: claude-tui: .{0,40}(stays on its first-run screens|shows its first-run notes)/.test(err)) return t("Finish Claude Code's first-run setup, then refresh. Run magpie claude-code to find its executable.");
-  // the /usage helper's other reasons, on the card (#4830)
   const tui = /^Claude Code: claude-tui: (.+?)(?:: |$)/m.exec(err) || /^(Claude Code's interactive mode said nothing[^(]*?) \(/.exec(err);
   if (tui) return t("Allowance unavailable: {why}", { why: tui[1].slice(0, 160) });
-  // signed in again in place from the row's Sign in again (blue12345655)
   if (/sign-in has expired/.test(err)) return t("Signed out — choose Sign in again on this account under Providers");
-  // Copilot's refused token (copilot_lapsed.go), in either language
   const copilotLapsed = "GitHub refused this Copilot sign-in; sign in again";
   if (err === copilotLapsed || err === t(copilotLapsed)) return t(copilotLapsed);
   // an account whose sign-in its vendor revoked (signin_revoked.go, #1793)
@@ -13611,6 +13607,7 @@ function quotaError(err, q) {
   if (/^nothing read on that magpie yet/.test(err)) return t("Nothing read on that computer yet — refresh this card to have it read");
   if (/^remote magpie doesn't share its quotas/.test(err)) return t("That computer's magpie doesn't share its quotas yet — update magpie there");
   if (/^remote magpie isn't shared/.test(err)) return t("That computer's magpie isn't shared — turn on Settings → Network and sharing → Share on local network there");
+  if (/^remote magpie tells this key none of its quotas/.test(err)) return t("That computer's magpie tells this key no quotas: it holds the key to a budget, models or accounts — turn on Quotas for the key under Gateway keys there");
   if (/^remote magpie didn't take this key/.test(err)) return t("That computer's magpie didn't take this key — use one of its gateway keys in this provider");
   if (/^couldn't reach the remote magpie/.test(err)) return t("Couldn't reach that computer's magpie — check that it is running and its address");
   // a remote magpie's gateway key card (#1547, remote_key_limits.go)

@@ -546,6 +546,7 @@ function routingPage(part) {
     weight: ["By weight", "Requests spread over the keys or accounts by the weight set beside each: one weighing 3 takes three requests for every one weighing 1 takes, evenly over a few requests. One that fails is passed over while it rests, and the others share its requests; a conversation stays with it as Stays says."],
     free: ["Free first", "Requests go to what costs nothing first: the models their vendor serves at no cost to this subscription's allowance or credits, in their listed order, and only when those can't answer to one that spends them. Nothing that cost nothing is left unused."],
     cheap: ["Cheapest first", "Requests go to the member whose model costs least now, by its price a million tokens in and out at this hour — a vendor's peak hours count double where it bills them so, as DeepSeek and Ollama Cloud do — and the cheaper cache read when two cost the same; those that cost the same keep their listed order, and one with no known price goes last."],
+    expiring: ["Free quota by expiry", "Free quota by expiry: the accounts on a free plan, or whose model costs nothing there, go first, the one whose free quota is lost soonest first — at its next reset, or when its credits expire if sooner; once it is used up, the next. A paid one takes requests only when no free one has quota left, the paid as Smart orders them."],
     fast: ["Speed first", "Requests go to the one that has answered this model fastest lately, by its time to the first token and how fast it writes; those within a tenth of each other keep their listed order. One not measured lately gets one request in five, so it is measured again, and one that fails is passed over while it rests."],
   };
   // modeOf: a routing's name and what it does, a JS gateway plugin's
@@ -593,7 +594,12 @@ function routingPage(part) {
   // noURLWord: its keys are all set to a protocol its provider has no URL
   // for, so it went out on the URLs it has (#1702)
   const noURLWord = (w) => t("key set to {api} only, no {api} URL · sent on the others", { api: API[w.noURL] || w.noURL });
-  const group = (w) => w.used >= 98 ? "spent" : w.used >= 90 ? "low" : "fine";
+  // group is the tier Smart and Use before expiry put one in: 90% of a
+  // week alone (weekLow) is kept with those that have room, as what it
+  // has left is lost at its reset (ysicing_01858 on Discord)
+  const group = (w) => w.used >= 98 ? "spent" : w.used >= 90 && !w.weekLow ? "low" : "fine";
+  // tiered: its routing holds one running low back (routes.seatTier)
+  const tiered = (w) => !w.routing || w.routing === "pace";
   const renews = (w) => (w.renews || []).map((s) => known0(s) ? at(s) : 0);
   // usedRenews is when the window w.used is the share of renews: a row
   // says the two together, so they are of one window, a Factory account's
@@ -757,6 +763,16 @@ function routingPage(part) {
         if (f.free) return restedTo(t("it costs nothing there, so it's spent first."))
           || t("Free first: {model} costs nothing on {who}, so it's tried before any that spends the allowance.", { model: f.model, who: w });
         return t("Free first: every one that costs nothing is spent or resting, so {model} on {who}, which spends the allowance, is next.", { model: f.model, who: w });
+      case "expiring": {
+        // Free quota by expiry (routes.FreeExpiring): when a free one's
+        // quota is first lost, as the gateway read it (Weighed.expires)
+        const left = f.expires && at(f.expires) - at(r.time);
+        if (f.free && left > 0) return restedTo(t("its free quota is lost soonest, in {d}.", { d: dur(left) }))
+          || t("Free quota by expiry: {who}'s free quota is lost soonest, in {d}, so it's spent first.", { who: w, d: dur(left) });
+        if (f.free) return restedTo(t("it has free quota left, so it's spent before any paid one."))
+          || t("Free quota by expiry: {who} has free quota left, so it's spent before any paid one.", { who: w });
+        return t("Free quota by expiry: no free one has quota left, so {who}, which is paid for, is next.", { who: w });
+      }
       case "cheap": {
         // Cheapest first (routes.Cheapest): its price now, as the gateway
         // read it for this request (Weighed.price)
@@ -2697,9 +2713,9 @@ function routingPage(part) {
       else if (w.known) {
         const soon = usedRenews(w);
         s = w.creditsLast && !r.order[0]?.creditsLast ? quota(w, "{n} used · on credits · after the others", "{n} left · on credits · after the others")
-          : !w.routing && w.used >= 98 && w.credits ? quota(w, "{n} used · on credits", "{n} left · on credits")
-          : !w.routing && w.used >= 98 ? quota(w, "{n} used · all but used up", "{n} left · all but used up")
-          : !w.routing && w.used >= 90 ? quota(w, "{n} used · kept for last", "{n} left · kept for last")
+          : tiered(w) && group(w) === "spent" && w.credits ? quota(w, "{n} used · on credits", "{n} left · on credits")
+          : tiered(w) && group(w) === "spent" ? quota(w, "{n} used · all but used up", "{n} left · all but used up")
+          : tiered(w) && group(w) === "low" ? quota(w, "{n} used · kept for last", "{n} left · kept for last")
           : (b = behindWhy(r, w)) === "kept" ? quota(w, "{n} used · conversation kept on another", "{n} left · conversation kept on another")
           : b === "sooner" && soon ? quota(w, "{n} used · renews in {d} · one renewing sooner goes first", "{n} left · renews in {d} · one renewing sooner goes first", { d: dur(soon - n) })
           : soon ? quota(w, "{n} used · renews in {d}", "{n} left · renews in {d}", { d: dur(soon - n) }) : quota(w, "{n} used", "{n} left");
@@ -2742,7 +2758,7 @@ function routingPage(part) {
       const flying = !resting && (trying.has(id) || onWire.has(id));
       const on = flying || (!resting && answered.has(id));
       lightRow(row.li, row.wire, on, flying);
-      row.li.classList.toggle("low", !!(!w.routing && w.known && w.used >= 90));
+      row.li.classList.toggle("low", !!(tiered(w) && w.known && group(w) !== "fine"));
       row.li.classList.toggle("rest", !!resting || gave.has(id));
       row.li.classList.toggle("left", !!w.unlisted || !!w.window);
       // in the colour of the agent whose request is on it: the one it
@@ -4185,8 +4201,10 @@ function routingPage(part) {
     const mine = quotas.filter((q) => q.from && q.kind === "subscription" && (q.provider === w.provider || q.provider.startsWith(w.provider + "/")));
     const cards = mine.filter((q) => q.provider !== w.provider && !q.error && q.windows?.length && (!fam || q.provider === w.provider + "/" + fam));
     if (!cards.length) {
-      // the remote's own card, saying why nothing was read from it
-      const bad = mine.find((q) => q.provider === w.provider && q.error);
+      // the remote's own card, saying why nothing was read from it, or
+      // the account's card there saying its read failed (Usage shows it)
+      const bad = mine.find((q) => q.provider === w.provider && q.error)
+        || mine.find((q) => q.provider !== w.provider && q.error && (!fam || q.provider === w.provider + "/" + fam));
       return bad ? [{ text: t("Allowance unavailable — hover for why"), title: bad.error }] : [];
     }
     const out = [];
@@ -5243,7 +5261,7 @@ function routingPage(part) {
   // a group may also be routed by hand: every request to the member the
   // user picks on its card (provider.Manual, #317) — a provider's keys can't
   // and by its members' weights, as a provider's keys are (#1910)
-  const GROUP_ROUTE_OPTS = [...ROUTE_OPTS, ["cheap", "Cheapest first"], ["weight", "By weight"], ["manual", "Manual"]];
+  const GROUP_ROUTE_OPTS = [...ROUTE_OPTS, ["cheap", "Cheapest first"], ["expiring", "Free quota by expiry"], ["weight", "By weight"], ["manual", "Manual"]];
   const AFF_OPTS = [["", "Auto"], ["session", "Session"], ["turn", "Within a turn"], ["off", "Off"], ["strict", "Strict"]];
   // what one rate limited with quota left does then (provider.Sink), as in
   // a provider's editor (app.js SINKS)
@@ -5288,6 +5306,7 @@ function routingPage(part) {
     free: "Free first: the members whose model its vendor serves at no cost to the subscription's allowance or credits go first, then the rest — each whole, over its own accounts or keys as its provider routes them. The free ones are tried before any that spends, so nothing that costs nothing is left unused.",
     fast: "Speed first: the member that answered fastest lately goes first, by its time to the first token and how fast it writes, each of its accounts or keys weighed on its own; those within a tenth keep their listed order, and one not measured lately gets one request in five, so it is measured again.",
     cheap: "Cheapest first: the member whose model costs least now goes first, by its price a million tokens in and out at this hour — so a model billed double in its vendor's peak hours, as DeepSeek's own API and Ollama Cloud's DeepSeek models are, goes behind a provider charging less then, and ahead of it off-peak. Those that cost the same keep their listed order; one with no known price goes last.",
+    expiring: "Free quota by expiry: the accounts on a free plan, or whose model costs nothing there, go first, the one whose free quota is lost soonest first — at its next reset, or when its credits expire if sooner; once it is used up, the next. A paid one takes requests only when no free one has quota left, the paid as Smart orders them.",
     manual: "Manual: every request goes to the model you pick on the group's card, over its own accounts or keys; the others, and the rules, wait until you pick another — none takes over when it fails.",
   };
   // a group in the group, and a provider set to route other than Smart, is
