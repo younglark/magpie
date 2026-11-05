@@ -451,6 +451,43 @@ func codexThreadsOn(home, p string) []string {
 	return out
 }
 
+// CodexThreadsBusyOn says whether a thread a Codex folder's state
+// databases keep on the provider p was written to in the last
+// ActiveWindow, which a move of p's threads leaves where it is: such a
+// move has more to do once the thread is quiet. A database that can't be
+// read, and a rollout that can't be found, say nothing.
+func CodexThreadsBusyOn(home, p string) bool {
+	now := time.Now()
+	for _, path := range codexStateDBs(home) {
+		u := url.URL{Scheme: "file", Path: filepath.ToSlash(path), RawQuery: "mode=ro&_pragma=busy_timeout(2000)"}
+		if len(u.Path) >= 2 && u.Path[1] == ':' {
+			u.Path = "/" + u.Path
+		}
+		db, err := sql.Open("sqlite", u.String())
+		if err != nil {
+			continue
+		}
+		var paths []string
+		rows, err := db.Query(`SELECT rollout_path FROM threads WHERE model_provider = ?`, p)
+		if err == nil {
+			for rows.Next() {
+				var r string
+				if rows.Scan(&r) == nil && r != "" {
+					paths = append(paths, r)
+				}
+			}
+			rows.Close()
+		}
+		db.Close()
+		for _, r := range paths {
+			if fi, err := os.Stat(filepath.Clean(r)); err == nil && now.Sub(fi.ModTime()) < ActiveWindow {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // MoveCodexThreads moves every thread of a Codex folder its state database
 // keeps on the provider from to the provider to, each as MoveCodexProvider
 // moves one: its files' session_meta and its row, a copy of the files kept
@@ -466,6 +503,24 @@ func MoveCodexThreads(home, from, to string) ([]CodexMove, error) {
 		return nil, fmt.Errorf("can't move Codex's threads from %q to %q", from, to)
 	}
 	return moveCodexThreadIDs(home, from, to, codexThreadsOn(home, from), 0)
+}
+
+// MoveCodexThreadIDs moves those of the threads ids that a Codex folder's
+// state database still keeps on the provider from to the provider to, as
+// MoveCodexThreads moves them: to undo a move of those threads alone,
+// where moving every thread of from would take others with them.
+func MoveCodexThreadIDs(home, from, to string, ids []string) ([]CodexMove, error) {
+	if !codexProviderRe.MatchString(from) || !codexProviderRe.MatchString(to) || from == to {
+		return nil, fmt.Errorf("can't move Codex's threads from %q to %q", from, to)
+	}
+	on := codexThreadsOn(home, from)
+	var still []string
+	for _, id := range ids {
+		if contains(on, id) {
+			still = append(still, id)
+		}
+	}
+	return moveCodexThreadIDs(home, from, to, still, 0)
 }
 
 // moveCodexThreadIDs moves the threads ids of a Codex folder from the
@@ -542,6 +597,21 @@ func moveCodexThreadIDs(home, from, to string, ids []string, budget int64) ([]Co
 // provider is magpie"), so a packed thread left on OpenAI couldn't be
 // reopened while magpie was Codex's provider.
 func MovePackedCodexThreads(home, from, to string, since time.Time, budget int64) ([]CodexMove, error) {
+	return moveRecentCodexThreads(home, from, to, since, budget, true)
+}
+
+// MoveRecentCodexThreads is MovePackedCodexThreads for every thread on
+// from whose last turn is since since, plain or packed: for a provider
+// whose id isn't magpie's length, which RelabelCodexThreads can't write
+// in place, so each one moved is rewritten with a copy kept. A thread of
+// the user's own provider (a relay's, "myrelay") was listed by the Codex
+// app once magpie was its provider, and refused: "This chat uses myrelay,
+// but your current provider is magpie" (hxy920830 on X).
+func MoveRecentCodexThreads(home, from, to string, since time.Time, budget int64) ([]CodexMove, error) {
+	return moveRecentCodexThreads(home, from, to, since, budget, false)
+}
+
+func moveRecentCodexThreads(home, from, to string, since time.Time, budget int64, packedOnly bool) ([]CodexMove, error) {
 	if !codexProviderRe.MatchString(from) || !codexProviderRe.MatchString(to) || from == to || budget <= 0 {
 		return nil, fmt.Errorf("can't move Codex's threads from %q to %q", from, to)
 	}
@@ -566,12 +636,14 @@ func MovePackedCodexThreads(home, from, to string, since time.Time, budget int64
 				if !filepath.IsAbs(path) || !strings.Contains(filepath.Base(path), id) || !sameDir(codexHomeOf(path), home) {
 					continue
 				}
-				// packed: the plain file gone, the .zst there and on from
+				// packed: the plain file gone, the .zst there and on
+				// from; or, packedOnly not, the plain file on from
 				plain, _ := strings.CutSuffix(path, zstSuffix)
-				if _, err := os.Lstat(plain); err == nil {
-					continue
-				}
-				if fi, err := os.Lstat(plain + zstSuffix); err != nil || !fi.Mode().IsRegular() || codexMetaProvider(plain+zstSuffix) != from {
+				if fi, err := os.Lstat(plain); err == nil {
+					if packedOnly || !fi.Mode().IsRegular() || codexMetaProvider(plain) != from {
+						continue
+					}
+				} else if fi, err := os.Lstat(plain + zstSuffix); err != nil || !fi.Mode().IsRegular() || codexMetaProvider(plain+zstSuffix) != from {
 					continue
 				}
 				ids = append(ids, id)

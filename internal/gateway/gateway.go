@@ -266,8 +266,12 @@ func namesInCatalog() map[string]bool {
 
 // switchedOff says a request for model went nowhere because p, which
 // serves it, is switched off in magpie (provider.Provider.Off), or kept to
-// Claude Code's own sign-in (provider.Provider.KeptToAgent).
+// Claude Code's own sign-in (provider.Provider.KeptToAgent), or a Remote
+// magpie that is this one (provider.Provider.SelfLeftOut).
 func switchedOff(p provider.Provider, model string) string {
+	if p.SelfLeftOut() && !p.Off {
+		return fmt.Sprintf("%s is a Remote magpie that is this magpie itself, so %q is not served through it; ask for the model without %q in front, or tick \"Use it anyway\" on it in Magpie's Providers", p.Name, model, p.ID+"/")
+	}
 	if p.KeptToAgent() {
 		return fmt.Sprintf("%s's accounts are kept to Claude Code's own sign-in in Magpie, so %q is not served; untick \"Only switch Claude Code's sign-in\" under its accounts in Magpie's Providers to use it", p.Name, model)
 	}
@@ -556,9 +560,10 @@ type Server struct {
 	// (UnixNano, 0 for never): while that is recent, a group skips it for
 	// such a request when someone is left after it (antigravityForeseen)
 	agTurnedAway atomic.Int64
-	// thoughtMu keeps the count of each DeepSeek member's thinking replies
-	// that went on to an answer in a row, by "<provider>/<model>"
-	// (holdsThinking, #4512)
+	// thoughtMu keeps the count of each member's thinking replies that
+	// went on to an answer in a row, by "<provider>/<model>", for a
+	// vendor that may refuse after its thinking (holdsThinking, #4512,
+	// #4166)
 	thoughtMu    sync.Mutex
 	thoughtClean map[string]int
 }
@@ -1023,10 +1028,10 @@ func (s *Server) routes() *routeMux {
 	mux.HandleFunc("GET /videos/{id}", s.videosGet)
 	mux.HandleFunc("GET /v1/videos/{id}/content", s.videosContent)
 	mux.HandleFunc("GET /videos/{id}/content", s.videosContent)
-	// a provider's own images and video API, as it is (native.go)
-	mux.HandleFunc("POST "+NativePath+"{provider}/{path...}", s.native)
-	mux.HandleFunc("GET "+NativePath+"{provider}/{path...}", s.native)
-	mux.HandleFunc("DELETE "+NativePath+"{provider}/{path...}", s.native)
+	// a provider's own API, as it is, at its host (native.go)
+	for _, m := range nativeMethods {
+		mux.HandleFunc(m+" "+NativePath+"{provider}/{path...}", s.native)
+	}
 	mux.HandleFunc("POST "+claudeMCPPath+"{token}", s.subscription.mcpCall)
 	mux.HandleFunc("/mcp/{name}", s.mcpProxy)
 	mux.HandleFunc("/mcp/run/{name}", runMCP)
@@ -1427,7 +1432,8 @@ func drawerObjects(r *http.Request) []map[string]any {
 			name := cmp.Or(m.Name, m.ID)
 			o := map[string]any{"id": p.ID + "/" + m.ID, "object": "model", "type": "model", "kind": "image", "created": 0,
 				"owned_by": p.ID, "display_name": name, "magpie_label": name + " · " + p.Name,
-				"modalities": map[string]any{"input": []string{"text"}, "output": []string{"image"}}}
+				"modalities": map[string]any{"input": []string{"text"}, "output": []string{"image"}},
+				"magpie_via": catalog.ViaHere(m.Via)}
 			if m.Images {
 				o["modalities"] = map[string]any{"input": []string{"text", "image"}, "output": []string{"image"}}
 			}
@@ -1455,10 +1461,33 @@ func videomakerObjects(r *http.Request) []map[string]any {
 			name := cmp.Or(m.Name, m.ID)
 			out = append(out, map[string]any{"id": p.ID + "/" + m.ID, "object": "model", "type": "model", "kind": "video", "created": 0,
 				"owned_by": p.ID, "display_name": name, "magpie_label": name + " · " + p.Name,
-				"modalities": map[string]any{"input": []string{"text", "image"}, "output": []string{"video"}}})
+				"modalities": map[string]any{"input": []string{"text", "image"}, "output": []string{"video"}},
+				"magpie_via": catalog.ViaHere(m.Via)})
 		}
 	}
 	return out
+}
+
+// viaOf is the magpies e's model passes through after this one, as the
+// remote magpie serving it listed them; nil for a provider's own model.
+// A routing group's are its members' together: a group with a remote
+// magpie's group in it (two magpies each the other's remote, each with an
+// auto/ group of the model) reaches every magpie that one does (catalog's
+// magpie_via.go).
+func viaOf(e provider.Entry) []string {
+	if e.Group == "" {
+		return e.Provider.RemoteVia(e.Model)
+	}
+	_, ms, _ := provider.FindGroup(e.ID)
+	var via []string
+	for _, m := range ms {
+		for _, v := range m.Provider.RemoteVia(m.Model) {
+			if !slices.Contains(via, v) {
+				via = append(via, v)
+			}
+		}
+	}
+	return via
 }
 
 // catalogFor is the catalog as the agent asking is shown it.
@@ -1566,6 +1595,10 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 					if how := webSearchOf(e, searches); how != "" {
 						m["web_search"] = how
 					}
+					// the magpies it goes through, this one last, so a
+					// magpie that is this one's remote too doesn't take
+					// back its own models (catalog's magpie_via.go)
+					m["magpie_via"] = catalog.ViaHere(viaOf(e))
 				}
 				if ts := tiers[e.ID]; len(ts) > 0 {
 					m["service_tiers"] = ts
@@ -1609,6 +1642,7 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 			m := modelObject(e)
 			m["kind"], m["magpie_label"] = "decision", labels[i]
 			m["native_endpoints"] = []string{"/v1/systemone"}
+			m["magpie_via"] = catalog.ViaHere(viaOf(e))
 			data = append(data, m)
 		}
 	}
@@ -1885,7 +1919,7 @@ func (s *Server) countOn(w http.ResponseWriter, r *http.Request, p provider.Prov
 			}
 			keepRetryOut(w.Header(), res.Header, b)
 			passReplyHeaders(w.Header(), c.p, res)
-			writeError(w, provider.Anthropic, res.StatusCode, c.p.Explain(c.p.Name+": "+provider.APIError(b, res.Status), res.StatusCode, b))
+			writeError(w, provider.Anthropic, res.StatusCode, explained(c.p, model, res, b))
 			return
 		}
 		defer res.Body.Close()
@@ -2186,6 +2220,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	var clientResponseID string // only a reply released to the client owns this ID
 	call := Call{Time: start, From: from, Model: unprefixed(modelOf(body)), Agent: who.agent, Via: who.via, Kind: requestCallKind(r.Header, metadata),
 		wire: archiving(r, capture, start, nil), headers: headerLogOf(r.Context())}
+	// the reply counted as it reaches the agent, for the Routing page
+	// while it is out (#4951); learned from once it ends
+	capture.live = liveBegin(inflightOf(r.Context()), call.Model, from)
+	defer func() { capture.live.finish(call.Status >= 400, call.Usage.Output) }()
 	// the log has the body as it went: masked, or as written where it
 	// went so
 	logBody := func(b []byte) {
@@ -3026,6 +3064,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	sameRefusal := false              // the last try's 5xx was a mate's word for word: the request's
 	autoReset := resetFirst != nil    // a Codex or Claude reset looked at, once a request
 	creditsAsked := map[string]bool{} // Codex accounts asked again onto their credits, once each (creditsAgain)
+	regionAsked := map[string]int{}   // a provider's model refused for where the request came from, times this request (#5182)
 	// the subscription/model pairs an account refused as a model it doesn't
 	// serve, for the accounts whose own list lacks it to be asked next
 	// (unlistedNext); none for a request pinned to an account, a
@@ -3036,8 +3075,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		unlisted, unlistedW = nil, nil
 	}
 	// what the tries' held streams sent the agent ahead of a reply (#751)
-	kept := &keptAlive{proto: from, model: askedFor, told: start}
-	if k := handedOnOf(r); k != nil {
+	kept := &keptAlive{proto: from, model: askedFor, told: start, whole: wantsWhole(r.Context())}
+	if k := handedOnOf(r); k != nil && !kept.whole {
 		// Codex's own sign-in waited for first, with Codex kept alive
 		kept = k
 	}
@@ -3091,6 +3130,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// the try whose plugin ended the turn on its upstream's stream dying
 	// mid-call (plugins#38), asked again where it stood (cutReasks, #2873)
 	cuts := 0
+	// the conversation's own key or account, kept for what its vendor
+	// cached, asked once more after a moment for a failure that passes
+	// before it moves (keptAgain, jiabubu)
+	keptAsked := false
 	// ended is when the last try's reply ended: the request's ms end there,
 	// not after what magpie writes down of it once it has (#1939: sticks
 	// and the provider's last answer, saved to disk, took seconds on a busy
@@ -3164,7 +3207,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			msg := ""
 			switch {
 			case other != nil:
-				call.Status, call.Error = other.Status, other.Error
+				call.Status, call.Error, call.Usage.ErrType = other.Status, other.Error, other.errType
+				s.trace.update(tr, func(t *Route) { t.Fail = toldFail(other) })
 			case call.Status < 400:
 				call.Status, call.Error = 404, "every account passed over by a middleware"
 				msg = fmt.Sprintf("none of %s's models is ready", call.Model)
@@ -3205,7 +3249,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// thoughtCleanMost times running (holdsThinking, #4512): its
 		// filter refuses after thinking hardly ever, and held, the agent
 		// waited every request's whole thinking out.
-		hw.thinkingShown = !s.holdsThinking(c) || last
+		// Claude's, GPT's and Gemini's go as they come the same way while
+		// a refusal after them can still be handed over (hw.over): held,
+		// a group's Claude showed Claude Code its thinking only with its
+		// text, all at once, and never its "thinking with <effort>
+		// effort" (#4166). Set below, once hw.over is.
 		hw.ctx, hw.alive, hw.streams = r.Context(), kept, streams
 		// a Claude subscription account's refusal of a big conversation
 		// isn't told again to the subscription's other accounts
@@ -3221,6 +3269,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// same stream (refusalHandover; yhwangl on X)
 			hw.over = &refusalHandover{proto: from, seq: -1}
 		}
+		// the reasoning's hold, above, once the handover is known
+		hw.thinkingShown = !s.holdsThinking(c, hw.over != nil) || last
 		report := cacheReport
 		if c.p.Account == nil || c.p.Account.Agent != "claude" {
 			report = nil
@@ -3306,6 +3356,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// again (#4732)
 			attemptBody = webpAsJPEG(from, attemptBody)
 		}
+		// Codex's detail "original" goes only where it is taken (qiu_eth)
+		if from == provider.Responses && !takesOriginalDetail(c.p) {
+			attemptBody = originalAsHigh(attemptBody)
+		}
 		// a value masking swapped for a placeholder: the model is told to
 		// use it as written (treeMan on Discord). A conversation's values
 		// are masked again on every turn, so once one is, every later
@@ -3320,7 +3374,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// but with a quota, the agent is told this, as it would be had
 			// Antigravity been asked
 			if other == nil {
-				other = &Try{Status: turnedAwayStatus, Error: c.p.Name + ": " + hint}
+				other = &Try{Status: turnedAwayStatus, Error: c.p.Name + ": " + hint, errType: turnedAwayErrType}
 			}
 			skipped = append(skipped, c.label()+": "+hint)
 			continue
@@ -3829,7 +3883,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				break
 			}
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			skipped = append(skipped, c.label()+": "+call.Error)
 			continue
@@ -4049,7 +4103,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// nobody after it answers but with a quota of its own, that is
 			// what the agent is told, at a status it doesn't retry
 			if other == nil {
-				other = &Try{Status: turnedAwayStatus, Error: call.Error}
+				other = &Try{Status: turnedAwayStatus, Error: call.Error, errType: turnedAwayErrType}
 			}
 			try.Fail = failPrompt
 			s.trace.update(tr, func(t *Route) {
@@ -4091,7 +4145,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// Nothing is wrong with the account, so it doesn't rest; its
 			// mates, carrying the same prompt, are asked last
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failPrompt
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
@@ -4137,7 +4191,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 			if left := withRoom(cands[i+1:], c, tokens); len(left) > 0 {
 				if other == nil {
-					other = &Try{Status: call.Status, Error: call.Error}
+					other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 				}
 				try.Fail = failOverflow
 				if hw.code() == http.StatusRequestEntityTooLarge {
@@ -4176,7 +4230,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// input item it doesn't know, #350) another's may: the next is
 			// asked once, as each is, and this one doesn't rest
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failShape
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
@@ -4188,7 +4242,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// to the vendor, so this one doesn't rest, and a member that
 			// goes another way (or the proxy back up) may still answer (#381)
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failProxy
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
@@ -4200,7 +4254,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// request never reached the vendor, so this one doesn't rest,
 			// and is asked first again once the network is back
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failOffline
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
@@ -4213,7 +4267,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// is signed in again (provider/claude_auth.go), and the next
 			// one is asked
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failAuth
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
@@ -4240,7 +4294,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		noRoom := hw.failed() && claudeNoRoom(hw.code(), hw.errBody())
 		if protected || zdr || noRoom {
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failOther
 			left := elsewhere(cands[i+1:], c)
@@ -4261,6 +4315,40 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		// nor is it asked again after a moment
 		protected = protected || zdr || noRoom
+		if !hw.passing && !hw.refused && hw.failed() && regionRefused(hw.code(), wordsOf(hw.errBody())) {
+			// the vendor refused the model for where the request came from
+			// (regionWords). Once, it may be the edge a kept-alive
+			// connection reached: the next account, or this one again, is
+			// asked on a new connection (regionFresh) and may answer
+			// (#5182, ggdayup: answered 12s on). Refused again, it is the
+			// place: Google serves some models to no request from it
+			// (taoxiaoxin: gemini-3.8-flash refused, Claude models on the
+			// same account answered), so none of the provider's other
+			// accounts is asked that model, nor this one again. Nobody
+			// rests (restAfterMarked); another provider or model left is
+			// asked, and the agent is told why (regionNote)
+			regionAsked[c.p.ID+"\x00"+c.model]++
+			if regionAsked[c.p.ID+"\x00"+c.model] > 1 {
+				cands = append(cands[:i+1:i+1], notMates(cands[i+1:], c)...)
+				busyNow = slices.DeleteFunc(busyNow, func(b busyTry) bool { return b.c.p.ID == c.p.ID && b.c.model == c.model })
+				last = i == len(cands)-1
+				protected = true
+			}
+		}
+		if !hw.passing && !hw.refused && hw.failed() && riskRefused(c, hw.code(), hw.header, hw.errBody()) {
+			// the vendor's risk control restricted the account (WorkBuddy's
+			// 403 11140, ZCode's 3012): its risk control reads the same
+			// request on whichever account it comes from, so none of the
+			// provider's other accounts is sent it, now or in a later
+			// round of this request (_teamtaylor_ on Discord: one request
+			// sent on from account to account got each restricted in
+			// turn, until its tries ran out). It rests as restricted;
+			// another provider left is asked, else the agent is told
+			cands = append(cands[:i+1:i+1], elsewhere(cands[i+1:], c)...)
+			busyNow = slices.DeleteFunc(busyNow, func(b busyTry) bool { return b.c.p.ID == c.p.ID })
+			small, smallW = elsewhereWeighed(small, smallW, c)
+			last = i == len(cands)-1
+		}
 		if wait, ok := passing(hw.code(), hw.header, hw.errBody(), again); ok && !protected && !last && hw.failed() && spentAfter(cands[i+1:]) {
 			// the others left are out of their allowance (Discord, waroy: a
 			// Codex account run out, Grok busy a moment): this one is the
@@ -4288,7 +4376,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// The last one left is asked again after a moment, as for any
 			// 503, before the agent is told
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failOther
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
@@ -4300,7 +4388,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// is the model's doing, not the account's: the next is asked,
 			// and nobody rests (#2274)
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failOther
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
@@ -4313,7 +4401,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// and mates of the same model, likely to end empty too, are
 			// asked last
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failOther
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
@@ -4354,7 +4442,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			})
 			if !last {
 				if other == nil {
-					other = &Try{Status: call.Status, Error: call.Error}
+					other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 				}
 				skipped = append(skipped, c.label()+": "+call.Error)
 				matesLast(cands[i+1:], c)
@@ -4394,7 +4482,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			next, nextW, unlisted, unlistedW = unlistedNext(unlisted, unlistedW, key)
 			if len(next) > 0 && last {
 				if f := failure(hw.code(), hw.errBody()); other == nil && f != failQuota && f != failCredit {
-					other = &Try{Status: call.Status, Error: call.Error}
+					other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 				}
 				rest := s.restAfterMarked(c, hw.code(), hw.header, hw.errBody(), hw.sharedPool)
 				try.Fail, try.Rest = rest.Why, &rest
@@ -4420,7 +4508,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// whose reply said nothing (#1221) or was cut short by its
 			// output limit (#2274): the next is asked, and nobody rests
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failOther
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
@@ -4435,7 +4523,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// then the next member as any failure's is (#2873)
 			try.Fail = failCut
 			if other == nil {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 			skipped = append(skipped, c.label()+": "+call.Error)
@@ -4449,9 +4537,33 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 			continue
 		}
+		if wait, ok := keptAgain(aff, c, hw, keptAsked); ok && !last && !kept.tooQuiet(wait) {
+			// the one the conversation is kept on, for what its vendor
+			// cached of it, failed a way that passes — overloaded, a 5xx,
+			// timed out, not a rate limit, quota or sign-in: it is asked
+			// once more after a moment, without resting, before the
+			// conversation moves and the next one is sent it all uncached
+			// (jiabubu on Discord: a channel that errs once and is back a
+			// moment later had the conversation moved off it at once)
+			keptAsked = true
+			try.Fail, try.Again = failureOf(c, hw.code(), hw.errBody()), wait.Milliseconds()
+			try.Kept = true
+			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+			skipped = append(skipped, c.label()+": "+call.Error)
+			select {
+			case <-time.After(wait):
+				i--
+				continue
+			case <-r.Context().Done():
+				call.Status, call.Error = canceled(r.Context())
+				try.Gone = true
+				s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+			}
+			break
+		}
 		if !last && hw.failed() {
 			if f := failure(hw.code(), hw.errBody()); other == nil && f != failQuota && f != failCredit {
-				other = &Try{Status: call.Status, Error: call.Error}
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			rest := s.restAfterMarked(c, hw.code(), hw.header, hw.errBody(), hw.sharedPool)
 			try.Fail, try.Rest = rest.Why, &rest
@@ -4657,7 +4769,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// (Discord, waroy)
 			try.Fail, try.Earlier = f, true
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
-			call.Status, call.Error = other.Status, other.Error
+			// and its row says that one's kind too: a 529 overload told
+			// beside the last account's usage_limit_reached read as the
+			// overload being the quota (蛋仔 on Discord)
+			call.Status, call.Error, call.Usage.ErrType = other.Status, other.Error, other.errType
+			s.trace.update(tr, func(t *Route) { t.Fail = toldFail(other) })
 			failTo(w, kept, from, call.Status, call.Error)
 			break
 		} else if outgrew {
@@ -4684,7 +4800,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// and a vendor that failed (not a reply too long, nor one its
 			// filter refused) rests, so the retry goes to another member. A
 			// reply the agent stopped itself is booked as before
-			try.Fail = failureOf(c, call.Status, []byte(call.Error))
+			try.Fail = failureOf(c, failedNamed(hw.header, call.Status), []byte(call.Error))
 			// a compaction a rule sent to a model of its own isn't a turn of
 			// the conversation: it leaves the stick where it was when it
 			// answers (below), and breaking off mid-reply forgets nothing
@@ -4709,6 +4825,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			} else if lateRests(call.Error) {
 				rest := s.restAfter(c, call.Status, hw.header, []byte(call.Error))
 				try.Fail, try.Rest = rest.Why, &rest
+			}
+			if hw.looped == "" && !hw.refusedAfter {
+				// an upstream's error frame that named its status (#4855,
+				// mycf_711: wps-lingxi's "（HTTP 503）" rows read status=200)
+				// is booked at it, in the Routing and Usage views, though
+				// the agent's 200 went out before it
+				if named := failedNamed(hw.header, namedStatus([]byte(call.Error))); named >= 400 {
+					call.Status = named
+				}
 			}
 		} else if call.Status < 400 {
 			servedCandidate(c, call.Usage.Input+call.Usage.Output+call.Usage.CacheRead+call.Usage.CacheWrite)
@@ -4756,7 +4881,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				// (offline.go): told so, and it doesn't rest
 				try.Fail = failOffline
 			}
-			if try.Fail == failVerify && !held || strictAlone {
+			// and one its vendor restricted (riskRefused), for the next
+			// request not to be sent to it again
+			if (try.Fail == failVerify || try.Fail == failRestricted) && !held || strictAlone {
 				// the last one left rests too, for the app to show and the
 				// next requests to be held
 				rest := s.restAfter(c, call.Status, hw.header, []byte(call.Error))
@@ -4868,6 +4995,9 @@ func sinceStart(before, d time.Duration) int64 {
 // attempt sends a request to one provider. call.To stays empty when the
 // provider has no endpoint to send it to.
 func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.Protocol, p provider.Provider, model string, body []byte, call *Call) (int, string) {
+	// the try that answers is the one whose rate estimates the reply's
+	// tokens (live.go), after a fallback another than the first
+	liveOfInflight(inflightOf(r.Context())).routed(p.ID, unprefixed(model))
 	// the tier the reply said, unknown where the vendor's word tells
 	// nothing (servedTierAt)
 	defer func() { call.Usage.Tier = servedTierAt(p.Host(), call.Usage.Tier) }()
@@ -5779,7 +5909,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		// Gemini's thought signatures, which came to the client in its
 		// calls' ids, go back where Gemini wants them; another upstream
 		// gets the calls' own ids (#687)
-		body = chatCallSignatures(body, compat)
+		body = chatCallSignatures(body, compat, p.ID, true)
 		if p.Preset == "mistral" || p.Host() == "api.mistral.ai" {
 			// an earlier turn's reasoning_content, which Mistral turns
 			// away, as the thinking part it takes (#494)
@@ -5808,6 +5938,8 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		// body has no such field, and Factory ignores it.
 		geminiWhole = !streamOf(body)
 		body = withoutFields(body, "stream")
+		// a signature another provider gave goes to none (ownSignatures)
+		body = geminiBodySignatures(body, p.ID, true)
 	case provider.Anthropic:
 		// what the client holds, taken before the upstream gets its own
 		// call ids back below, and those given back to it (tool_use_ids.go,
@@ -5952,12 +6084,39 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	// the new input alone, after the id the provider keeps the previous
 	// response under, when it answered that one (prev_response.go)
 	sentWhole, delta := body, false
+	var remote *remoteTurn
 	if proto == provider.Responses {
 		body, delta = prevDelta(r, p, body)
+		// and to another magpie, which Codex's store false would leave
+		// sent whole each turn: asked to keep it, and sent the input after
+		// the turn it kept last (remote_delta.go)
+		if remote = remoteTurnFor(r, p, body); !delta && remote != nil {
+			r = r.WithContext(withKeepTurn(r.Context()))
+			body, delta = remote.delta(body)
+		}
 	}
 	res, err := s.forward(r.Context(), p, proto, path, p.Prepare(body), r.Header)
 	if err != nil {
 		return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
+	}
+	if res.StatusCode == http.StatusBadRequest && (proto == provider.Chat || proto == provider.Gemini) && signaturesReach(p, proto, upstream) {
+		// a signature Google won't take (signatureRefused), one given
+		// before magpie noted whose it was: asked again once without
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		res.Body.Close()
+		res.Body = io.NopCloser(bytes.NewReader(b))
+		if signatureRefused.Match(b) {
+			bare := geminiBodySignatures(body, p.ID, false)
+			if proto == provider.Chat {
+				bare = chatCallSignatures(body, true, p.ID, false)
+			}
+			if !bytes.Equal(bare, body) {
+				body = bare
+				if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(body), r.Header); err != nil {
+					return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
+				}
+			}
+		}
 	}
 	if delta && badRequest(res.StatusCode) || delta && res.StatusCode == http.StatusNotFound {
 		// one it no longer holds: the conversation whole
@@ -5966,6 +6125,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		res.Body = io.NopCloser(bytes.NewReader(b))
 		if prevRefused(res.StatusCode, b) {
 			body = sentWhole
+			if remote != nil {
+				remote.refused()
+			}
 			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(body), r.Header); err != nil {
 				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
 			}
@@ -6310,7 +6472,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	u.RequestID = requestID(res.Header)
 	if res.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		msg := p.Explain(p.Name+": "+provider.APIError(b, res.Status), res.StatusCode, b)
+		msg := explained(p, model, res, b)
 		if wrongEndpoint(res.StatusCode, b) {
 			s.markUnfit(p.ID, model, proto)
 			if len(s.usable(p, model)) > 0 {
@@ -6325,6 +6487,13 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		keepRetry(w.Header(), res.Header, b)
 		u.ErrType = provider.ErrorType(b)
 		return writeVendorError(w, proto, res.StatusCode, msg, b), msg, true
+	}
+	if remote != nil && res.Header.Get(KeptTurnHeader) != "" {
+		// the other magpie kept the turn: what it answered is kept here
+		// once relayed, for the next turn's delta (remote_delta.go)
+		var kept func()
+		res.Body, kept = remote.tee(res.Body, res.Header.Get("Content-Type"))
+		defer kept()
 	}
 	rd, sse := eventStream(res)
 	client := w
@@ -6374,7 +6543,10 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	}
 	var sigs *sigTidy
 	if proto == provider.Chat && geminiCompat(p.Host(), model) {
-		sigs = &sigTidy{sse: sse}
+		sigs = &sigTidy{sse: sse, by: p.ID}
+	} else if proto == provider.Gemini {
+		// a Gemini client keeps the signatures itself: noted as p's
+		sigs = &sigTidy{sse: sse, by: p.ID, native: true}
 	}
 	var search *searchTidy
 	if searchFn && sse {
@@ -6687,6 +6859,12 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	} else {
 		sniff.settleWhole()
 	}
+	if sniff.failedNamed != 0 {
+		// the stream's error frame named its own status: the failure is
+		// booked and rested as it (saidStatusHeader, #4855), while the
+		// frame itself goes to the client as it came
+		noteSaidStatus(w, sniff.failedNamed)
+	}
 	if gather != nil {
 		// the gathered stream is read here, not by the client: it gets
 		// every byte, a last line the upstream never ended included, as
@@ -6766,6 +6944,15 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 // dsh's pi-ai for an error it doesn't retry, and the turn failed (#470).
 func cutMidReply(name string, err error) string {
 	return name + ": connection lost mid-reply (" + err.Error() + ")"
+}
+
+// noteSaidStatus carries the status a relayed stream's error frame named
+// for itself onto the try's writer (#4855), for the routing loop and
+// restAfter to read (namedStatusHeader); the client never sees it.
+func noteSaidStatus(w http.ResponseWriter, status int) {
+	if h, ok := w.(*holdWriter); ok {
+		h.note(namedStatusHeader, strconv.Itoa(status))
+	}
 }
 
 // streamFailure is an error event ending a stream in proto, as each
@@ -6882,6 +7069,8 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r.Effort, req = e, &r
 		}
 	}
+	// Gemini's signatures another provider gave go to none (ownSignatures)
+	req = ownSignatures(req, p.ID)
 	if p.IsVertex() && !provider.VertexPartner(model) && !provider.VertexClaude(model) {
 		// Gemini's levels; a partner model on chat completions, and
 		// Claude on Anthropic's Messages API, are sent their effort as
@@ -7345,9 +7534,9 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 				continue
 			}
 		}
-		if p.IsVertex() && res.StatusCode == http.StatusBadRequest && vertexSignatureRefused.Match(b) {
-			// a call's signature Vertex AI won't take (a client changed
-			// it, or another API gave it, the conversation having moved):
+		if res.StatusCode == http.StatusBadRequest && signaturesReach(p, to, model) && signatureRefused.Match(b) {
+			// a signature Google won't take (a client changed it, or
+			// another provider gave it before magpie noted whose it was):
 			// the calls waved through instead, for this request
 			if r, had := withoutSignatures(req); had {
 				req = r
@@ -7967,7 +8156,7 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	u.RequestID = requestID(res.Header)
 	if res.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		msg := p.Explain(p.Name+": "+provider.APIError(b, res.Status), res.StatusCode, b)
+		msg := explained(p, model, res, b)
 		if wrongEndpoint(res.StatusCode, b) {
 			msg += wrongAPINote(p, model, res, b)
 		}
@@ -8294,7 +8483,14 @@ func build(proto provider.Protocol, r *Request, model, host string, rejectTemp b
 // A ChatGPT account is given a declared tool whose name its backend
 // refuses under another (provider.CodexToolName); the model's call to it
 // comes back by the name the agent declared, from tools, the request's.
+//
+// Each Gemini thought signature the reply gives is noted as p's
+// (signersNoted), so it goes back to p alone (ownSignatures).
 func decoderFor(p provider.Provider, proto provider.Protocol, tools []Tool) func(data string, emit func(Event)) error {
+	return signersNoted(decoderOf(p, proto, tools), p.ID)
+}
+
+func decoderOf(p provider.Provider, proto provider.Protocol, tools []Tool) func(data string, emit func(Event)) error {
 	if proto == provider.Chat && p.IsPlugin() {
 		d := &chatDecoder{past: true}
 		return d.decode
@@ -9415,6 +9611,29 @@ func streamError(w http.ResponseWriter, proto provider.Protocol, model string, s
 		ev.Code = "context_length_exceeded"
 	}
 	makeEncoder(proto, sw, &Request{Model: model}).event(ev)
+}
+
+// failOverloaded is how the Routing page words a failure told in a
+// later try's place (Route.Fail) that was the vendor too busy for the
+// request (saidOverloaded): a word for the row only. Routing reads such a
+// failure as failOther, which rests the account a moment at most
+// (vendorOverloaded); it is never a rest's Why.
+const failOverloaded = "overloaded"
+
+// toldFail says why the failure o, told the agent in a later try's
+// place, failed, as the Routing page words it: the vendor overloaded
+// (danzi002 on Discord: ChatGPT's 529 server_is_overloaded, on an
+// account with its allowance left, read as "quota used up" beside the
+// last account's usage limit), the agent's prompt turned away, or as
+// failure reads its status and words.
+func toldFail(o *Try) string {
+	switch {
+	case o.errType == turnedAwayErrType:
+		return failPrompt
+	case saidOverloaded(o.Status, string(wordsOf([]byte(o.Error)))):
+		return failOverloaded
+	}
+	return failure(o.Status, []byte(o.Error))
 }
 
 // saidOverloaded says a failure is the vendor too busy for the request:

@@ -121,9 +121,16 @@ type Route struct {
 	Done   bool    `json:"done"`
 	Status int     `json:"status,omitempty"`
 	Error  string  `json:"error,omitempty"`
-	Millis int64   `json:"ms,omitempty"`
-	Tokens int     `json:"tokens,omitempty"`
-	Output int     `json:"out,omitempty"` // of Tokens, the reply's
+	// Fail: why the failure the agent was told failed (toldFail), set
+	// when it was an earlier try's than the last (Try.Earlier, or every
+	// account after it passed over by a middleware): the request's row
+	// pairs Status with it, not with the last try's own Fail (danzi002 on
+	// Discord: an earlier account's 529 server_is_overloaded read
+	// "529 · quota used up" beside the last account's usage limit)
+	Fail   string `json:"fail,omitempty"`
+	Millis int64  `json:"ms,omitempty"`
+	Tokens int    `json:"tokens,omitempty"`
+	Output int    `json:"out,omitempty"` // of Tokens, the reply's
 	// Reasoning: of Output, the reply's reasoning, which its speed leaves
 	// out (usage.DecodeOf)
 	Reasoning int `json:"reasoning,omitempty"`
@@ -151,6 +158,12 @@ type Route struct {
 	// is unknown (maskingMs)
 	Phase   string `json:"phase,omitempty"`
 	Masking int64  `json:"masking,omitempty"`
+	// Bytes, ContentAt and EstTok: the reply as it reaches the agent
+	// (live.go), the bytes it has had, the epoch ms content last came, and
+	// the output tokens estimated from it, 0 while its pair has no rate
+	Bytes     int64 `json:"bytes,omitempty"`
+	ContentAt int64 `json:"contentAt,omitempty"`
+	EstTok    int   `json:"estTok,omitempty"`
 	// Held: the file name, in HeldDir, of the report saved of a request
 	// magpie held too long before routing it and stopped (giveUp)
 	Held string `json:"held,omitempty"`
@@ -463,6 +476,10 @@ type Try struct {
 	Error      string `json:"error,omitempty"`
 	Rest       *Rest  `json:"rest,omitempty"`  // how long it now sits out; none when it was the last to try
 	Again      int64  `json:"again,omitempty"` // ms waited before it was tried again, the last one left
+	// Kept: Again was waited though others were left, because the
+	// conversation is kept on this one for what its vendor cached of it,
+	// so it is asked once more before it moves (keptAgain, jiabubu)
+	Kept bool `json:"kept,omitempty"`
 	// Replan: every member had failed in a way that passes, so after
 	// Again the Replan of them that may answer by then were asked again,
 	// in turn, within the group's Patience (seconds) for the request
@@ -478,6 +495,10 @@ type Try struct {
 	// allowance's (Discord, waroy). Whether a try went on is the next
 	// try in Tries, which is appended only as it is asked (#2281)
 	Earlier bool `json:"earlier,omitempty"`
+	// errType: the kind of error the failure's body named (Usage.ErrType),
+	// kept for the one told in place of a later try's (Earlier), so the
+	// row's kind is that failure's and not the later try's
+	errType string
 	// Queued: ms it waited for one of its key's or account's slots, the
 	// provider's MaxConcurrency out already (concurrency.go)
 	Queued int64 `json:"queued,omitempty"`
@@ -837,6 +858,11 @@ func (t *trace) update(r *Route, f func(r *Route)) {
 			t.totals.Errors++
 		}
 		t.turns.end(r, turnFinal(r), time.Now())
+		// read: the scan's context is its request's, which keeps the
+		// request on it (inflight's unrouted watch) and so its body; a
+		// socket turn's is the whole conversation, in memory, and 60
+		// routes are kept
+		r.tools = nil
 		if keepsRoutes() {
 			c := *r
 			c.Order = append([]Weighed{}, r.Order...) // [] for none: the GUI reads it as a list
@@ -851,6 +877,22 @@ func (t *trace) update(r *Route, f func(r *Route)) {
 	if after := activityOf(r); before != after {
 		t.noteActivity(r, activityChange(before, after))
 	}
+}
+
+// liveBytes writes a reply's running totals on its route (live.go): the
+// bytes the agent has had, when content last came, and its estimated
+// output tokens. Each write wakes the pages waiting, which gather a
+// moment before they read (traceGather), so a stream's many writes reach
+// a page a few times a second, and the last before a pause is not lost.
+func (t *trace) liveBytes(rt *Route, bytes, contentAt int64, est int) {
+	if rt == nil {
+		return
+	}
+	t.mu.Lock()
+	rt.Bytes, rt.ContentAt, rt.EstTok = bytes, contentAt, est
+	t.changed()
+	rt.Seq = t.seq
+	t.mu.Unlock()
 }
 
 // gatewayTrace tells this gateway's routing to another magpie on the same

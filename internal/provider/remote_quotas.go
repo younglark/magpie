@@ -75,7 +75,7 @@ const errRemoteNotShared = "remote magpie isn't shared; turn on Share on local n
 // on, rather than leaving the remote's Claude or Codex out with no word
 // (yi_time on Discord: a Claude shared from another computer showed no
 // usage on any page here, its key held to Claude's models there).
-const errRemoteHeld = "remote magpie tells this key none of its quotas, as it holds the key to a budget, models or accounts; turn on Quotas for the key under Gateway keys on that computer"
+const errRemoteHeld = "remote magpie tells this key none of its quotas, as it holds the key to a budget, models or accounts; on that computer, turn on Quotas for the key under Gateway keys, and let it use every model of a provider whose usage it is to see"
 
 // errRemoteKey is a remote magpie that didn't take this provider's key (401).
 const errRemoteKey = "remote magpie didn't take this key; use one of its enabled gateway keys"
@@ -207,7 +207,7 @@ func ForgetKeptCardsForTest() {
 func remoteMagpies() []Provider {
 	var out []Provider
 	for _, p := range All() {
-		if p.IsRemoteMagpie() && !p.Hidden && !p.Off && p.Key != "" && p.Anthropic != "" {
+		if p.IsRemoteMagpie() && !p.Hidden && !p.Off && !p.SelfLeftOut() && p.Key != "" && p.Anthropic != "" {
 			out = append(out, p)
 		}
 	}
