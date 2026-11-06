@@ -343,8 +343,13 @@ var (
 	// WorkBuddy's 429 14018 "Credits exhausted. Please visit the link
 	// below to purchase add-on packs…" too (Creat.wu on Discord)
 	brokeWords = regexp.MustCompile(`(?i)insufficient.?(balance|credit|fund)|\bcredits? (are )?exhausted\b|余额不足|欠费|请充值`)
-	// quotaWords: it has used up what its plan allows for now.
-	usedUpWords = regexp.MustCompile(`(?i)quota|usage.?limit|out of budget|budget (exceeded|exhausted)|limit.?reached|hit your .*limit|limit.{0,24}resets|exceeded.*(plan|limit)|额度|用量|套餐|上限`)
+	// quotaWords: it has used up what its plan allows for now. The budget's
+	// words needn't sit beside each other: LiteLLM's spent key answers 429
+	// "Budget has been exceeded! Key=… (sk-…), Current cost: …, Max budget:
+	// …" (#5111, wuxiaoqiang12) — its "has been" broke the pair, and read
+	// as a plain rate limit the key was asked again every half an hour, the
+	// user's quota-rest never read
+	usedUpWords = regexp.MustCompile(`(?i)quota|usage.?limit|out of budget|budget.{0,32}(exceeded|exhausted)|limit.?reached|hit your .*limit|limit.{0,24}resets|exceeded.*(plan|limit)|额度|用量|套餐|上限`)
 	// rateWords: a 429 that is a short rate limit — requests or tokens per
 	// minute — which usedUpWords took for a used-up plan ("Rate limit
 	// exceeded", "reached"): as magpie words an upstream error, with
@@ -388,8 +393,11 @@ var (
 	// there (重置, or a comma or full stop), so a refusal cut short after
 	// "UTC", "UTC+" or Ark's "+0800" isn't read as UTC: another vendor's
 	// date in passing ("deprecated on …"), or one with no offset, is not a
-	// reset time.
-	resetsWhen = regexp.MustCompile(`(?i)(?:\bresets? at|将在|将于)\s*(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2}):(\d{2})\s*(?:(?:UTC|GMT)([+-])(\d{1,2})(?::?(\d{2}))?|([+-])(\d{2})(\d{2}) (?-i:[A-Z]{2,5}))(?:\s*(?:重置|[,.;，。；]))`)
+	// reset time. The offset may sit in brackets, as WorkBuddy's China
+	// build writes it since November (taoxiaoxin on Discord: "将在
+	// 2026-11-06 17:13:04 (UTC+8) 重置"): unread, the refusal rested the
+	// whole account a quarter of an hour as out of quota.
+	resetsWhen = regexp.MustCompile(`(?i)(?:\bresets? at|将在|将于)\s*(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2}):(\d{2})\s*[(（]?\s*(?:(?:UTC|GMT)([+-])(\d{1,2})(?::?(\d{2}))?|([+-])(\d{2})(\d{2}) (?-i:[A-Z]{2,5}))\s*[)）]?(?:\s*(?:重置|[,.;，。；]))`)
 	// monthlyWords: a refusal that says the allowance it used up is a
 	// month's, as Ark's does ("You have exceeded the monthly usage quota")
 	// and Zhipu's 1310 ("Weekly/Monthly Limit Exhausted"): the reset time
@@ -589,7 +597,8 @@ func failure(status int, body []byte) string {
 		// Standard's pool, which counts some models only, and read as the
 		// account out of credit it rested Droid Core with it (#1979)
 		return failQuota
-	case status == 402, creditWords.Match(body) && (status != 429 || brokeWords.Match(body)) || bytes.Contains(body, []byte("insufficient_quota")):
+	case status == 402, creditWords.Match(body) && (status != 429 || brokeWords.Match(body)),
+		bytes.Contains(body, []byte("insufficient_quota")) && !minuteRate(body):
 		return failCredit
 	case status == 429 && resetsWhen.Match(body):
 		// out until the time it names, in whichever language it said so:
@@ -597,7 +606,7 @@ func failure(status int, body []byte) string {
 		// English one as a rate limit, and each rested its own fallback
 		// (#1669)
 		return failQuota
-	case status == 429 && minuteLimit(body):
+	case status == 429 && minuteRate(body):
 		// a limit per minute, whatever it calls itself: back in a
 		// minute, not a plan used up (minuteWords)
 		return failRate
@@ -620,13 +629,20 @@ func failure(status int, body []byte) string {
 	return failOther
 }
 
-// minuteLimit says a 429's words name a limit per minute or less
+// minuteRate says a 429's words name a limit per minute or less
 // (minuteWords), and nothing longer or spent beside it: no longer window
-// (longWords), no balance spent (brokeWords, insufficient_quota). Words
-// in a link don't count.
-func minuteLimit(body []byte) bool {
+// (longWords), no balance spent (brokeWords). Words in a link don't
+// count. A body carrying the quota code insufficient_quota reads here
+// too when its words say a rate: SenseNova's token-plan gateway answers
+// its throttle with the code beside the type rate_limit_error and the
+// message "inference exceeds tpm/rpm limit" over a pool half up — read
+// from its body it was out of credit, from the words magpie gave the
+// agent a rate limit, and the same text was both the same day (#5006).
+// The code is the gateway's throttle code, not its balance: OpenAI's own
+// out-of-credit (its message names no rate) reads credit as before.
+func minuteRate(body []byte) bool {
 	body = urlWords.ReplaceAll(body, nil)
-	return minuteWords.Match(body) && !longWords.Match(body) && !brokeWords.Match(body) && !bytes.Contains(body, []byte("insufficient_quota"))
+	return minuteWords.Match(body) && !longWords.Match(body) && !brokeWords.Match(body)
 }
 
 // dashScopeTokenRate: DashScope's (Model Studio's) 429 for the tokens
@@ -696,7 +712,29 @@ func restrictedRefused(p provider.Provider, status int, body []byte) bool {
 	if restrictedSaid(status, body) {
 		return true
 	}
-	return isWorkBuddy(p) && provider.WBRestricted(status, wordsOf(body))
+	return isWorkBuddy(p) && provider.WBRestricted(status, wordsOf(body)) || googleSuspended(p, status, body)
+}
+
+// googleToS is Google's 403 PERMISSION_DENIED for a Code Assist account it
+// suspended: "This service has been disabled in this account for violation
+// of Terms of Service. Please submit an appeal to continue using this
+// product." (bestony on Discord, an Antigravity account, 11-06).
+var googleToS = regexp.MustCompile(`(?i)disabled in this account for violation of Terms of Service`)
+
+// googleSuspended says Google suspended p, an account signed in to
+// Antigravity or Gemini CLI, for its terms (googleToS): the account, not
+// the model or the request, until an appeal goes through. Read as any
+// failure, it rested a minute, doubling to ten, and was asked again, and
+// refused, every ten minutes for good. Another vendor's same words are its
+// own, and aren't read so.
+func googleSuspended(p provider.Provider, status int, body []byte) bool {
+	if status != http.StatusForbidden {
+		return false
+	}
+	if a := accountAgent(p); a != "antigravity" && a != "gemini" {
+		return false
+	}
+	return googleToS.Match(wordsOf(body))
 }
 
 // isWorkBuddy is whether p is a WorkBuddy account, either build's: the
@@ -759,6 +797,12 @@ type Rest struct {
 	// (GanHei37443 on X: three WorkBuddy accounts each "failed · back in
 	// 16s", and nothing on the row said why)
 	Error string `json:"error,omitempty"`
+	// Rate: the vendor called it a rate (frequency) limit and named when
+	// it lifts (rateUntilSaid). It rests as out of quota until then, and
+	// the app says rate limited, not quota used up: WorkBuddy's "您的使用
+	// 量已超出频率限制，将在 … 重置，您也可以切换其他模型继续使用" rests
+	// one model of an account with credits left (taoxiaoxin on Discord)
+	Rate bool `json:"rate,omitempty"`
 
 	// the subscription account resting, when it is one; agent "" and its
 	// provider.KeyAllowanceID for a key out of its own windows
@@ -1650,6 +1694,7 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 	if id == c.restID() {
 		r.Model = c.model
 	}
+	r.Rate = rateUntilSaid(why, r.By, body)
 	r.Probed = probeable(c, r, header, now) && !probeMissed(id, now)
 	restingUntil.Lock()
 	if why == failQuota || why == failCredit {
@@ -1698,6 +1743,14 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 		go narrowWhenRead(c, r)
 	}
 	return r
+}
+
+// rateUntilSaid says a refusal read as out of quota until the time it
+// names (by "resets") calls itself a rate or frequency limit (rateWords,
+// words in a link apart): the app words its rest as rate limited, with
+// that time. How long it rests, and what it rests, are a quota's.
+func rateUntilSaid(why, by string, body []byte) bool {
+	return why == failQuota && by == "resets" && rateWords.Match(urlWords.ReplaceAll(wordsOf(body), nil))
 }
 
 // vendorOverloaded says a failure is the vendor's servers too busy for
