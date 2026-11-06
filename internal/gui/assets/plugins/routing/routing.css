@@ -556,8 +556,13 @@ button.rt-session { cursor: pointer; }
 .rt-group { display: flex; align-items: center; gap: 12px; padding: 10px 12px 10px 14px; cursor: pointer; transition: background .12s; }
 .rt-group:hover { background: var(--card-2); }
 .rt-group.off { opacity: .6; }
-/* switched off as a whole: dimmed but for its switch, which brings it back */
-.rt-group.disabled > :not(.rt-gon) { opacity: .5; }
+/* switched off as a whole: its switch, its "switched off" tag and its
+   grey logos say so, and its words stay readable (jiabubu on Discord: at
+   half opacity they were too faint to read), the name a step quieter than
+   an on group's and not dimmed again by .off */
+.rt-group.disabled { opacity: 1; }
+.rt-group.disabled .nm b { color: var(--fg-2); font-weight: 500; }
+.rt-group.disabled > .ics, .rt-group.disabled > .rt-ghandle { filter: grayscale(1); opacity: .6; }
 .rt-group .rt-gon { flex: none; transform: scale(.85); }
 .rt-group .ics { display: flex; gap: 3px; flex: none; min-width: 18px; }
 .rt-group .ics .ic { width: 16px; height: 16px; }
@@ -590,6 +595,12 @@ button.rt-session { cursor: pointer; }
 .rt-gedit button.primary.busy { opacity: .75; display: inline-flex; align-items: center; gap: 6px; }
 .rt-gedit button.primary.busy::before { content: ""; width: 10px; height: 10px; border-radius: 50%; border: 1.6px solid currentColor; border-right-color: transparent; animation: spin .7s linear infinite; }
 @media (prefers-reduced-motion: reduce) { .rt-gedit button.primary.busy::before { animation-duration: 2s; } }
+/* what a group's card and its editor say can be selected and copied
+   (jiabubu on Discord): its name and id, its models, its patterns, what
+   is left of its accounts; a drag across them selects, a click still
+   opens the editor (groupRow). Its controls stay controls. */
+.rt-groups:not(.sorting) > .rt-group :is(.nm b, .nm code.mdl, .mem),
+.rt-gedit .fallback:not(.rt-rules) > .fbl:not(.sorting) > .fbrow > .n, .rt-gaccts > .fbrow > .n { user-select: text; -webkit-user-select: text; }
 .rt-group .mem { margin-top: 2px; font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* a pattern the group finds models by, and how many it matches now */
 .rt-group .mem.pat code, .rt-pats code { font: var(--code-style, normal) 500 11px/1.5 var(--code-font, var(--code)); font-stretch: var(--code-stretch, 100%); color: var(--fg-2); }

@@ -505,6 +505,9 @@ type Server struct {
 	// codexTurns is the model each Codex last had a turn of its own
 	// answered on, by caller (codexMemoryStandIn)
 	codexTurns sync.Map
+	// held is the most prompt tokens each provider's model answered
+	// (heldOf), by provider id and model
+	held sync.Map
 	// codexLeads is the model each Codex conversation's own turns last
 	// went on, for its side calls to follow (codexFollowTo)
 	codexLeads codexLeads
@@ -3838,6 +3841,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			w = spliceAfter(w, hw.over)
 		}
 		reasked += hw.reasked
+		if hw.code() > 0 && hw.code() < 400 && !hw.refused {
+			// an answer, passing or held whole: the model holds a prompt
+			// this size (tooLongUnsaid)
+			s.noteHeld(c.p.ID, c.model, call.Usage.prompt())
+		}
 		if hw.passing {
 			clientResponseID = call.Usage.ResponseID
 		}
@@ -3850,7 +3858,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		outgrew := false // a failure that didn't say so was the request's length
 		if !hw.passing && !hw.refused && hw.code() >= 400 {
 			if req, err := parse(from, attemptBody); err == nil {
-				if msg, ok := tooLongUnsaid(c.p, c.model, estimate(req), hw.code(), hw.errBody()); ok {
+				if msg, ok := tooLongUnsaid(c.p, c.model, estimate(req), s.heldOf(c.p.ID, c.model), hw.code(), hw.errBody()); ok {
 					// told as an overflow: not asked again, of this one or
 					// another, and nobody rests
 					hw.failure, hw.failMsg, outgrew = http.StatusBadRequest, msg, true
@@ -6033,17 +6041,19 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			// turns the whole request away for (#1462)
 			body = withReasoningOnToolTurns(body)
 		}
+		// a client that took the gateway for an Ollama server (its
+		// /api/tags and /api/show are answered in Ollama's shape) sends
+		// Ollama's per-request options beside its Chat fields: Hermes
+		// Agent's {"num_ctx": …} from /api/show's context length. No Chat
+		// API reads them, Ollama's own /v1 included (its
+		// ChatCompletionRequest has no options), and a strict one turns
+		// the whole request away: Gemini's OpenAI-compatible API over a
+		// name it doesn't know (#3097), Mistral with 422 extra_forbidden
+		// (lijiho96940561 on X). Their runner settings have no place
+		// there, as the Ollama route's own body builder judges
+		// (ollamaChatBody), so no upstream is sent them
+		body = withoutOllamaOptions(body)
 		compat := geminiCompat(p.Host(), model)
-		if compat {
-			// a client that took the gateway for an Ollama server (its
-			// /api/show is answered in Ollama's shape) sends Ollama's
-			// per-request options beside its Chat fields. Gemini's
-			// OpenAI-compatible API reads proto JSON and turns the whole
-			// request away over a name it doesn't know (#3097), and the
-			// runner settings in options have no place on a Chat API, as
-			// the Ollama route's own body builder judges (ollamaChatBody)
-			body = withoutFields(body, "options")
-		}
 		// Gemini's thought signatures, which came to the client in its
 		// calls' ids, go back where Gemini wants them; another upstream
 		// gets the calls' own ids (#687)

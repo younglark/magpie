@@ -3907,8 +3907,8 @@ function openAgentMenu(anchor, a, inFold) {
   const { shown } = arrangeAgents();
   const i = shown.findIndex((x) => x.id === a.id);
   const reapply = !a.cliMissing && (a.drift || a.fields.some((f) => optionFor(f, f.value)?.ref));
-  // a Mac window's (coolmantou)
-  const term = a.terminal && mode != "panel" && !web ? [{ name: "Open in terminal", icon: LAUNCH_GLYPH, sep: !0, run: () => api("agents/open", { agent: a.id }).catch(statusErr) }] : [];
+  // coolmantou, lileo0668
+  const o = a.terminal && mode != "panel" && !web, term = [...o ? [{ name: "Open in terminal", icon: LAUNCH_GLYPH, sep: !0, run: () => api("agents/open", { agent: a.id }).catch(statusErr) }] : [], ...a.command ? [{ name: "Copy launch command", icon: COPY_ICON, sep: !o, run: () => copy(a.command, t("Launch command")) }] : []];
   const acts = inFold && isHidden(a)
     ? [{ name: "Show", icon: EYE, run: () => setAgentHidden(a, false) }]
     : inFold
@@ -9164,11 +9164,9 @@ function vertexOfDraft() {
   return { project: (v.project || "").trim(), location: (v.location || "").trim(), credentials: (v.credentials || "").trim(), impersonate: (v.impersonate || "").trim() };
 }
 const decideOnly = (p) => !!p?.decide && !(p.chat || p.responses || p.anthropic || p.gemini);
-// a provider that lists its decision models apart (OpenRouter) says which
-// they are: its Jev Router (typesafe/jev-router) is a chat model
+// OpenRouter lists its decision models apart
 const decidesModel = (p, id) => !!p.decide && (decideOnly(p) || (p.deciders ? p.deciders.includes(id) : id.split("/").some((s) => /^jev(?:-|$)/i.test(s))));
-// modelAPIs: the APIs one of p's models can be asked on alone, those it has
-// a URL for when it has more than one, Gemini's too (01huadalang, Kayphoon)
+// modelAPIs: those p has a URL for, if 2+ (01huadalang, Kayphoon)
 const modelAPIs = (p) => {
   const urls = ["chat", "responses", "anthropic", "gemini"].filter((k) => ((draft?.id === p.id ? draft[k] : undefined) ?? p[k] ?? "").trim());
   return urls.length < 2 ? [] : PROTOS.filter(([k]) => urls.includes(k));
@@ -9179,8 +9177,7 @@ function pickedOf(p) {
   const on = p.models.filter((m) => m.on);
   if (!Array.isArray(p.chosen)) return on.map((m) => m.id); // no picks said: those served, as before
   const picks = new Set(p.chosen);
-  // a pick agents aren't offered for want of its API's URL stays picked
-  // (#2094): it is offered again once the URL is added
+  // one with no URL for its API stays picked (#2094)
   return p.models.filter((m) => (m.on || m.noAPI) && picks.has(m.id)).map((m) => m.id);
 }
 
@@ -9266,8 +9263,7 @@ function drawEditor(p, presetID) {
     }
   }
 
-  // a vendor's global and China endpoints are presets of their own, one row
-  // in the add sheet: here the new provider picks between them, the key kept
+  // a vendor's global and China endpoints: one row in the add sheet, picked here
   const pair = isNew && pr ? (globalOf(pr) ? [globalOf(pr), pr] : chinaOf(pr) ? [pr, chinaOf(pr)] : null) : null;
   if (pair) {
     const seg = el("div", "segs area");
@@ -9286,9 +9282,7 @@ function drawEditor(p, presetID) {
     ed.append(...field(t("Region"), seg, ""));
   }
 
-  // who uses it: just the agents already pointed here, so a click changes
-  // one's model. Pointing a new agent at the provider happens in the Agent
-  // tab's picker, not here.
+  // the agents already pointed here; a new one is pointed in the Agents tab
   if (p) {
     const on = p.agents.filter((a) => a.current);
     if (on.length) {
@@ -9306,7 +9300,8 @@ function drawEditor(p, presetID) {
   }
 
   let name, url;
-  if (another) {
+  const remoteNew = isNew && pr?.id === "remote-magpie";
+  if (another && !remoteNew) {
     name = input(draft.name === pr.name ? "" : draft.name, t("e.g. {name} · Work", { name: pr.name }));
     const hint = el("div", "hint");
     const idHint = () => { hint.textContent = t("id {id} — a number is added if it is taken", { id: draft.id }); };
@@ -9316,10 +9311,7 @@ function drawEditor(p, presetID) {
     wrap.append(name, hint);
     ed.append(el("label", "", t("Name")), wrap);
   }
-  // an added preset's name is the user's, as a custom provider's is: two
-  // of a vendor's sites (Kimi and Kimi (China)) named as they tell them
-  // apart, in the list and every picker (yapechan on Discord). Left empty,
-  // it is the preset's again
+  // an added preset's name is the user's (yapechan on Discord); empty, the preset's
   if (p && pr && !p.account) {
     name = input(draft.name === pr.name ? "" : draft.name, pr.name);
     name.className = "provider-name";
@@ -9373,18 +9365,14 @@ function drawEditor(p, presetID) {
     ed.append(...field(t("Name"), name));
     if (p) idField();
 
-    // the base URL is the one the chosen protocol is asked at; a vendor
-    // that serves only the Responses API is added (and tested) with that
-    // alone, since /chat/completions would only fail (#73)
+    // the base URL is the chosen protocol's; Responses alone where only it serves (#73)
     const seg = el("div", "segs base-apis");
     for (const [v, hint] of [["openai", "…/v1 — chat completions, and responses when the vendor has it"], ["responses", "…/v1 — for a vendor that serves only the Responses API, not chat completions"], ["anthropic", "the root URL, what ANTHROPIC_BASE_URL would take"], ["gemini", "…/v1beta — Google's Gemini API (generateContent), or one that answers as it does; the key goes in x-goog-api-key"], ["decide", "a decision API's root, POST …/systemone under it: its models are a routing group's classifier, never an agent's"]]) {
       const b = el("button", "opt" + (draft.api === v ? " on" : ""), t(API_NAMES[v]));
       b.title = t(hint);
       b.onclick = () => {
         if (draft.api === v) return;
-        // each protocol keeps its own URL (#105); an unsaved one moves to a
-        // protocol without one, in its spelling (#73), and goes back once
-        // that protocol is given its own (#1231)
+        // each protocol keeps its own URL (#105, #73, #1231)
         const from = apiField[draft.api], to = apiField[v];
         carried = null;
         if (!draft[to] && draft[from] && draft[from] !== (p?.[from] || "")) {
@@ -9605,14 +9593,10 @@ function drawEditor(p, presetID) {
     addressField = field(t("Server address"), address, t("Where the server listens; change the port, or give another computer's address"));
   }
 
-  // null, not false, when there is none: false?.key is undefined, and a
-  // provider with no key read .set of it (willz: a local Ollama without a
-  // key opened no editor, its row just toggling)
+  // null, not false, with no key (willz)
   const copied = (!p && draft.copyOf && providers.providers.find((x) => x.id === draft.copyOf)) || null;
   const key = input(draft.key || "", p?.key.set ? t("{masked} · paste a new key to replace it", { masked: p.key.masked }) : copied?.key.set ? t("{masked} · {name}'s key, or paste another", { masked: copied.key.masked, name: copied.name }) : t(pr?.keyHint || (pr?.noKey || p?.key.optional ? "optional for local servers" : "paste an API key")), "password");
-  // many keys pasted at once (361 on Discord): one a line, or separated by
-  // commas or spaces, are kept as one list; saved, the first is the key
-  // and the others are added to its accounts, as Paste several does
+  // many keys pasted at once (361 on Discord): the first is the key, the others its accounts
   const keyCount = el("span", "hint key-count");
   const countKeys = () => {
     const n = splitKeys(key.value).length;
@@ -9712,6 +9696,24 @@ function drawEditor(p, presetID) {
   else if (vertex) ed.append(...vertexFields());
   // keys are replaced in Accounts; the box is for no key yet (Kylin_Cloud on X)
   else if (!p?.keyList?.length) ed.append(...field(t("API key"), keyWrap, isNew ? t("Kept in ~/.config/magpie/providers.json, readable by you alone. Nothing is read from your shell.") : ""));
+
+  // blank, the preset's (treeman_26897)
+  if (remoteNew) {
+    const idIn = input("", pr.id);
+    name = input("", pr.name);
+    name.className = "provider-name";
+    idIn.className = "provider-id";
+    name.oninput = idIn.oninput = () => { draft.name = name.value.trim() || pr.name; draft.id = slug(idIn.value) || slug(name.value) || pr.id; idIn.placeholder = draft.id; };
+    name.onkeydown = idIn.onkeydown = key.onkeydown;
+    ed.append(...field(t("Name"), name), ...field(t("ID"), idIn));
+  }
+  // off when added
+  if ((p?.preset || pr?.id) === "remote-magpie" && !p?.account) {
+    const [l, c] = tick(t("Add its MCP servers to the Library"), (draft.libraryMCP ??= !!p?.libraryMCP));
+    l.classList.add("library-mcp");
+    c.onchange = () => (draft.libraryMCP = c.checked);
+    ed.append(...field(t("MCP servers"), l));
+  }
 
   // A user-defined provider can have its own picture; presets keep theirs.
   if (custom) ed.append(...field(t("Icon"), iconPicker(ed), ""));
@@ -10160,6 +10162,7 @@ function drawEditor(p, presetID) {
     if (custom) { body.icon = draft.icon || "generic"; body.iconFrom = draft.iconFrom || ""; body.balanceURL = (draft.balanceURL || "").trim(); body.balancePath = (draft.balancePath || "").trim(); body.balanceMethod = draft.balanceMethod || ""; body.modelsURL = (draft.modelsURL || "").trim(); }
     if (p) { body.fallback = draft.fallback; body.unlisted = draft.unlisted; body.hiddenDrawers = draft.hiddenDrawers; body.hiddenVideomakers = draft.hiddenVideomakers; body.noModels = noneChosen(); body.bestInFamily = bestChosen(); body.modelPrefs = modelPrefsOfDraft(); Object.assign(body, routingOfDraft(p)); }
     body.searches = !!draft.searches && searchable();
+    if (draft.libraryMCP != null) body.libraryMCP = draft.libraryMCP;
     body.pinUpstream = !!draft.pinUpstream;
     if (twoKeyHeaders()) body.authHeader = draft.authHeader || "";
     body.unredacted = !!draft.unredacted && unmaskable();
@@ -18821,12 +18824,17 @@ function ledAxis(max) {
 }
 
 // what a chart tells apart, most first, and the colour of each: those of the
-// ranking's top, and the rest together as "Other"
-function ledCategories(l, split, metric) {
-  const list = (l.by?.[split] || []).slice().sort((a, b) => ledRankValue(metric, b) - ledRankValue(metric, a) || allTokens(b) - allTokens(a));
+// ranking's top, the rest as "Other"; a speed chart's, the most timed
+// (zzzkl3994 on Discord)
+function ledCategories(l, split, metric, chart) {
+  const v = chart && metric === "speed" ? (x) => ledSpeed(x) > 0 ? x.decode_n || x.timed || 1 : 0 : (x) => ledRankValue(metric, x);
+  const list = (l.by?.[split] || []).slice().sort((a, b) => v(b) - v(a) || allTokens(b) - allTokens(a));
   const top = list.slice(0, LED_SHOWN).map((x, i) => ({ ...x, color: `var(--c${i + 1})` }));
   return { top, rest: list.slice(LED_SHOWN), list };
 }
+// a speed point's timed ones past the colours, faint
+const ledOthers = (by, top, list) => Object.keys(by).filter((k) => ledSpeed(by[k]) > 0 && !top.some((c) => c.id === k))
+  .map((id) => ({ id, name: list.find((x) => x.id === id)?.name, color: "var(--faint)" }));
 
 // when a point is: the hour, the day or the week it stands for
 function ledWhen(p, bucket) {
@@ -18860,12 +18868,12 @@ function drawLedColumns(box, l, split, metric, compact, chooseDay, focusDay) {
   box.append(plot);
   const W = plot.clientWidth, H = plot.clientHeight, pts = l.series || [], n = pts.length;
   if (W < 100 || !n) return;
-  const { top } = ledCategories(l.chartBy ? { by: l.chartBy } : l, split, metric);
+  const { top, list } = ledCategories(l.chartBy ? { by: l.chartBy } : l, split, metric, true);
   const totals = pts.map((p) => ledValue(metric, p));
   // speeds don't add up: a point's column is how fast all its replies
   // wrote, and each one told apart is a mark at its own speed on it (#860)
   const speed = metric === "speed";
-  const max = Math.max(0, ...totals, ...(speed ? pts.flatMap((p) => top.map((c) => ledSpeed(p.by?.[split]?.[c.id]))) : []));
+  const max = Math.max(0, ...totals, ...(speed ? pts.flatMap((p) => Object.values(p.by?.[split] || {}).map(ledSpeed)) : []));
   if (!(max > 0)) {
     plot.append(el("div", "none", t(metric === "cost" ? "No known price for these requests" : speed ? "No streamed replies timed in this period" : "Nothing in this period")));
     return;
@@ -18873,9 +18881,7 @@ function drawLedColumns(box, l, split, metric, compact, chooseDay, focusDay) {
   const topV = ledAxis(max);
   const selectable = l.bucket === "day" && !!box.chooseDay;
   const g = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: selectable ? "group" : "img", "aria-label": t("Usage trend") });
-  // the side's labels, measured as drawn: the plot starts where the widest
-  // ends ("8000 万", "¥1250" are wider than "80M"), so none reaches past the
-  // card's padding
+  // the side's labels, measured: the plot starts where the widest ends
   plot.append(g);
   const labs = [0, 1, 2, 3, 4].map((i) => {
     const lab = sv("text", { "text-anchor": "end", class: "axis" });
@@ -18917,19 +18923,13 @@ function drawLedColumns(box, l, split, metric, compact, chooseDay, focusDay) {
     };
     const by = p.by?.[split] || {};
     if (speed) {
-      // the point's own speed, as a track the models' marks sit on: not a
-      // share of anything, and not the grey "Other" of the stacked charts
+      // the point's own speed, a track the models' marks sit on
       if (totals[i] > 0) { draw("\0all", "var(--pill)", totals[i]); segs.at(-1).classList.add("all"); }
-      for (const c of top) {
+      for (const c of [...top, ...ledOthers(by, top, list)]) {
         const v = ledSpeed(by[c.id]);
         if (!(v > 0)) continue;
-        // a model faster than the point's own leaves its mark above the
-        // column, in nothing: a leader line ties the two, so the mark reads
-        // as this column's rather than as a stray dash (huoranxuanyuan, #860).
-        // The colour goes through style, not the attribute: var() substitutes
-        // in a style and not in a presentation attribute. The line stops at
-        // the column's top when the mark is within a pixel of it, or it would
-        // be drawn back down into the column
+        // a mark above the column gets a leader line to it (#860); colour
+        // through style, where var() works
         if (v > totals[i]) {
           const top = Y(totals[i]);
           segs.push(g.appendChild(sv("line", {
@@ -18973,7 +18973,7 @@ function drawLedColumns(box, l, split, metric, compact, chooseDay, focusDay) {
     // first token each in a column of their own (#2343)
     tip.classList.toggle("speed", speed);
     const by = p.by?.[split] || {};
-    const rows = top.map((c) => [name(c), c.color, ledPart(metric, by[c.id] || {}), by[c.id]]);
+    const rows = [...top, ...(speed ? ledOthers(by, top, list) : [])].map((c) => [name(c), c.color, ledPart(metric, by[c.id] || {}), by[c.id]]);
     if (!speed) rows.push([t("Other"), "var(--faint)", Math.max(0, totals[i] - rows.reduce((a, x) => a + x[2], 0))]);
     for (const [nm, color, v, part] of rows.filter((x) => x[2] > 0).sort((a, b) => b[2] - a[2])) {
       const row = el("div");
@@ -19023,8 +19023,8 @@ function drawLedRank(box, l, split, metric, picked, choose, compact) {
   const kept = box.scrollTop;
   box.replaceChildren();
   const { top, rest, list } = ledCategories(l, split, metric);
-  if (l.chartBy) {
-    const colors = ledCategories({ by: l.chartBy }, split, metric).top;
+  if (l.chartBy || metric === "speed") {
+    const colors = ledCategories(l.chartBy ? { by: l.chartBy } : l, split, metric, true).top;
     for (const x of top) x.color = colors.find((c) => c.id === x.id)?.color || "var(--faint)";
   }
   if (!list.length) return;
