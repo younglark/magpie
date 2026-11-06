@@ -158,11 +158,12 @@ func wiresOf(ctx context.Context) map[string]string {
 // The reasons serve gives a model move of its own (ModelMove.Why);
 // Claude Desktop's are desktopMove's.
 const (
-	movedClassifier = "classifier"  // Claude Code's auto mode classifier: the model /model moved its tier to
-	movedClaudeTier = "claude-tier" // Claude Code's full id of a Claude model: the model set for its tier
-	movedStandIn    = "stand-in"    // a model magpie doesn't serve: the one the agent's config names
-	movedCodexTurn  = "codex-turn"  // Codex's memory or auto-review call: its last turn's model
-	movedPrivacy    = "privacy"     // a request masking would change: Settings › Privacy's model for it
+	movedClassifier  = "classifier"   // Claude Code's auto mode classifier: the model /model moved its tier to
+	movedClaudeTier  = "claude-tier"  // Claude Code's full id of a Claude model: the model set for its tier
+	movedStandIn     = "stand-in"     // a model magpie doesn't serve: the one the agent's config names
+	movedCodexTurn   = "codex-turn"   // Codex's memory or auto-review call: its last turn's model
+	movedCodexFollow = "codex-follow" // Codex's memory call on a bare default of its own magpie serves, nothing set for it: the conversation's model
+	movedPrivacy     = "privacy"      // a request masking would change: Settings › Privacy's model for it
 )
 
 // standIn is StandIn's model for one magpie shows no entry for: not a
@@ -1089,6 +1090,12 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	if local(r) {
 		out["pid"], out["serves"] = os.Getpid(), Serves
 	}
+	// its MCP router has a server to give, for another magpie that has
+	// this one as a Remote magpie to give it a server of its own
+	// (provider/remote_hub.go); told to whoever the router answers
+	if (local(r) || sharedWith(r)) && hubServes() {
+		out["mcp_hub"] = true
+	}
 	writeJSON(w, 200, out)
 }
 
@@ -2007,6 +2014,8 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 		}
 		if from == provider.Chat {
 			body = thinkingEffort(body)
+			// OpenCode 1's promptCacheKey (#5468)
+			body = cacheKeyCamel(body)
 			// a tool Pi adds during a conversation, in a message of its
 			// own: in the request's tools for every route, the relay's
 			// and every check that reads them (#2322)
@@ -2369,9 +2378,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		asked = grouped(at(m))
 		move(m, movedStandIn)
 	}
-	if m := s.codexMemoryStandIn(r, call.Agent, agent, call.Kind, asked, body); m != "" {
+	if m, why := s.codexMemoryStandIn(r, call.Agent, agent, call.Kind, asked, body); m != "" {
 		asked = m
-		move(m, movedCodexTurn)
+		move(m, why)
 	}
 	// a Codex subagent on the model set for Codex's subagents, whatever
 	// its lead asked for (willz on Discord), and a Claude Desktop
@@ -7506,6 +7515,16 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		}
 		if to == provider.Chat && (p.IsBedrock() || p.IsAzure()) {
 			body = asCompletionTokens(body)
+		}
+		if to == provider.Chat && (p.Preset == "mistral" || p.Host() == "api.mistral.ai") {
+			// an earlier turn's reasoning, which the build replays in
+			// reasoning_content for a model whose name says DeepSeek
+			// wherever it is served (chatReplaysReasoning), and Mistral
+			// turns that field away (#494): the thinking part it takes,
+			// as the relayed route converts it. The Chat route alone had
+			// it; every follow-up of a Codex tool loop was refused, 422
+			// extra_forbidden (#4906)
+			body = mistralThinking(body)
 		}
 		if to == provider.Responses && !keepsLoneNone(p) {
 			// the "none" buildResponses keeps for a request that turned

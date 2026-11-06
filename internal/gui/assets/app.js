@@ -1290,13 +1290,10 @@ function fillMenuButton(b, a) {
 // what turning one on costs, said in its opened row
 const CONNECT_COST = {
   gemini: "Gemini CLI's requests all go through magpie; its Google sign-in is turned off first and comes back when you disconnect",
-  // Desktop's third-party mode runs in a userData of its own (Claude-3p),
-  // so the signed-in profile's chats and projects aren't shown there; magpie
-  // leaves them alone (xgddm88 on X: 之前的工程和会话记录全没了)
+  // its third-party mode has a userData of its own (xgddm88 on X)
   "claude-desktop": "Chats and projects from your Anthropic sign-in stay in Desktop's own profile, not shown on magpie; nothing is deleted, and turning this off brings them back.",
 };
-// what an agent not yet connected says turning it on does to what the user
-// sees in it, before they turn it on
+// what turning it on changes in it, said before
 const CONNECT_BEFORE = {
   "claude-desktop": "Not connected · on magpie, Claude Desktop opens a separate profile: chats and projects from your Anthropic sign-in stay, and are back when you turn it off",
 };
@@ -1305,6 +1302,7 @@ const CONNECT_BEFORE = {
 const STARTS_WITH = new Set(["codex", "claude"]);
 
 let agentExpanded = null; // the connected agent opened in the window
+let agentExpandRequest = 0; // a later click supersedes a settings read or closing animation
 const staleSeen = {}; // agent id → the running copies the reader was told of
 const previews = {}; // agent id → its disconnect preview, as last read
 
@@ -1340,9 +1338,7 @@ function newModels(a) {
 }
 
 const staleNow = (a) => a.wired && a.stale > 0 && staleSeen[a.id] !== a.stale;
-// a running copy left on the old list (agent.StaleCopy's kind): what it
-// is, since when, and how it is reopened — the words, and the command or
-// key in them as code
+// a copy left on the old list (agent.StaleCopy's kind), and its reopen
 const STALE_HOW = {
   app: ["The {agent} app, started {when}: closing its window keeps it running. Quit it with {cmd} and open it again.", "⌘Q"],
   ide: ["{agent} in an editor (VS Code, Cursor…), started {when}: reload that editor's window."],
@@ -1352,10 +1348,7 @@ const STALE_HOW = {
   cli: ["A {agent} in a terminal, started {when}: quit it and start it again."],
 };
 
-// the folded row's words for the copies left on the old list (#1374): a
-// reopen of one kind doesn't end another, so "reopen Codex" sent the reader
-// to the app while the editor's Codex was the one left. One kind is named
-// with how it is reopened; more are counted, the row opened says which.
+// the folded row's words for one kind of copy left; more are counted (#1374)
 const STALE_SHORT = {
   app: "Connected · quit and reopen the {agent} app",
   ide: "Connected · reload the editor's window",
@@ -1429,8 +1422,7 @@ function connectLine(a, kind) {
     return line;
   }
   line.classList.add("on");
-  // Codex on magpie while its ChatGPT account is used up: the line says
-  // until when, the hover (and the row opened) what is off till then
+  // its ChatGPT account used up: until when, and what is off till then
   if (a.appOut) {
     const o = a.appOut;
     if (o.stuck) say(t("On magpie · quit and reopen the {agent} app to send", { agent: a.name }), "wait");
@@ -1484,14 +1476,27 @@ function expandLink(a) {
   if (!open) {
     b.append(el("span", "chev", svg(CHEV_R, 10, 1.6)));
   }
-  b.onclick = (e) => {
+  b.onclick = async (e) => {
     e.stopPropagation();
+    const request = ++agentExpandRequest;
+    const want = open ? null : a.id;
+    const own = want && agentPrefsOf(a);
+    const compact = own && own.includes("fullContextRow") && !window.agentCompactFill;
+    // sheet measures once: its settings are read first (#5360, chiperman)
+    if (own && (!prefs || compact)) {
+      const label = [...b.childNodes];
+      b.disabled = true;
+      saving(b, t("Loading…"));
+      try { await Promise.all([!prefs && loadSettings(), compact && import("./agentcompact.js")]); }
+      catch (e) { if (request === agentExpandRequest && b.isConnected) statusErr(e); return; }
+      finally { b.disabled = false; doneSaving(b); b.replaceChildren(...label); }
+      if (request !== agentExpandRequest || !b.isConnected || view !== "agents") return;
+    }
     const shut = document.querySelector("#agents .row.agent.expanded > .ag-exp");
-    agentExpanded = open ? null : a.id;
-    const want = agentExpanded;
+    agentExpanded = want;
     // the one open slides shut first, then the list is drawn again
     sheet(shut, false, () => {
-      if (agentExpanded !== want) return;
+      if (request !== agentExpandRequest || agentExpanded !== want) return;
       renderAgents();
       if (want) sheet(document.querySelector(`#agents .row.agent[data-id="${CSS.escape(want)}"] > .ag-exp`), true);
     });
@@ -1546,22 +1551,15 @@ function connectRow(a, row, who, { fields, extras, fieldBtn, sw, kind }) {
   row.classList.toggle("unplugged", kind === "ok" && !a.wired);
   who.classList.add("with-models");
   who.append(connectLine(a, kind));
-  // a hidden one's Show stands in the row, centred as its picker and switch
-  // are, not up on the name's line above its middle (Hu9956, #842: 其余里
-  // 的显示歪了偏上了)
+  // a hidden one's Show centred in the row, as its switch is (#842)
   const back = who.querySelector(":scope > .ag-show");
   if (back) row.append(back);
-  // the model it starts on, one click away beside the switch (the owner:
-  // both ways at once): picked here, it is connected first if it wasn't
+  // the model it starts on, beside the switch; picked, it connects (the owner)
   const start = kind === "ok" && !listsMenu(a) ? startField(a) : null;
   if (start) fields.querySelector(`:scope > [data-key="${CSS.escape(start.key)}"]`)?.remove();
   if (kind === "ok") {
     if (a.wired) {
-      // a click anywhere on the row that isn't one of its controls opens or
-      // closes it, as a disclosure row does on the Mac (NG_shiyu on X: the
-      // space between the name and the model did nothing, only the small
-      // link did); the link stays the control the keyboard and a screen
-      // reader use, with its aria-expanded
+      // a click on the row off its controls opens it, as on the Mac (NG_shiyu)
       const link = expandLink(a);
       row.append(link);
       row.onclick = (ev) => {
@@ -1592,9 +1590,7 @@ function connectRow(a, row, who, { fields, extras, fieldBtn, sw, kind }) {
     off.append(el("i"));
     row.append(add, off);
   } else if (kind === "link") {
-    // its link where the others' model stands, and nothing to switch: the
-    // switch's room kept, so the button lines up with the pickers (the
-    // owner: the old row's wide button sat apart from every other)
+    // its link where a model stands, the switch's room kept (the owner)
     const b = importButton(a);
     b.classList.add("ag-start");
     row.append(b, el("span", "ag-conn-gap"));
@@ -8001,7 +7997,7 @@ function advancedSet(d, p) {
     !!d.proxyMode || Object.values(d.accountProxies || {}).some((x) => x?.mode) ||
     [d.concurrency, d.maxAccounts, d.queueLimit, d.queueWait, d.maxRPM, d.priceRate, d.contexts, d.outputs, d.compacts].some((v) => String(v ?? "").trim()) ||
     !!d.rateWindows?.length ||
-    !!(d.searches || d.authHeader || d.passUserAgent || d.unredacted || d.countFree || d.pinUpstream || d.nativeCompaction || d.balanceToken || d.limitRestOff || d.imageFilesOff) ||
+    !!(d.searches || d.authHeader || d.passUserAgent || d.unredacted || d.countFree || d.pinUpstream || d.nativeCompaction || d.balanceToken || d.limitRestOff || d.http1 || d.imageFilesOff) ||
     !!d.fallback?.length || !!p?.balanceToken?.set;
 }
 function priceRateError(ed) {
@@ -8074,6 +8070,7 @@ function asTyped() {
   // asked unchecked as it would be saved; magpie takes it only for a
   // provider of the user's own
   body.insecureTLS = !!draft.insecureTLS;
+  body.http1 = !!draft.http1;
   return body;
 }
 
@@ -9196,7 +9193,7 @@ function baseAPIOf(p) {
 
 // draftOf is a saved provider as its editor's form holds it.
 function draftOf(p) {
-  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), passHeaders: (p.passHeaders || []).join(", "), icon: p.icon || "", iconFrom: p.iconFrom || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], hiddenVideomakers: [...(p.hiddenVideomakers || [])], searches: !!p.searches, unredacted: !!p.unredacted, countFree: !!p.countFree, insecureTLS: !!p.insecureTLS, limitRestOff: !!p.limitRestOff, imageFilesOff: !!p.imageFilesOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: !!p.passUserAgent, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p), rateWindows: (p.rateWindows || []).map((w) => ({ ...w })) };
+  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), passHeaders: (p.passHeaders || []).join(", "), icon: p.icon || "", iconFrom: p.iconFrom || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], hiddenVideomakers: [...(p.hiddenVideomakers || [])], searches: !!p.searches, unredacted: !!p.unredacted, countFree: !!p.countFree, insecureTLS: !!p.insecureTLS, http1: !!p.http1, limitRestOff: !!p.limitRestOff, imageFilesOff: !!p.imageFilesOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: !!p.passUserAgent, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p), rateWindows: (p.rateWindows || []).map((w) => ({ ...w })) };
 }
 
 // duplicateProvider opens the Add form on a copy of p, its key p's unless another is pasted (#268).
@@ -9798,9 +9795,13 @@ function drawEditor(p, presetID) {
     ctk.classList.add("insecure-tls");
     ccb.onchange = () => { draft.insecureTLS = ccb.checked; };
     const row = field(t("Certificate"), ctk, t("For your own server with a self-signed certificate or one from your company's CA. magpie then can't tell it from another machine answering at its address: turn it on only on a network you trust."));
-    showTLS = () => { for (const e of row) e.style.display = onHTTPS() ? "" : "none"; };
+    const [htk, hcb] = tick(t("HTTP/1.1 only"), !!draft.http1);
+    hcb.onchange = () => { draft.http1 = hcb.checked; };
+    const hrow = field(t("HTTP version"), htk);
+    showTLS = () => { for (const e of [...row, ...hrow]) e.style.display = onHTTPS() ? "" : "none"; };
     showTLS();
     ed.append(...row);
+    advIn.append(...hrow);
   }
   // off, a 429 or quota refusal rests none of its keys (LimitRestOff, zoecats)
   if (custom) {
@@ -10163,7 +10164,7 @@ function drawEditor(p, presetID) {
     if (twoKeyHeaders()) body.authHeader = draft.authHeader || "";
     body.unredacted = !!draft.unredacted && unmaskable();
     body.countFree = !!draft.countFree;
-    if (tlsTakes()) body.insecureTLS = !!draft.insecureTLS && onHTTPS();
+    if (tlsTakes()) { body.insecureTLS = !!draft.insecureTLS && onHTTPS(); body.http1 = !!draft.http1 && onHTTPS(); }
     if (custom) body.limitRestOff = !!draft.limitRestOff;
     if (p?.takesImageFiles) body.imageFilesOff = !!draft.imageFilesOff;
     if (!decideOnly(p || pr)) body.nativeCompaction = !!draft.nativeCompaction && carriesCompaction();
@@ -11993,7 +11994,7 @@ function renderModels(p) {
 }
 
 function renderDrawers(p) {
-  return field(t("Image models"), mediaChips("mchips drawers", p.drawIds, "hiddenDrawers", p, p.drawNames), p.drawPicks ? t("ChatGPT's image backend picks the model itself, whichever is named, so one GPT Image is listed") : t("Settings → Images lists the ticked ones. Agents don't chat with these, so they aren't among its models."));
+  return field(t("Image models"), mediaChips("mchips drawers", p.drawIds, "hiddenDrawers", p, p.drawNames), p.drawPicks ? t("ChatGPT's image backend picks the GPT Image version itself and doesn't say which; to choose one, use an OpenAI API key") : t("Settings → Images lists the ticked ones. Agents don't chat with these, so they aren't among its models."));
 }
 
 // renderVideomakers: its video models, ticked to be offered (axelburks on Discord)
@@ -21548,7 +21549,7 @@ function renderImageGen(s, keep, box) {
   // ChatGPT's images backend picks the model itself, so its one entry says
   // so where it draws, picked or automatic (#1865)
   const draws = v === "off" || gone ? "" : v ? shown : s.imageGenAuto;
-  if (models.find((x) => x.id === draws)?.vendorPicks) who.append(el("div", "sub image-gen-vendor", t("ChatGPT's image backend picks the model itself, whichever is named, so one GPT Image is listed")));
+  if (models.find((x) => x.id === draws)?.vendorPicks) who.append(el("div", "sub image-gen-vendor", t("ChatGPT's image backend picks the GPT Image version itself and doesn't say which; to choose one, use an OpenAI API key")));
   // a pick unticked in its provider's editor since still draws, and says so
   if (s.imageGenHidden && !gone && v !== "off") who.append(el("div", "sub image-gen-hidden", t("{model}, picked here, is unticked in its provider's Image models: it still draws, but leaves this list once another is picked. Tick it there to keep it listed.", { model: named(shown) })));
   if (gone) who.append(el("div", "sub err image-gen-missing", s.imageGenAuto
