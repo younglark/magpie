@@ -478,6 +478,8 @@ type SkillView struct {
 	OffHere bool `json:"offHere,omitempty"`
 	// Note is the user's own note on it (Skill.Note)
 	Note string `json:"note,omitempty"`
+	// Manual: its SKILL.md sets disable-model-invocation (meta.Manual)
+	Manual bool `json:"manual,omitempty"`
 }
 
 // View is the Library page.
@@ -495,9 +497,13 @@ type View struct {
 	FoundServers   []Found             `json:"foundServers"`
 	Skills         []SkillView         `json:"skills"`
 	FoundSkills    []FoundSkill        `json:"foundSkills"`
-	// NewSkills are skills a check found its skills' repositories to have
-	// added beside them, to add or set aside
-	NewSkills    []NewSkill        `json:"newSkills"`
+	// NewSkills are skills a check found its skills' repositories, or
+	// the folders they were added from, to have beside them since, to
+	// add or set aside
+	NewSkills []NewSkill `json:"newSkills"`
+	// CheckFolders is whether a check looks in folders the user added
+	// skills from, which the page then offers with no remote skill
+	CheckFolders bool              `json:"checkFolders,omitempty"`
 	Projects     []ProjectView     `json:"projects"`
 	Instructions *InstructionsView `json:"instructions"`
 	Dir          string            `json:"dir"`
@@ -711,7 +717,7 @@ func readView(problems []Problem, glance bool) (*View, error) {
 			sv.Origin = o.String()
 		}
 		if m, ok := readMeta(skillDir(s.Name)); ok {
-			sv.Description = m.Description
+			sv.Description, sv.Manual = m.Description, m.Manual
 		} else {
 			sv.Missing = true
 		}
@@ -725,6 +731,7 @@ func readView(problems []Problem, glance bool) (*View, error) {
 		v.FoundServers[i].Icon = serverIcon(l, v.FoundServers[i].Server)
 	}
 	v.NewSkills = newSkills(l)
+	v.CheckFolders = l.addedFromFolders()
 	v.Projects = projectViews(l, problems)
 	v.SkillGroups = l.skillGroups()
 	v.CheckDue = checkDue(l)

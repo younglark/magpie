@@ -64,7 +64,9 @@ const callCacheVersion = "calls-v15"
 // parent's (codex_fork.go, zcDB.copied).
 // codex 2, zcode 2: only the copies are; a fork's own calls are its own
 // (zcode 1 left out every call of a session holding one copy).
-var callParseVersions = map[string]int{"cindy": 1, "codex": 3, "zcode": 2}
+// antigravity 1: a Gemini deployment's name with any one letter after it
+// (gemini-4-argon-d) is its model's (GeminiDeployment).
+var callParseVersions = map[string]int{"antigravity": 1, "cindy": 1, "codex": 3, "zcode": 2}
 
 // CallCacheVersion is callCacheVersion and callParseVersions, for a cache
 // of what is made of the calls (usage's requests-v1.bin and heatmap): a
@@ -756,25 +758,58 @@ func loadKept(f file) *callFile {
 // holds no more than framePatches, so a kept one is at most ~1 MB.
 var framePatchBufs = sync.Pool{New: func() any { return new([]callPatch) }}
 
+// frameBytes holds one frame's bytes as writeCalls writes it, for the
+// next frame and the next write: a write was held whole before any of it
+// went to the file, grown by doublings to its size (~120 MB of a first
+// start's writes, and a 52k-call session held 8 MB at once), where one
+// frame is at most ~1 MB.
+var frameBytes = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 func writeCalls(st *callFile, start int, appendOnly bool) {
 	state := diskCallState(st)
-	var data bytes.Buffer
+	dir := callCacheDir()
+	if os.MkdirAll(dir, 0700) != nil {
+		return
+	}
+	var out *os.File
+	var err error
+	if appendOnly {
+		out, err = os.OpenFile(callCachePath(st.Path), os.O_WRONLY|os.O_APPEND, 0600)
+	} else {
+		out, err = os.CreateTemp(dir, "calls-*.tmp")
+	}
+	if err != nil {
+		return
+	}
+	if !appendOnly {
+		defer os.Remove(out.Name())
+	}
+	data := frameBytes.Get().(*bytes.Buffer)
+	defer func() {
+		if data.Cap() <= 4<<20 {
+			data.Reset()
+			frameBytes.Put(data)
+		}
+	}()
 	var frame callFrame
 	var dict map[string]uint32
 	var header [8]byte
 	ok := true
-	// flush adds the frame to data, its header in front
+	// flush writes the frame to out, its header in front
 	flush := func(more bool) {
 		frame.More = more
-		at := data.Len()
+		data.Reset()
 		data.Write(header[:])
-		if gob.NewEncoder(&data).Encode(frame) != nil {
+		if gob.NewEncoder(data).Encode(frame) != nil {
 			ok = false
 			return
 		}
 		b := data.Bytes()
-		binary.LittleEndian.PutUint32(b[at:], uint32(len(b)-at-len(header)))
-		binary.LittleEndian.PutUint32(b[at+4:], crc32.ChecksumIEEE(b[at+len(header):]))
+		binary.LittleEndian.PutUint32(b, uint32(len(b)-len(header)))
+		binary.LittleEndian.PutUint32(b[4:], crc32.ChecksumIEEE(b[len(header):]))
+		if _, err := out.Write(b); err != nil {
+			ok = false
+		}
 	}
 	patches := framePatchBufs.Get().(*[]callPatch)
 	defer func() {
@@ -782,13 +817,25 @@ func writeCalls(st *callFile, start int, appendOnly bool) {
 		*patches = frame.Patches[:0]
 		framePatchBufs.Put(patches)
 	}()
-	frame.Patches = (*patches)[:0]
+	// room for the first frame's patches at once: the pool is empty after
+	// a collection, and append's doublings to framePatches were ~150 MB
+	// of a first start's writes
+	n := len(st.Calls) - start
+	for i := 0; i < start; i++ {
+		if st.dirty[i] {
+			n++
+		}
+	}
+	frame.Patches = slices.Grow((*patches)[:0], min(n, framePatches))
 	begin := func() {
 		frame = callFrame{State: state, Strings: []string{""}, Calls: len(st.Calls), Patches: frame.Patches[:0]}
 		dict = map[string]uint32{"": 0}
 	}
 	begin()
 	add := func(i int) {
+		if !ok {
+			return
+		}
 		if len(frame.Patches) == framePatches {
 			if flush(true); !ok {
 				return
@@ -817,31 +864,10 @@ func writeCalls(st *callFile, start int, appendOnly bool) {
 	for i := start; i < len(st.Calls); i++ {
 		add(i)
 	}
-	if flush(false); !ok {
-		return
+	if ok {
+		flush(false)
 	}
-	dir := callCacheDir()
-	if os.MkdirAll(dir, 0700) != nil {
-		return
-	}
-	var out *os.File
-	var err error
-	if appendOnly {
-		out, err = os.OpenFile(callCachePath(st.Path), os.O_WRONLY|os.O_APPEND, 0600)
-	} else {
-		out, err = os.CreateTemp(dir, "calls-*.tmp")
-	}
-	if err != nil {
-		return
-	}
-	if !appendOnly {
-		defer os.Remove(out.Name())
-	}
-	_, err = out.Write(data.Bytes())
-	if closeErr := out.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil && !appendOnly {
+	if closeErr := out.Close(); ok && closeErr == nil && !appendOnly {
 		_ = os.Rename(out.Name(), callCachePath(st.Path))
 	}
 }

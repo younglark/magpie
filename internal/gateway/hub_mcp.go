@@ -134,6 +134,70 @@ type HubServer struct {
 	// (RouterHeader) isn't given it, so two magpies that have each other
 	// never ask each other round.
 	Bridge bool
+	// HereOnly: the server acts as the user of this computer beyond what
+	// its tools' arguments say: Magpie Browser (every site the user's
+	// browser is signed in to), magpie's image server (it draws with this
+	// magpie's own token, past a gateway key's models, accounts and
+	// spend), and another magpie's router (which passes a call on to its
+	// own). It is given only to a caller on this computer (HubVisitor),
+	// Magpie Browser also to a keyed one elsewhere (Keyed).
+	HereOnly bool
+	// Program: the server is a program run on this computer, with the
+	// user's rights (a command, or a tools plugin), not an HTTP server
+	// elsewhere. A gateway key held to some models, accounts or a spend
+	// limit isn't given it from another computer.
+	Program bool
+	// Keyed: the server is Magpie Browser, whose browsers are each this
+	// computer's or a gateway key's (browser.go): given to this computer
+	// and to another computer's caller with a key, and calls go to that
+	// key's browsers only.
+	Keyed bool
+}
+
+// HubVisitor is who a hub request is from, for what it is given of the
+// servers behind it (HubServer's HereOnly and Program): Away, another
+// computer, a tunnel or a web page; Held, by a gateway key held to some
+// models, accounts or a spend limit. A caller on this computer is given
+// every server. Key is the gateway key an Away visitor came with, whose
+// browsers it is given (HubServer's Keyed).
+type HubVisitor struct {
+	Away, Held bool
+	Key        string
+}
+
+// Gives is whether v is given s.
+func (v HubVisitor) Gives(s HubServer) bool {
+	if !v.Away {
+		return true
+	}
+	if s.Keyed {
+		return v.Key != ""
+	}
+	return !s.HereOnly && !(v.Held && s.Program)
+}
+
+type hubVisitorKey struct{}
+
+// WithHubVisitor is ctx a hub request of v.
+func WithHubVisitor(ctx context.Context, v HubVisitor) context.Context {
+	return context.WithValue(ctx, hubVisitorKey{}, v)
+}
+
+// HubVisitorOf is who ctx's hub request is from; a ctx with none (the
+// gateway's own calls) is this computer's.
+func HubVisitorOf(ctx context.Context) HubVisitor {
+	v, _ := ctx.Value(hubVisitorKey{}).(HubVisitor)
+	return v
+}
+
+// hubVisitor is who r is from (HubVisitor).
+func hubVisitor(r *http.Request) HubVisitor {
+	away := !local(r) || fromBrowser(r)
+	v := HubVisitor{Away: away, Held: away && nativeHeld(access.Caller(r.Context()))}
+	if !local(r) && !fromBrowser(r) {
+		v.Key = access.Caller(r.Context()).KeyID
+	}
+	return v
 }
 
 // RouterHeader marks a request of magpie's own router to another magpie's
@@ -158,9 +222,21 @@ func FromRouter(ctx context.Context) bool {
 // hubServersOf are the servers behind agent's tools, as the request of
 // ctx is given them.
 func hubServersOf(ctx context.Context, agent string) []HubServer {
-	ss := MCPHub.Servers(agent)
+	// a copy: the hub's own list isn't cut
+	ss := slices.Clone(MCPHub.Servers(agent))
 	if FromRouter(ctx) {
 		ss = slices.DeleteFunc(ss, func(s HubServer) bool { return s.Bridge })
+	}
+	v, who := HubVisitorOf(ctx), access.Caller(ctx)
+	ss = slices.DeleteFunc(ss, func(s HubServer) bool {
+		ok, _ := who.MCPServer(s.Name)
+		return !v.Gives(s) || !ok
+	})
+	// a key held to some tools of a server is told of those only
+	for i, sv := range ss {
+		if _, every := who.MCPServer(sv.Name); !every {
+			ss[i].Tools = slices.DeleteFunc(slices.Clone(sv.Tools), func(n HubToolNote) bool { return !who.MCPAllows(sv.Name, n.Name) })
+		}
 	}
 	return ss
 }
@@ -196,6 +272,7 @@ func (s *Server) hubMCP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get(RouterHeader) != "" {
 		r = r.WithContext(WithRouter(r.Context()))
 	}
+	r = r.WithContext(WithHubVisitor(r.Context(), hubVisitor(r)))
 	serveMCP(w, r, "magpie's MCP hub", "magpie", hubBody, func(r *http.Request, m mcpMessage) (any, map[string]any) {
 		return s.hubMCPCall(r, agent, m)
 	})
@@ -232,9 +309,20 @@ func hubTools(ctx context.Context, agent string) []hubTool {
 	if MCPHub == nil || !MCPHub.On() {
 		return nil
 	}
+	// a server the caller isn't given (HubVisitor) is neither listed nor,
+	// as calls are found in this list (hubToolNamed), run
+	v, kept := HubVisitorOf(ctx), map[string]bool{}
+	for _, s := range MCPHub.Servers(agent) {
+		if !v.Gives(s) {
+			kept[s.Name] = true
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, hubListWait)
 	defer cancel()
-	return hubNamed(MCPHub.Tools(ctx, agent))
+	// nor is one the calling gateway key may not use (access.Key.MCP)
+	who := access.Caller(ctx)
+	ts := slices.DeleteFunc(slices.Clone(MCPHub.Tools(ctx, agent)), func(t HubTool) bool { return kept[t.Server] || !who.MCPAllows(t.Server, t.Tool) })
+	return hubNamed(ts)
 }
 
 // hubLineMax is how much of the instructions' first line an agent is sure
@@ -586,6 +674,9 @@ func hubToolNamed(ctx context.Context, ts []hubTool, agent, name string) (hubToo
 		if !ok || tool == "" {
 			continue
 		}
+		if !access.Caller(ctx).MCPAllows(sv.Name, tool) {
+			continue
+		}
 		t := hubTool{HubTool: HubTool{Server: sv.Name, Tool: tool}, name: name}
 		for _, l := range ts {
 			if l.Server == sv.Name {
@@ -606,6 +697,10 @@ func hubToolNamed(ctx context.Context, ts []hubTool, agent, name string) (hubToo
 // reads them, its workspaces and client (HubCaller).
 func (s *Server) hubCall(r *http.Request, agent string, t hubTool, args json.RawMessage, meta hubCallMeta) any {
 	c := HubCaller{Session: hubSession(r, agent, meta)}
+	if v := hubVisitor(r); v.Away && v.Key != "" {
+		// its browser is its key's, whatever session it names (browser.go)
+		c.Session = keyedSession(v.Key, c.Session)
+	}
 	if t.Roots {
 		c.Roots, c.Client = hubRoots(r, meta), hubClient(r)
 	}
@@ -622,6 +717,11 @@ func (s *Server) hubMCPRun(r *http.Request, agent string, t hubTool, args json.R
 	use.on(t.Server)
 	use.as(agent)
 	use.named(t.name)
+	// every hub call comes here: a tool the gateway key may not use is
+	// refused whichever way it was found
+	if who := access.Caller(r.Context()); !who.MCPAllows(t.Server, t.Tool) {
+		return toolResult(keyMCPToolRefused(who, t.Server, t.Tool), true)
+	}
 	release, err := reserveFor(access.Caller(r.Context()), int64(len(args)), "", limitClock())
 	if err != nil {
 		return toolResult(err.Error(), true)

@@ -28,6 +28,7 @@ magpie.plugin("library", (ctx) => {
   let probing = false;
   let checking = false;  // asking GitHub which skills it has changed
   let autoChecked = false; // the page checked by itself, as the server said it was due (#1449)
+  let updatingAll = false; // Update all, picked from the bar's menu
   let regrouping = false; // the skills' repositories fetched to group them again
   let modal = null;      // what the library has open in the dialog
   const hid = new Set(); // the write failures the reader hid, by agent and what (#3745)
@@ -1672,9 +1673,14 @@ magpie.plugin("library", (ctx) => {
         const rh = el("div", "row-head lib-serverhead");
         rh.append(el("span", "label", t("In the library")), el("span", "grow"));
         if (many) rh.append(sortBy("libServers", NAME_SORTS, fill));
-        if (many && all.length) rh.append(pickButton("servers"), ...everyButtons("servers", all));
-        if (by) rh.append(byAgentButton("servers"));
-        if (many) rh.append(removeEveryButton("servers"));
+        // the rest under ⋯, as the skills' (ryanpascal on Discord)
+        if (many && all.length) rh.append(pickButton("servers"));
+        rh.append(barMore([
+          ...many && all.length ? everyButtons("servers", all).map((b) => [b, GLYPH.power]) : [],
+          by && [byAgentButton("servers"), GLYPH.person],
+          null,
+          many && [removeEveryButton("servers"), GLYPH.trash],
+        ]));
         body.append(rh);
       }
       fill();
@@ -3597,37 +3603,36 @@ magpie.plugin("library", (ctx) => {
       const fresh = lib.skills.filter((s) => s.kind === "github" || s.kind === "git" || s.origin);
       rh.append(el("span", "grow"));
       if (lib.skills.length > 1) rh.append(sortBy("libSkills", SKILL_SORTS(), () => { if (box.isConnected) drawSkills(box, all); }));
-      if (lib.skills.length > 1) rh.append(foldAllButton(box, all));
-      // the groups traced again: a pack added a while ago is mostly older
-      // copies its repository has edited since (White Immortal on Discord)
-      if (lib.skills.length > 1 && lib.skills.some((s) => skillRepo(s))) {
-        const g = button(regrouping ? t("Grouping…") : t("Group again"), "lib-regroup", () => regroupSkills());
-        g.title = t("Fetch the repositories your skills came from, and group the skills they have with them");
-        g.disabled = regrouping;
-        if (regrouping) g.classList.add("busy");
-        rh.append(g);
-      }
-      if (lib.skills.length > 1 && all.length) rh.append(pickButton("skills"), ...everyButtons("skills", all));
-      if (byAgentRows("skills").length) rh.append(byAgentButton("skills"));
-      // every one kept in ~/.agents/skills, moved into the library at once
-      // (tnt1223); a row moves its own
-      const kept = lib.skills.filter((s) => s.shared);
-      if (kept.length > 1) rh.append(handOverButton(kept));
-      if (lib.skills.length > 1) rh.append(removeEveryButton("skills"));
-      if (lib.skills.some((s) => s.kind === "github" || s.kind === "git")) {
-        const c = button(checking ? t("Checking…") : t("Check for updates"), "lib-updall", () => checkSkills());
-        c.title = lib.skills.some((s) => s.kind === "git")
+      // what is used now and then waits under ⋯ (ryanpascal on Discord):
+      // the bar keeps the order, Select, what is going on and what a check
+      // found to do
+      if (lib.skills.length > 1 && all.length) rh.append(pickButton("skills"));
+      let check = false, again = false, updAll = false;
+      if (lib.checkFolders || lib.skills.some((s) => s.kind === "github" || s.kind === "git")) {
+        const c = button(checking ? t("Checking…") : t("Check for updates"), "lib-updall lib-check", () => checkSkills());
+        c.title = lib.checkFolders
+          ? t("Look in the repositories and folders your skills came from for changes and new skills")
+          : lib.skills.some((s) => s.kind === "git")
           ? t("Ask the repositories your skills came from which skills changed since they were installed")
           : t("Ask GitHub which skills changed since they were installed");
         c.disabled = checking;
-        if (checking) c.classList.add("busy");
-        rh.append(c);
+        if (checking) { c.classList.add("busy"); rh.append(c); }
+        else check = [c, REAPPLY];
       }
       // not checked since magpie started, or not for a while: the page
       // checks by itself, once, after it is drawn (#1449)
       if (lib.checkDue && !checking && !autoChecked) {
         autoChecked = true;
         setTimeout(() => checkSkills(true), 0);
+      }
+      // the groups traced again: a pack added a while ago is mostly older
+      // copies its repository has edited since (White Immortal on Discord)
+      if (lib.skills.length > 1 && lib.skills.some((s) => skillRepo(s))) {
+        const g = button(regrouping ? t("Grouping…") : t("Group again"), "lib-updall lib-regroup", () => regroupSkills());
+        g.title = t("Fetch the repositories your skills came from, and group the skills they have with them");
+        g.disabled = regrouping;
+        if (regrouping) { g.classList.add("busy"); rh.append(g); }
+        else again = [g, GLYPH.folder];
       }
       // skills their source no longer has, from one place only: no group
       // heading is drawn to hold its Clean up, so the bar does
@@ -3648,16 +3653,33 @@ magpie.plugin("library", (ctx) => {
         u.title = n === 1 ? t("Fetch {name} from GitHub again", { name: stale[0].name }) : t("Fetch the {n} skills GitHub changed again", { n });
         rh.append(u);
       } else if (fresh.length > 1) {
-        const u = button(t("Update all"), "action lib-updall", async (e, b) => {
-          b.classList.add("busy");
-          b.textContent = t("Updating…");
+        // picked from the menu: the bar says it is at work till it is done
+        const u = button(updatingAll ? t("Updating…") : t("Update all"), "action lib-updall lib-updallnow", async () => {
+          updatingAll = true;
+          render();
           await updateAllSkills();
-          b.classList.remove("busy");
-          b.textContent = t("Update all");
+          updatingAll = false;
+          render();
         });
         u.title = t("Fetch the {n} skills from GitHub again", { n: fresh.length });
-        rh.append(u);
+        u.disabled = updatingAll;
+        if (updatingAll) { u.classList.add("busy"); rh.append(u); }
+        else updAll = [u, GLYPH.down];
       }
+      // every one kept in ~/.agents/skills, moved into the library at once
+      // (tnt1223); a row moves its own
+      const kept = lib.skills.filter((s) => s.shared);
+      const many = lib.skills.length > 1;
+      rh.append(barMore([
+        check, updAll, again,
+        many && [foldAllButton(box, all), () => foldAllBtn?.textContent === t("Expand all") ? MOVE_DOWN : MOVE_UP],
+        null,
+        ...many && all.length ? everyButtons("skills", all).map((b) => [b, GLYPH.power]) : [],
+        byAgentRows("skills").length && [byAgentButton("skills"), GLYPH.person],
+        kept.length > 1 && [handOverButton(kept), GLYPH.skill],
+        null,
+        many && [removeEveryButton("skills"), GLYPH.trash],
+      ]));
       body.append(rh);
       drawSkills(box, all);
       body.append(box);
@@ -3718,7 +3740,7 @@ magpie.plugin("library", (ctx) => {
   function renderNewSkills(body) {
     const list = lib.newSkills;
     const rh = el("div", "row-head lib-newhead");
-    rh.append(el("span", "label", t("Also in their repositories")), el("span", "grow"), el("span", "note", t("on GitHub beside skills you have, not in the library yet")));
+    rh.append(el("span", "label", t("Also in their repositories")), el("span", "grow"));
     if (list.length > 1) {
       const ids = list.map((n) => n.id);
       const ign = button(t("Ignore all"), "lib-updall", () => change("skills/ignore-new", { names: ids }, t("{n} skills set aside", { n: ids.length })));
@@ -3747,10 +3769,20 @@ magpie.plugin("library", (ctx) => {
     sub.title = n.description || "";
     who.append(sub);
     const src = el("div", "lib-src");
-    const a = el("a", "lib-srclink", n.repo + "/" + n.path);
-    a.href = n.id;
-    a.onclick = (e) => { e.preventDefault(); e.stopPropagation(); browse(n.id); };
-    src.append(a);
+    if (n.kind === "folder") {
+      // a folder the user added skills from: shown where it is
+      src.append(pathLink(n.id));
+    } else if (n.kind === "git" && !/^https?:\/\//.test(n.id)) {
+      // an SSH address (git@host:path) or a file:// one: no page to open
+      const a = el("span", "lib-srclink", n.id);
+      a.title = n.id;
+      src.append(a);
+    } else {
+      const a = el("a", "lib-srclink", n.kind === "git" ? n.id.replace(/^https?:\/\//, "") : n.repo + "/" + n.path);
+      a.href = n.id;
+      a.onclick = (e) => { e.preventDefault(); e.stopPropagation(); browse(n.id); };
+      src.append(a);
+    }
     who.append(src);
     const have = el("div", "lib-have");
     // one find without its list of agents doesn't take the page down (#1217)
@@ -3982,6 +4014,41 @@ magpie.plugin("library", (ctx) => {
   // on each heading would leave them; while filtering, it folds or opens
   // the groups the filter shows, till the filter changes, as a heading's
   // click does then. A part inside a group keeps its own fold.
+  // The ⋯ at a list's heading (ryanpascal on Discord): the actions used
+  // now and then, the app's own row menu. Each is [button, icon], a button
+  // made as the bar's own would be, so its name, title and whether it can
+  // be used are read when the menu opens; null is a line between them, and
+  // a hidden button, or a false one (not there), is left out. The menu's item keeps the
+  // button's lib-* names, which the tests click.
+  function barMore(entries) {
+    const b = el("button", "text action lib-updall lib-barmore");
+    b.type = "button";
+    b.title = t("More");
+    b.setAttribute("aria-label", t("More"));
+    b.setAttribute("aria-haspopup", "menu");
+    b.append(svg(DOTS, 14, 2));
+    b.hidden = !entries.some(Boolean);
+    b.onclick = (e) => {
+      e.stopPropagation();
+      if (b.classList.contains("open")) return closeAgentMenu();
+      const acts = [], cls = [];
+      let sep = false;
+      for (const x of entries) {
+        if (x === null) { sep = acts.length > 0; continue; }
+        if (!x) continue;
+        const [btn, icon] = x;
+        if (btn.hidden) continue;
+        acts.push({ name: btn.textContent, literal: true, icon: typeof icon === "function" ? icon() : icon, off: btn.disabled, tip: btn.title, sep, run: (ev) => btn.onclick(ev) });
+        cls.push([...btn.classList].filter((c) => c.startsWith("lib-") && c !== "lib-updall"));
+        sep = false;
+      }
+      if (!acts.length) return;
+      openRowMenu(b, acts);
+      agentMenu?.box.querySelectorAll(".rm-item").forEach((it, i) => it.classList.add(...cls[i]));
+    };
+    return b;
+  }
+
   let foldAllBtn = null;
   function foldAllButton(box, all) {
     const b = button("", "lib-updall lib-foldall", () => {
@@ -5549,6 +5616,7 @@ magpie.plugin("library", (ctx) => {
       };
       nm.append(b);
     }
+    if (s.manual) nm.append(manualTag(s.name));
     // turned off on this computer alone: no agent here gets it, the ticks
     // stay what a sync carries to the others, and a sync doesn't turn it
     // on here again. A line of its own: a narrow row's name has no room
@@ -5926,10 +5994,18 @@ magpie.plugin("library", (ctx) => {
   }
 
 
+  // its SKILL.md sets disable-model-invocation (sunset3279 on Discord):
+  // the model doesn't use it on its own, only a /name the user types
+  function manualTag(name) {
+    return tag(t("Manual only"), "lib-manual", t("Its SKILL.md sets disable-model-invocation: Claude Code runs it only when you type /{name}, never on its own.", { name }));
+  }
+
   function foundSkillRow(f) {
     const row = el("div", "row lib-row lib-found");
     const who = el("div", "who");
-    who.append(el("div", "name", f.name));
+    const nm = el("div", "name", f.name);
+    if (f.manual) nm.append(manualTag(f.name));
+    who.append(nm);
     const sub = el("div", "sub", f.description || "");
     sub.title = f.description || "";
     who.append(sub);
@@ -6434,21 +6510,56 @@ magpie.plugin("library", (ctx) => {
     const box = el("div", "mk-browser");
     const state = el("div", "mk-browser-state");
     const steps = el("ol", "mk-browser-steps");
+    let away = false;
     const go = button(t("Set up the extension…"), "action", async () => {
       go.disabled = true;
       try {
-        draw(await api("library/browser/setup", {}));
-        steps.hidden = false;
+        if (away) await download();
+        else {
+          draw(await api("library/browser/setup", {}));
+          steps.hidden = false;
+        }
       } catch (e) { status(e.message, "err"); }
       go.disabled = false;
     });
+    // magpie's folders are out of this browser's reach (another computer,
+    // or magpie in a container): the extension comes as a zip, pointed at
+    // this page's address with a gateway key of its own
+    const download = async () => {
+      const r = await fetch("/api/library/browser/extension", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ at: location.origin }),
+      });
+      if (!r.ok) throw new Error((await r.text()).trim() || r.statusText);
+      const url = URL.createObjectURL(await r.blob());
+      const a = el("a");
+      a.href = url;
+      a.download = "Magpie Browser Extension.zip";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      steps.hidden = false;
+    };
     const draw = (b) => {
+      away = !!b.away;
       state.replaceChildren();
       const dot = el("span", "mk-browser-dot" + (b.connected ? " on" : ""));
       state.append(dot, el("span", "", b.connected
         ? t("Connected to your browser") + (b.extension ? " · " + b.extension : "")
+        : away ? t("Not connected: download the extension and load it in your browser")
         : b.written ? t("Not connected: load the folder below in your browser, and keep that browser open") : t("Not set up: set up the extension in Chrome, Edge, Arc, Brave or another Chromium browser")));
-      go.textContent = b.written ? t("Show the extension folder") : t("Set up the extension…");
+      go.textContent = away ? t("Download the extension") : b.written ? t("Show the extension folder") : t("Set up the extension…");
+      if (away) {
+        steps.replaceChildren(
+          el("li", "", t("Unzip the download.")),
+          el("li", "", t("Open chrome://extensions (edge://extensions in Edge) in the browser you use every day.")),
+          el("li", "", t("Turn on Developer mode.")),
+          el("li", "", t("Click Load unpacked and choose the unzipped Magpie Browser Extension folder.")),
+        );
+        folder.hidden = true;
+        if (b.connected) steps.hidden = true;
+        return;
+      }
       steps.replaceChildren(
         el("li", "", t("Open chrome://extensions (edge://extensions in Edge) in the browser you use every day.")),
         el("li", "", t("Turn on Developer mode.")),

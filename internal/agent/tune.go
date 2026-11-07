@@ -420,9 +420,10 @@ type TuneKnob struct {
 // TuneKept are the settings in agent's own config that tune put in and
 // that still hold its value (Ours), so Undo can put back what was there:
 // Claude Code's cache lifetimes and per-model windows. The Usage page's
-// card is the one place they are changed, and it keeps them there when
-// a range has too few calls to advise on (linkaww on Discord: a 1-hour
-// cache put in, with no way back to 5 minutes). One in magpie's Long
+// card keeps them there when a range has too few calls to advise on
+// (linkaww on Discord: a 1-hour cache put in, with no way back to 5
+// minutes). The cache lifetimes are also picked in Claude Code's own
+// settings (ClaudeCacheSet), which makes them the user's. One in magpie's Long
 // conversations or Codex's background compaction is left out: Settings
 // shows and changes those.
 func TuneKept(home, agent string) []TuneKnob {
@@ -453,6 +454,32 @@ func TuneKept(home, agent string) []TuneKnob {
 		}
 		return cmp.Or(window(a)-window(b), cmp.Compare(a.Knob, b.Knob), cmp.Compare(a.Model, b.Model))
 	})
+	return out
+}
+
+// TuneCacheHere is Claude Code's two prompt-cache lifetimes as this
+// computer's Claude Code reads them, whoever set them, when its folder is
+// here: the main conversation's always, the subagents' when something
+// sets it. They change what this computer's Claude Code sends, whichever
+// magpie its requests go on to (linkaww on Discord: Claude Code through a
+// Remote magpie, too few calls read here to advise on, and the card had
+// no row to tell the cache it keeps, or a way back to 5 minutes).
+func TuneCacheHere(home string) []TuneKnob {
+	p, err := tuneWhere(home, "claude", TuneCache, "")
+	if err != nil {
+		return nil
+	}
+	if fi, err := os.Stat(filepath.Dir(p.path)); err != nil || !fi.IsDir() {
+		return nil
+	}
+	var out []TuneKnob
+	for _, knob := range []string{TuneCache, TuneSubCache} {
+		s, err := TuneRead(home, "claude", knob, "")
+		if err != nil || knob == TuneSubCache && s.Value == "" {
+			continue
+		}
+		out = append(out, TuneKnob{Knob: knob, Setting: s})
+	}
 	return out
 }
 
@@ -609,4 +636,39 @@ func asyncUndo() error {
 		return nil
 	}
 	return provider.SetCodexAsyncCompact(st.On, st.Percent)
+}
+
+// ClaudeCacheSet is one of Claude Code's prompt-cache lifetimes as the
+// user picks it in Claude Code's settings, beside its compaction (Linka on
+// Discord: the card offers no way to change a lifetime that is already
+// the cheapest): "5m" or "1h", written where the card writes it
+// (promptCacheTtl, subagentPromptCacheTtl in settings.json), or "" taking
+// the key out, so Claude Code's own default holds. Claude Code reads the
+// variables before the setting (FORCE_PROMPT_CACHING_5M, then
+// CLAUDE_CODE_PROMPT_CACHE_TTL or CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL),
+// so with one set nothing is written. The pick is the user's own: a value
+// the card stashed is forgotten, so its Undo never puts an older one back
+// over it.
+func ClaudeCacheSet(home, knob, value string) error {
+	if knob != TuneCache && knob != TuneSubCache {
+		return fmt.Errorf("Claude Code has no prompt cache %q", knob)
+	}
+	if value != "" && value != "5m" && value != "1h" {
+		return fmt.Errorf("the cache is kept 5m or 1h, not %q", value)
+	}
+	p, err := tuneWhere(home, "claude", knob, "")
+	if err != nil {
+		return err
+	}
+	if cur, _ := TuneRead(home, "claude", knob, ""); cur.Locked != "" {
+		return fmt.Errorf("%s=%s is set and comes before the setting: take it out first", cur.Locked, cur.Value)
+	}
+	forget(tuneKey("claude", knob, ""))
+	if value == "" {
+		if _, ok := p.get(); !ok {
+			return nil
+		}
+		return edit.DelJSON(p.path, p.key)
+	}
+	return edit.SetJSON(p.path, edit.KV{Path: p.key, Value: value})
 }

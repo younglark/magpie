@@ -72,6 +72,9 @@ type callFile struct {
 	Claude      *claudeUsageState
 	ContentHash string
 	dirty       map[int]bool
+	// readSize is the size of the file being read (prepareCalls), for
+	// growCalls
+	readSize int64
 	// bigFrame: read from a frame of more than framePatches (loadCalls)
 	bigFrame bool
 	Size     int64
@@ -409,7 +412,26 @@ func prepareCalls(f file, old *callFile, owned bool) *callFile {
 	}
 	st.dirty = map[int]bool{}
 	st.Head, st.HeadSize, st.Path = hashHead(head), len(head), f.path
+	st.readSize = f.size
 	return st
+}
+
+// growCalls makes room in st.Calls, when it is full, for the calls the
+// rest of the file holds at the rate read so far: append grows a long
+// list by a quarter at a time, and a Claude session's calls were copied
+// into ~5 lists their size on the way (616 MB of a cold start's reading
+// on mote, ~13% of all it allocated). The room is at most twice the
+// calls so far, as append's own doubling of a short list.
+func growCalls(st *callFile) {
+	n := len(st.Calls)
+	if n < cap(st.Calls) || n < 256 || st.End <= 0 || st.readSize <= st.End {
+		return
+	}
+	// what the rest is likely to hold, and an eighth more
+	want := min(int(int64(n)*st.readSize/st.End)*9/8, 2*n)
+	if want > n+n/4+1 {
+		st.Calls = slices.Grow(st.Calls, want-n)
+	}
 }
 
 func (st *callFile) clone() *callFile {
@@ -759,23 +781,32 @@ func ccReplyHead(b []byte) bool {
 // read of a 21 GB history made 82 MB of those lines and 27 MB of copies
 // of their content, which nothing kept (#2278).
 func ccDecode(b []byte, l *ccCall) error {
+	_, err := ccDecodeLess(b, l)
+	return err
+}
+
+// ccDecodeLess is ccDecode into any v: json.Unmarshal(b, v) with the
+// message's content null, the content given as the bytes of b that hold
+// it (nil when b has none, and v was decoded from b whole). v keeps no
+// byte of the line decoded: its strings are copies.
+func ccDecodeLess(b []byte, v any) ([]byte, error) {
 	if len(b) == 0 {
-		return json.Unmarshal(b, l)
+		return nil, json.Unmarshal(b, v)
 	}
 	c := gjson.Get(unsafe.String(&b[0], len(b)), "message.content")
 	if !c.Exists() || c.Index <= 0 || c.Index+len(c.Raw) > len(b) {
-		return json.Unmarshal(b, l)
+		return nil, json.Unmarshal(b, v)
 	}
 	p := ccLines.Get().(*[]byte)
 	out := append((*p)[:0], b[:c.Index]...)
 	out = append(out, "null"...)
 	out = append(out, b[c.Index+len(c.Raw):]...)
-	err := json.Unmarshal(out, l) // l keeps no byte of out: its strings are copies
+	err := json.Unmarshal(out, v)
 	if cap(out) <= ccLineKept {
 		*p = out
 		ccLines.Put(p)
 	}
-	return err
+	return b[c.Index : c.Index+len(c.Raw) : c.Index+len(c.Raw)], err
 }
 
 // ccLines holds the buffers ccDecode makes its lines in; one grown past
@@ -958,6 +989,7 @@ func claudeCall(st *callFile, b []byte, l *ccCall) {
 	if c.Error == "" {
 		c.Compact, st.CompactMs = st.CompactMs, 0
 	}
+	growCalls(st)
 	st.Calls = append(st.Calls, c)
 }
 

@@ -142,6 +142,16 @@ type Provider struct {
 	// goes round already. See gateway.sink.
 	Sink bool `json:"sink,omitempty"`
 
+	// UseFirst puts its keys or accounts ahead of the other providers'
+	// where Smart weighs them together: a group of several providers'
+	// models (hzh_1119 on Discord: an OpenAI API key's monthly credit
+	// spent before the ChatGPT subscription serving the same models). One
+	// resting after a failure, out of credit or out of quota (a 429
+	// insufficient_quota) is passed over as ever, and one all but used up
+	// goes with the others that are. Off, the default, Smart goes as it
+	// always has (routes.Seat.Lead).
+	UseFirst bool `json:"useFirst,omitempty"`
+
 	// Affinity is how long a conversation stays with the key or account
 	// that answered it, so the vendor's prompt cache it filled is read
 	// again rather than lost (see Affinities): "" auto, "session",
@@ -348,6 +358,18 @@ type Provider struct {
 	// AdditionalToolsOff, `additional-tools=off`, sends a loaded tool in
 	// the top-level tools even where magpie's default would send the item.
 	AdditionalToolsOff bool `json:"additionalToolsOff,omitempty"`
+
+	// PassErrors, `errors=pass`, is the user's word that the client, not
+	// magpie, deals with what the provider's errors say (ne9ko9 on
+	// Discord): a request to it is asked once, its error goes to the
+	// agent as it came (its status, and its body as written where the
+	// agent's API is the provider's own, else in the agent's shape with
+	// the vendor's type, code and words), nothing about it is inferred
+	// (a prompt too long, a busy relay), it is not asked again in place
+	// or of a fallback or a group's next member, and none of its keys
+	// rests for it. Off, the default, magpie handles them. Only a provider
+	// of a key takes it (TakesPassErrors).
+	PassErrors bool `json:"passErrors,omitempty"`
 
 	// Patience is how many seconds more a request to this provider alone,
 	// not through a group, may be kept once it has failed in a way that
@@ -972,6 +994,7 @@ func accountSettings(a, pk Provider) Provider {
 	a.Proxy, a.AccountProxies, a.AccountModels, a.AccountModelsAll = pk.Proxy, pk.AccountProxies, pk.AccountModels, pk.AccountModelsAll
 	a.AccountCaps, a.AccountWindowCaps = pk.AccountCaps, pk.AccountWindowCaps
 	a.CapStop, a.CapCareful = pk.CapStop, pk.CapCareful
+	a.UseFirst = pk.UseFirst
 	a.AccountNames = pk.AccountNames
 	a.MaxConcurrency, a.PinUpstream = pk.MaxConcurrency, pk.PinUpstream
 	a.MaxAccounts = pk.MaxAccounts
