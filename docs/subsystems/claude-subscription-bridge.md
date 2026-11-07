@@ -181,19 +181,29 @@ talks to it as it talks to `-p`: stream-json in and out. The helper:
   base64 image is written to `image-N.<ext>` (0600) in a
   `magpie-claude-images-*` temp folder, and its path is pasted alone,
   which Claude Code reads into the message as `[Image #N]` (a path inside
-  other words stays words). Claude Code reads the file after the paste
-  returns, so the helper waits for `[Image #N]` with N past the last
-  before pasting the next piece; without that wait the second of two
-  images was lost. The transcript holds real image blocks, and Claude Code
-  notes each one's path to the model (`[Image: source: …]`). The folder
-  is removed once its message is sent (Claude Code has read the files
-  by then), and when the helper ends, on SIGINT, SIGTERM and SIGHUP too:
-  magpie's own handler (`endProbesOnSignal`) let go of the signals for
-  this command (`leaveSignals`), since it re-raised SIGTERM and killed the
-  helper before it could end Claude Code and remove its files. Windows
-  ends a run by killing its job, which no handler hears, so a helper
-  starting removes such folders, and the tap's, over an hour old
-  (`dropLeft`);
+  other words stays words). Each piece is pasted once the prompt shows
+  the one before (`send`). Claude Code reads an image's file after the
+  paste returns, so the helper waits for `[Image #N]` with N past the
+  paste before; without that wait the second of two images was lost.
+  Words with a line that ends naming an image file (`a.jpg` in an `ls`)
+  are tried as that file first (2.1.318 asks the clipboard for it, about
+  0.45s) and taken in after, and Claude Code keeps one mark of a paste
+  being taken in for every paste: an image pasted meanwhile cleared it,
+  and Enter sent the message without the words, which came in the next
+  prompt (#5548). So words are waited for too, until their last words
+  show or a `[Pasted text #N` with N past the paste before (`shown`):
+  images and pasted text are numbered together, and the prompt drawn
+  again shows the earlier ones (`TestShimWaitsForWordsNamingImages`,
+  `TestShimPastesImages`). The transcript holds real image blocks, and
+  Claude Code notes each one's path to the model (`[Image: source: …]`).
+  The folder is removed once its message is sent (Claude Code has read
+  the files by then), and when the helper ends, on SIGINT, SIGTERM and
+  SIGHUP too: magpie's own handler (`endProbesOnSignal`) let go of the
+  signals for this command (`leaveSignals`), since it re-raised SIGTERM
+  and killed the helper before it could end Claude Code and remove its
+  files. Windows ends a run by killing its job, which no handler hears,
+  so a helper starting removes such folders, and the tap's, over an hour
+  old (`dropLeft`);
 - tails `<CLAUDE_CONFIG_DIR>/projects/*/<session>.jsonl` and tells each
   row as `-p` would (`translator`): assistant messages whole, a tool's
   result, a `<synthetic>` API error as the turn's error result with its
@@ -404,7 +414,8 @@ a new Claude Code (one older than its session, or a client's own) can
 run to megabytes. A real 3MB paste showed `[Pasted text` after 35s, and
 a real 500KB one was answered with all of it in the transcript, so the
 helper waits for a paste a second per 64KB longer than `pasteWait`
-(`shownWait`) before its Enter. Until 11-01 words over 400KB were
+(`shownWait`) before the next piece or its Enter, and goes on when it
+still isn't shown. Until 11-01 words over 400KB were
 refused with a 502 (`big`), a bound no paste had been tried at.
 
 An image known only by its URL is downloaded first
@@ -669,7 +680,7 @@ conversation is written to the cache again and its images are sent again.
 By default, that message holds the history in blocks of `historyChunk`
 messages, and magpie's one mark (Claude Code keeps three of Anthropic's four) is on the
 last whole block, else on the caller's instructions: a later run started
-anew for the same conversation within the hour reads the history up to an
+anew for the same conversation while it is cached reads the history up to an
 earlier run's mark, found within Anthropic's 20-block lookback. A
 conversation with no history (no reply that calls no tool, as a sub-agent's
 loop of tool calls that Claude Code's AgentSummary asks a summary of) has
@@ -678,6 +689,20 @@ history is not chunked, and image blocks count toward the lookback.
 A turn that goes on in the run that had the last one is told only the
 messages since (`renderClaudeTurn`), and Anthropic reads the rest from the
 cache.
+
+A run keeps its prompt cache as long as the user picked for Claude Code's
+main conversation (`claudeRunTTL`): `FORCE_PROMPT_CACHING_5M`, then
+`CLAUDE_CODE_PROMPT_CACHE_TTL`, in magpie's environment or settings.json's
+`env`, then settings.json's `promptCacheTtl` (the Agents page's "Prompt
+cache · main conversation"), and an hour with none of them, as Claude Code
+writes it on a subscription within its limits. The run is given it as
+`CLAUDE_CODE_PROMPT_CACHE_TTL` (`cleanClaudeEnvTTL`; a saved account's
+Claude Code reads its own folder's settings, not the user's), and magpie's
+mark in the first message is as long (`Request.runMark`), since Anthropic
+refuses a 1h mark after a 5m one. A session a run goes on from keeps the
+lifetime it started with (`cachePrefix.ttl`; one saved before it was kept
+is an hour's). Until 11-07 every run was given 1h whatever the pick
+(linkaww). `TestClaudeRunKeepsTheUsersCacheTTL`.
 
 ## Client-placed cache marks (#1717)
 
