@@ -84,8 +84,16 @@ the full name, which is the client's own, when the cut name maps to
 nothing and isn't in `subscriptionRun.tools`: handed over cut, as
 `<server>__<tool>`, the client answered "No such tool available" and the
 model had to load it and call again (packinggoods, 11-02,
-`TestClaudeBridgeHandsOverAnUnloadedMagpieTool`). A deferred tool of
-another client MCP server (`mcp__linear__…`) is still not handed over.
+`TestClaudeBridgeHandsOverAnUnloadedMagpieTool`). Only a cut name of the
+router's form, `<server>__<tool>` (`magpieServerTool`), keeps the prefix.
+A deferred built-in (`WebFetch`, `WebSearch`, `CronCreate`: no `__` in
+the name, no prefix on the client) called as `mcp__magpie__WebFetch` is
+handed over as `WebFetch`; handed over whole, the client answered "No
+such tool available: mcp__magpie__WebFetch" (steven_4422, 11-08). One of
+another client MCP server called as `mcp__magpie__mcp__linear__…` is
+handed over as `mcp__linear__…`. A deferred tool the run's model calls
+by the bare client name (`WebFetch`, `mcp__linear__…`) is the run's
+Claude Code's to answer and is not handed over.
 
 A turn with `tool_choice` none is offered every tool the client sent, as
 any other turn is (bbfatx on X). Anthropic caches a prompt as tools, then
@@ -194,7 +202,15 @@ talks to it as it talks to `-p`: stream-json in and out. The helper:
   show or a `[Pasted text #N` with N past the paste before (`shown`):
   images and pasted text are numbered together, and the prompt drawn
   again shows the earlier ones (`TestShimWaitsForWordsNamingImages`,
-  `TestShimPastesImages`). The transcript holds real image blocks, and
+  `TestShimPastesImages`). Both are looked for in what was drawn since
+  the paste and at the end of the prompt as the screen shows it, the rows
+  between its last two rules (`prompt`, `imageTaken`, `textTaken`): a
+  prompt grown past a row is drawn again only where it changed, so the
+  drawing after a paste can hold one digit of its mark. With nineteen
+  images between words, 2.1.319 drew "3" of `[Image #33]`, the helper
+  waited out `pasteWait` and ended with exit status 1, a 502 to the
+  client (#5654, `TestShimSeesPastesOnAPromptDrawnInPart`, a real run's
+  bytes). The transcript holds real image blocks, and
   Claude Code notes each one's path to the model (`[Image: source: …]`).
   The folder is removed once its message is sent (Claude Code has read
   the files by then), and when the helper ends, on SIGINT, SIGTERM and

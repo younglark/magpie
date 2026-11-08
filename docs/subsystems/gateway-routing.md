@@ -573,10 +573,20 @@ looked at again on each of magpie's writes and on each change another
 process makes to its files (`filememo.Written`), each look holding the
 catalog for itself, so the wait is exempt from `holdCatalog`. It is the
 list's own route, so the key, `lanGuard`, `corsGuard` and a key's models
-judge it exactly as the list. A list asked without the header is answered
-as before, with no ETag. `modelsOnceChanged` in
+judge it exactly as the list. A wait's answer, 200 or 304, says in
+`X-Magpie-List-Wait` how many seconds it held. A list asked without the
+header is answered the same bytes with the same `ETag` (`private,
+no-cache`), and 304 with no body, at once, when `If-None-Match` names it
+(weakly, in a list, or `*`; clyzhicore on Discord), so a client polling
+the list pays a few bytes while it is unchanged; a refused list (400) is
+untagged. The follower (`waitRemoteList` in
+[`remote_follow.go`](../../internal/provider/remote_follow.go)) takes a 304
+that came sooner than `followQuick` and doesn't say it waited as a magpie
+that doesn't wait (a proxy dropped the header), and leaves it to the
+schedule rather than asking it each second. `modelsOnceChanged` and
+`listModelsTagged` in
 [`models_wait.go`](../../internal/gateway/models_wait.go), and
-`TestModelsWaitGuardedAsTheList` in
+`TestModelsWaitGuardedAsTheList` and `TestModelsListConditional` in
 [`models_wait_test.go`](../../internal/gateway/models_wait_test.go).
 
 A read-only gateway key (`access.Key.ReadOnly`, set by `add-key` or
@@ -718,6 +728,35 @@ prefers a whole-key limit, and a remote's key card leaves such limits out
 `TestScoped*` in `internal/budget`. A local magpie
 asks it with each of its remote-magpie keys for that key's card on its
 Usage page (#1547), a window per limit's cap.
+
+A key's `MaxConcurrency` (young02036 on Discord; `access.Key`, set by the
+`concurrency-key` action, the key row's "at once" badge or `magpie
+gateway-key concurrency <id> <n>|off`, 0 to 1000, 0 or unset for no limit)
+is how many of its requests are in flight at once. One more waits in the
+key's own lane (`keyLanes`, apart from the providers' `lanes`, by
+`"key:"+id`), in order and with no bound, shows as `slot` in Active and the
+trace, and has its wait in its try's `Queued`; one whose agent goes away
+while it waits leaves the queue and sends nothing. A key issued under
+another (`access.Identity.Issuer`) waits for a slot of its own, then one of
+its issuer's. `keySlots` sits in `Handler` after `withCaller` and `keyLimited`, so the
+LAN, a remote magpie and each turn of a Responses socket (sent through the
+handler again) all pass it; `keySlotRoutes` names the routes it holds, and
+`TestKeySlotEveryRoute` fails on a route judged neither held nor free
+(`keySlotFree`: GETs, count_tokens, MCP, magpie's own). The routes that go
+through `serve`'s tries (chat, Responses, Messages, Ollama, Gemini, the Codex
+backend) take the slot in the try, after `keepQueued`, so a waiting stream
+gets its 200 and keepalive comments as it does waiting for a provider's
+slot; the rest (embeddings, images, audio, videos, rerank, decisions, System
+One, native) take it before their handler runs. `forward` and
+`codexUpstreamOn` take it too, so no path of a held route reaches a vendor
+unheld. The slot is the request's until its handler returns, a stream's to
+its end; a later take within the same request takes nothing more (`keyHold`).
+`/v1/magpie/concurrency` reports the keys' lanes under `keys` and counts
+their waiters in `waiting`; `/v1/magpie/limit` says the key's
+`maxConcurrency` and `issuerMaxConcurrency`. Tests: `TestKeyConcurrency*`
+and `TestKeySlotEveryRoute` in `key_slots_test.go`, `TestKeyConcurrency` in
+`internal/access`, `TestGatewayKeyConcurrencyCLI`,
+`gateway-key-concurrency.test.cjs`.
 
 `GET /me` is the key page: a gateway key's holder opens it in a browser at
 the address they reach the gateway at, types their key, and sees that key's
