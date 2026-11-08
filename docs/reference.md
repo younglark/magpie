@@ -1052,6 +1052,19 @@ only `model` changed, to an OpenAI API key, to Azure OpenAI (at
 magpie. Any other provider is refused with a 400 that says so. Only input
 tokens are counted, cached ones apart.
 
+A decision model that answers System One instead (Qwen's
+`decision-model-preview`, Ark's, a Jev, a Clef, a plugin's, or a decision
+group) is asked there: a predicate goes as a `noul` question, a choice's
+values as its criteria, a score's levels as its criteria least first, and
+`input` as the state (a string as it is, messages as
+`{"messages":[{role, content}]}`, JSON parts as their JSON). The answer comes
+back in the Decisions shape, in the questions' order, with the input and
+output tokens. What System One has no counterpart for (an image where the
+model isn't a Clef, a tool call or its output, another field such as
+`reasoning`) is refused with a 400 that names it, and nothing is sent. The
+other way, `/v1/systemone` with a model only the Decisions API serves
+(`openai/gpt-6-luna`) is asked there and answered as System One answers.
+
 ```sh
 curl localhost:3425/v1/decisions -H "Authorization: Bearer $MAGPIE_KEY" \
   -d '{"model":"gpt-6-luna","input":"The parcel arrived torn open.","questions":[{"type":"predicate","name":"damaged","instructions":"Was the parcel damaged?"}]}'
@@ -2020,7 +2033,11 @@ each of these groups ordered by the share used.
   when the month holds less than its weeks add up to (Factory's, by
   one user's readings, about two weeks' worth), what a week leaves isn't
   lost at the week's reset, as the
-  month still has it to spend later. Its row
+  month still has it to spend later. Once the weeks still to come before
+  the month renews can't let through what the month has left (a
+  Volcengine Agent Plan: 20,000 a month, 7,000 a week), what a week
+  leaves is lost at its reset after all, and the account goes by its
+  week. Its row
   on the Routing page says the fullest window's share with when that
   window renews: "32% used · renews in 3 days" is the week's.
 - **In order**: the accounts in their order. The first takes every request
@@ -2711,6 +2728,22 @@ always named (400 without `user`). A second ask for the same account
 while one is out is answered 409. Another magpie's Codex card uses this,
 and so can an app reading `/v1/magpie/quotas/cards`, such as a DSH
 provider plugin, with a key of full access.
+
+When magpie updates, every Remote magpie it uses that runs an older
+release is asked to update too: `POST /v1/magpie/update?version=<v>`,
+sent with the provider's key a little after start and every hour, at most
+once in six hours for a version. Nothing is set up for it. The remote
+updates as its own automatic update would (the app restarts into the new
+version once nothing is in flight; `magpie serve` puts it in where it runs
+from and restarts once idle), or answers why it doesn't: `current`,
+`off` (automatic updates or downloads are off there), or `unsupported`
+with `why` `container`, `package` (with `manager` and `command`),
+`not-writable` or `source`. The provider's row says what came of it. With
+automatic updates off here, or a build that isn't a release, nothing is
+asked. Like the Codex reset, it takes an enabled gateway key with full
+access, from this computer too, and never answers a browser page: a
+read-only key is refused 403 `gateway_key_read_only` and a held key 403
+`gateway_key_held`.
 
 An app of your own can read the Usage page's numbers too.
 `GET /v1/magpie/usage?period=<today|week|month|all>` is the page's summary,

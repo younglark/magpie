@@ -1167,7 +1167,7 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 		prefix = from.cachePrefix
 		prompt = renderClaudeTurn(req.Messages[len(req.Messages)-len(from.since):], req.Tools)
 	} else {
-		req.cacheTTL = claudeRunTTL(os.Environ())
+		req.cacheTTL = runTTLFor(req, os.Environ())
 		prompt, err = renderClaudePrompt(req)
 		if err != nil {
 			cleanup()
@@ -2471,6 +2471,10 @@ type savedSession struct {
 	// run that resumes it is given them so again
 	appended bool
 
+	// cachePrefix is the marks, and the cache lifetime, of the run whose
+	// session this is: the run that goes on from it keeps both. Every
+	// savedSession is given its run's, a branch's too: one without it ran
+	// an hour's cache under a 5m pick (linkaww)
 	cachePrefix cachePrefix
 
 	mu   sync.Mutex
@@ -2698,7 +2702,7 @@ func (b *subscriptionBridge) branch(req *Request, owner string) *savedSession {
 				at, seq, said = l.uuid, l.seq, l.told
 			}
 		}
-		sid, sessions := run.sessionID, slices.Clone(run.sessions)
+		sid, sessions, prefix := run.sessionID, slices.Clone(run.sessions), run.cachePrefix
 		usable := !run.closed && !run.rewound && run.lean == req.leanPrompt && !run.clientMarks && (run.tui || !wantTUI(req))
 		run.mu.Unlock()
 		if at == "" {
@@ -2710,7 +2714,7 @@ func (b *subscriptionBridge) branch(req *Request, owner string) *savedSession {
 		if !usable || sid == "" || len(sessions) == 0 || said != told {
 			return nil
 		}
-		return &savedSession{session: sid, sessions: sessions, owner: owner, at: time.Now(), since: msgs[i:], cut: at, tui: run.tui, appended: run.appended, gone: true}
+		return &savedSession{session: sid, sessions: sessions, owner: owner, at: time.Now(), since: msgs[i:], cut: at, tui: run.tui, appended: run.appended, cachePrefix: prefix, gone: true}
 	}
 	return nil
 }
@@ -2756,7 +2760,7 @@ func (b *subscriptionBridge) retryBranch(req *Request, owner string) *savedSessi
 		// whose reply the client has is no retry of it
 		busy := !run.closed && run.rewinding == nil && !run.rewound && run.lean == req.leanPrompt &&
 			!run.clientMarks && (run.tui || !wantTUI(req)) && run.told == want
-		sid, sessions, backLine, backMsg, appended, tui := run.sessionID, slices.Clone(run.sessions), run.backLine, run.backMsg, run.appended, run.tui
+		sid, sessions, backLine, backMsg, appended, tui, prefix := run.sessionID, slices.Clone(run.sessions), run.backLine, run.backMsg, run.appended, run.tui, run.cachePrefix
 		started := run.started
 		run.mu.Unlock()
 		if !busy || sid == "" || backLine == "" && backMsg == "" || len(sessions) == 0 {
@@ -2773,7 +2777,7 @@ func (b *subscriptionBridge) retryBranch(req *Request, owner string) *savedSessi
 		if found != nil {
 			found.discard() // a newer run's copy is taken: the older one's goes
 		}
-		found, at = &savedSession{session: cut, sessions: sessions, owner: owner, at: time.Now(), since: since, tui: tui, appended: appended}, started
+		found, at = &savedSession{session: cut, sessions: sessions, owner: owner, at: time.Now(), since: since, tui: tui, appended: appended, cachePrefix: prefix}, started
 	}
 	if found == nil {
 		return nil
@@ -2813,7 +2817,7 @@ func (r *subscriptionRun) branchAt(at, msg, owner string, since []Message) *save
 		return nil
 	}
 	log.Printf("claude: the conversation's next turn goes on in a branch of its interactive run's session, cut before the side question it answered since")
-	return &savedSession{session: cut, sessions: sessions, owner: owner, at: time.Now(), since: since, tui: true, appended: r.appended}
+	return &savedSession{session: cut, sessions: sessions, owner: owner, at: time.Now(), since: since, tui: true, appended: r.appended, cachePrefix: r.cachePrefix}
 }
 
 // cutWait is how long cutSession waits for the line it cuts after to be
@@ -3499,6 +3503,22 @@ func inClaudeDir(env []string, configDir string) []string {
 	return out
 }
 
+func forced(v string) bool { return v != "" && v != "0" && v != "false" }
+
+// claudeForced5m: FORCE_PROMPT_CACHING_5M is set, in env or in Claude
+// Code's settings.json's env, as claudeRunTTL reads it.
+func claudeForced5m(env []string) bool {
+	if v, _ := edit.GetJSON(filepath.Join(claudeConfigDir(), "settings.json"), "env.FORCE_PROMPT_CACHING_5M"); v != "" {
+		return forced(v)
+	}
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, "FORCE_PROMPT_CACHING_5M="); ok {
+			return forced(v)
+		}
+	}
+	return false
+}
+
 // claudeRunTTL is how long the prompt cache of a bridge's Claude Code run
 // is kept, "5m" or "1h": the user's own pick for Claude Code's main
 // conversation, as Claude Code resolves it (FORCE_PROMPT_CACHING_5M, then
@@ -3509,19 +3529,27 @@ func inClaudeDir(env []string, configDir string) []string {
 // account's Claude Code reads the settings of the account's folder, not
 // the user's (linkaww: 5m picked, every relayed write an hour's).
 func claudeRunTTL(env []string) string {
+	if ttl := claudePickedTTL(env); ttl != "" {
+		return ttl
+	}
+	return "1h"
+}
+
+// claudePickedTTL is the user's pick claudeRunTTL reads, "" for none.
+func claudePickedTTL(env []string) string {
 	settingsPath := filepath.Join(claudeConfigDir(), "settings.json")
 	envOf := func(k string) string {
 		if v, _ := edit.GetJSON(settingsPath, "env."+k); v != "" {
 			return v
 		}
 		for _, e := range env {
-			if v, ok := strings.CutPrefix(e, k+"="); ok {
+			if v, found := strings.CutPrefix(e, k+"="); found {
 				return v
 			}
 		}
 		return ""
 	}
-	if v := envOf("FORCE_PROMPT_CACHING_5M"); v != "" && v != "0" && v != "false" {
+	if forced(envOf("FORCE_PROMPT_CACHING_5M")) {
 		return "5m"
 	}
 	if v := envOf("CLAUDE_CODE_PROMPT_CACHE_TTL"); v == "5m" || v == "1h" {
@@ -3530,7 +3558,53 @@ func claudeRunTTL(env []string) string {
 	if v, _ := edit.GetJSON(settingsPath, "promptCacheTtl"); v == "5m" || v == "1h" {
 		return v
 	}
-	return "1h"
+	return ""
+}
+
+// claudeSettingsKnown: Claude Code's settings.json here is missing or
+// reads and parses, so claudePickedTTL is the pick; a file that can't be
+// read says nothing of one.
+func claudeSettingsKnown() bool {
+	b, err := edit.Read(filepath.Join(claudeConfigDir(), "settings.json"))
+	return err == nil && (len(bytes.TrimSpace(b)) == 0 || edit.ValidJSONC(b))
+}
+
+// runTTLFor is how long a bridge run started for req keeps its prompt
+// cache:
+//   - five minutes when FORCE_PROMPT_CACHING_5M says so, as Claude Code
+//     itself would;
+//   - an hour when the request's marks name it: its client picked it;
+//   - the pick of the user of the computer the request's Claude Code runs
+//     on (pickedTTL: this one's, or what the magpie it came through
+//     named), and with none picked this computer's or an hour, as Claude
+//     Code keeps it on a subscription. Claude Code marks five minutes with
+//     no ttl, picked or as its default off a subscription, so its marks
+//     can't say which (linkaww: a 5m pick, relayed side calls an hour's;
+//     nothing picked, every relayed write five minutes');
+//   - else what the marks ask for, five minutes for a mark with no ttl (a
+//     remote magpie's relay was given the hour of its own setting, never
+//     the Mac's, Linka);
+//   - else, for a request with no marks, this computer's pick or an hour
+//     (claudeRunTTL).
+func runTTLFor(req *Request, env []string) string {
+	if claudeForced5m(env) {
+		return "5m"
+	}
+	if req != nil {
+		if req.askedTTL == "1h" {
+			return "1h"
+		}
+		switch req.pickedTTL {
+		case "5m", "1h":
+			return req.pickedTTL
+		case "default":
+			return claudeRunTTL(env)
+		}
+		if req.askedTTL != "" {
+			return req.askedTTL
+		}
+	}
+	return claudeRunTTL(env)
 }
 
 func cleanClaudeEnv(env []string) []string {
@@ -6488,6 +6562,9 @@ func (s *Server) serveSubscriptionAs(w http.ResponseWriter, r *http.Request, fro
 	// the tools of a caller on another computer run there, not where
 	// Claude Code runs (envUnknownNote)
 	req.remoteCaller = !local(r)
+	// how long the user of the computer the request's Claude Code runs on
+	// keeps its cache, which its marks don't say (runTTLFor)
+	req.pickedTTL = claudeTTLOf(callerOf(r))
 	if req.Format != nil && req.Format.schema() == nil {
 		// --json-schema takes a schema only: any JSON object is asked for
 		// in words

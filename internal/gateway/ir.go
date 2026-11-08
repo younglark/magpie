@@ -179,6 +179,13 @@ type Request struct {
 	// keeps its prompt cache (claudeRunTTL), which the marks magpie adds
 	// follow (runMark); "" is an hour
 	cacheTTL string
+	// askedTTL is the longest TTL the request's own cache marks ask for
+	// (askedCacheTTL), "" for one that marks nothing or came in another API
+	askedTTL string
+	// pickedTTL is the cache lifetime the user of the computer the
+	// request's Claude Code runs on picked, "default" for none, "" when
+	// unknown (claudeTTLOf)
+	pickedTTL string
 	// leanPrompt has the Claude bridge give the caller's instructions as
 	// the run's system prompt, in place of Claude Code's (ClaudeLeanPrompt).
 	leanPrompt bool

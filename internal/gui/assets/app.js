@@ -4229,6 +4229,8 @@ const UNROLL = { ms: 340, ease: ".23,1,.32,1" };
 const ROW_OPEN = { ms: 320, ease: ".25,.3,.1,1" };
 const ROW_CLOSE = { ms: 260, ease: ".25,.3,.1,1" };
 const ROLLUP = { ms: 260, ease: ".23,1,.32,1" };
+// a tab picked: --ease-out, as .nav-hl
+const TAB_GLIDE = { ms: 240, ease: ".23,1,.32,1" };
 
 // tintPanel hands the colour the panel's page shows to the system, to paint
 // under the page, which then leaves its own background clear: the page is
@@ -4292,9 +4294,8 @@ if (mode === "window") {
 
 // extra is room about to be taken (or given back), e.g. by agents unrolling;
 // glide moves the panel's edge there over time instead of at once.
-// The panel is as tall as its tallest tab, not the one showing, so it keeps
-// its height as the tabs change and a shorter tab leaves room below (#124).
-// Margins count; tabs lay out at once (hiding one ends its motion).
+// The panel is as tall as the tab showing, shrinking too (refeccd on
+// Discord); a tab picked glides there. Margins count; tabs lay out at once.
 function fit(extra = 0, glide) {
   if (mode !== "panel") return;
   const body = document.body, v = $("#view-agents"), tab = body.dataset.ptab, f = parseFloat, vs = getComputedStyle(v);
@@ -4305,7 +4306,7 @@ function fit(extra = 0, glide) {
     const o = { agentsLead: "agents", agents: "agents", panelQuota: "usage", panelUsage: "stats", panelRouting: "routing" }[c.id];
     for (const t in n) if (!o || o == t) n[t] += px;
   }
-  const h = Math.ceil(body.clientHeight - v.offsetHeight + f(vs.paddingTop) + f(vs.paddingBottom) + Math.max(...Object.values(n)));
+  const h = Math.ceil(body.clientHeight - v.offsetHeight + f(vs.paddingTop) + f(vs.paddingBottom) + n[n[tab] === undefined ? "agents" : tab]);
   if (tab) body.dataset.ptab = tab;
   if (h === fit.last) return;
   fit.last = h;
@@ -6174,10 +6175,7 @@ function renderProvidersLoading() {
   $("#excluded").replaceChildren();
 }
 
-// Providers switched off are kept apart, below the ones on, under a
-// "Turned off (N)" fold that starts folded: among the rest they took the
-// room of the ones in use (01huadalang on Discord). The fold is
-// remembered, per viewer.
+// Providers switched off fold below the ones on (01huadalang on Discord).
 let offFolded = true;
 try { offFolded = localStorage.getItem("magpie.offProvidersOpen") !== "1"; } catch {}
 $("#foldOff").prepend(svg(CHEV_R, 11, 1.6));
@@ -6230,7 +6228,9 @@ function renderProviders(quiet) {
     // accounts list says of each, not a green "signed in"
     const inUse = (p.account?.logins || []).filter((l) => l.on || l.active);
     const lapsed = inUse.length > 0 && inUse.every((l) => l.lapsed);
-    who.append(name, el("div", "sub", (p.account ? t(lapsed ? "{user} is signed out" : "signed in as {user}", { user: p.account.user }) : p.host) + " · " + models));
+    const sub = el("div", "sub", (p.account ? t(lapsed ? "{user} is signed out" : "signed in as {user}", { user: p.account.user }) : p.host) + " · " + models), ru = p.remoteUpdate;
+    if (ru) sub.append(" · ", Object.assign(el("span", "rup", t(ru.say, ru)), { title: t(ru.tip, ru) }));
+    who.append(name, sub);
     const using = p.agents.filter((a) => a.current);
     const uses = el("div", "uses");
     for (const a of using) {
@@ -6301,12 +6301,8 @@ function renderProviders(quiet) {
   if (dialog) openModal(dialog, quiet); else closeModal();
 }
 
-// providerHandle is an on row's logo, which is also its handle (#499):
-// drag it to move the row among the ones on, Alt+↑/↓ moves it from the
-// keyboard, and a click opens the row as a click anywhere on it does. The
-// grip that says so is drawn in the row's margin on hover (app.css). The
-// order is the one providers are tried in too: a model several serve goes
-// to the higher one first.
+// providerHandle is an on row's logo and its handle (#499): drag, or
+// Alt+↑/↓, sets the order providers are tried in; a click opens the row.
 let providerArranging = false;
 function providerHandle(p, row) {
   const b = el("button", "ag-handle pv-handle");
@@ -15800,6 +15796,7 @@ function loadQuotas(asked, again) {
     });
   p.asked = asked;
   quotasLoading = p;
+  if (mode !== "panel") globalThis.quotaReading?.(p);
   return p;
 }
 
@@ -15913,10 +15910,9 @@ function renderQuotas(lazy) {
   const subscriptions = $("#subscriptionUsage");
   const restoreFlash = keepQuotaFlash(subscriptions);
   const restoreRefresh = keepQuotaRefresh(subscriptions);
+  const was = [...subscriptions.children];
   subscriptions.replaceChildren();
-  // the allowances' own heading, apart from the period's cost: used or
-  // left turns their meters, and is only there when some card has one (a
-  // balance is only ever what is left)
+  // the allowances' heading: used or left, shown with a card that has one
   $("#quotaHead").hidden = !!quotas && !quotas.length;
   const pick = $("#quotaMode");
   pick.hidden = !quotas?.some((q) => !q.error && q.windows?.length);
@@ -15949,6 +15945,7 @@ function renderQuotas(lazy) {
   subscriptions.hidden = !shown.length;
   // an agent with several accounts is one card, a section per account
   const groups = [];
+  keepIcons(...was);
   for (const sub of byUsageOrder(keyCards(shown))) {
     const g = sub.user && groups.find((x) => x[0].user && x[0].provider === sub.provider);
     if (g) g.push(sub); else groups.push([sub]);
@@ -16071,6 +16068,7 @@ function renderQuotas(lazy) {
     if (accts && (folded.size || usageAcctsAll.has(first.provider))) card.append(acctsMore(first.provider, folded.size));
     subscriptions.append(card);
   }
+  keptIcons = null;
   markUpstream();
   packUsageNow(subscriptions);
   restoreFlash();
@@ -17086,7 +17084,7 @@ function setPanelTab(tab) {
   // the tab remembered is drawn as the page loads, before what the tab is drawn with,
   // further down, is set: a microtask later, when all of it is
   queueMicrotask(panelUseShown);
-  fit();
+  fit(0, TAB_GLIDE);
 }
 // Scroll to a requested card, or resume its highlight after a redraw.
 function flashCard(card, target = card, elapsed = 0) {
@@ -20088,8 +20086,11 @@ function renderSettings() {
     const cmd = "curl -fsS -m 1 -H 'Authorization: Bearer <gateway key>' --data-binary @- " + gw + "/v1/magpie/statusline || true";
     row(t("Status line on another computer"), t("statusLine's command in Claude Code's settings.json there; a read-only gateway key is enough"), cmd, copyBtn(cmd, t("Command"))).id = "statuslineRemoteRow";
   }
-  // MAGPIE_PUBLIC_URL, where other machines reach it (#1551)
-  if (s.publicURL && gw !== s.publicURL) row(t("Public address"), t("MAGPIE_PUBLIC_URL: where other computers reach the gateway, with a gateway key"), s.publicURL, copyBtn(s.publicURL, t("Public address"))).id = "publicURLRow";
+  // MAGPIE_PUBLIC_URL (#1551), named as the Gateway page names it
+  if (s.publicURL && gw !== s.publicURL) {
+    const who = self.pubWho?.(s) || t("Public address");
+    row(who, t("MAGPIE_PUBLIC_URL: where other computers reach the gateway, with a gateway key"), s.publicURL, copyBtn(s.publicURL, who)).id = "publicURLRow";
+  }
   const site = el("button", "text", t("Open"));
   site.onclick = () => api("open", { url: "https://usemagpie.ai" }).catch(() => {});
   row(t("Website"), t("downloads, docs and what's new"), "usemagpie.ai", site);
@@ -20612,12 +20613,9 @@ function renderTrayUsage(s, keep) {
     pill.classList.remove("busy");
     paint();
     if (!pill.isConnected) return;
-    // the Usage page's cards (keyCards): a key's plan and its balance are
-    // one, not two rows of one name ticked together (#1658, MizuIro-H). A
-    // balance left a card of its own (a stale stand-in) whose id another
-    // row has already is left out: the menu bar shows the first card of an
-    // id, so its row could only tick the other.
-    const cards = keyCards((quotas || []).filter((q) => !q.error && (q.windows?.length || q.balance)))
+    // the Usage page's cards (keyCards, #1658), one row an id; not one
+    // whose windows are all text, with no figure to draw (LuckymanJC)
+    const cards = keyCards((quotas || []).filter((q) => !q.error && (q.windows?.some((w) => !w.text) || q.balance)))
       .filter((q, i, all) => all.findIndex((c) => trayCardID(c) === trayCardID(q)) === i);
     const opts = [{ v: "", name: "Off", note: "" }];
     for (const q of cards) {
@@ -20630,9 +20628,11 @@ function renderTrayUsage(s, keep) {
     // magpie's own count of every agent's requests, as the Usage page's
     // Overview has it: tokens over cost (#1984)
     for (const [v, name] of TRAY_TOTALS) opts.push({ v, name, note: "Every agent's, as the Usage page counts them" });
-    // one ticked that isn't there now (signed out, or not answering) stays
-    // to be unticked
-    for (const id of ids) if (!opts.some((o) => o.v === id)) opts.push({ v: id, name: id.split("|")[0], note: id.endsWith(IN_USE) ? "Account in use" : id.split("|")[1] || "" });
+    // one ticked that isn't there now stays to be unticked
+    for (const id of ids) if (!opts.some((o) => o.v === id)) {
+      const q = (quotas || []).find((q) => trayCardID(q) === id || q.provider + IN_USE === id);
+      opts.push({ v: id, name: q?.name || id.split("|")[0], note: id.endsWith(IN_USE) ? "Account in use" : id.split("|")[1] || "" });
+    }
     if (!cards.length) opts.push({ v: "\x00", name: "No subscriptions yet", note: "Sign in to one, or add a plan's key, and it shows on the Usage page" });
     openProtoMenu(pill, opts, ids, (trayUsages) => savePrefs({ ...keep, trayUsages }), "Shown beside the icon");
   };

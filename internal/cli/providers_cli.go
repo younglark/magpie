@@ -98,6 +98,10 @@ const providerUsage = `usage:
                                           how much an API key may spend, in USD as the Usage page prices its calls,
                                           a day (the default), a month or in all from now: at it, routing takes the
                                           key for used up and goes on to the other keys and the fallbacks
+  magpie provider key-balance <id> [key [usd|¥cny|off] [--refill monthly[:day]|weekly[:mon…sun]|off]]
+                                          the balance on an API key whose vendor tells none, typed from its own page
+                                          in USD or in yuan (¥100): the Usage page shows it less what magpie prices the
+                                          key's calls at since; with --refill it is whole again each month or week
   magpie provider account-weight <id> [account [n|default]]
                                           a subscription account's share of the requests with routing=weight:
                                           one weighing 3 takes three for each one weighing 1 takes (default 1)
@@ -642,6 +646,8 @@ func providerCmd(args []string) error {
 		return poolCmd(rest)
 	case "account-concurrency", "account-limit":
 		return accountConcurrencyCmd(rest)
+	case "key-balance", "key-balances":
+		return keyBalanceCmd(rest)
 	case "spend-cap", "spend-caps":
 		return spendCapCmd(rest)
 	case "account-weight", "account-weights":
@@ -1501,6 +1507,10 @@ func serve() error {
 		gateway.SetRestarter(follow.answer)
 		go follow.run(ctx)
 	}
+	// another magpie using this one updated (serve_update.go), and this
+	// one's own Remote magpies follow it
+	gateway.SetUpdater(serveUpdateAsked(follow))
+	go provider.KeepRemotesUpdated(ctx, version)
 	err := s.ListenAndServe(ctx)
 	if exe := follow.restartTo(); exe != "" {
 		// the plugin hosts end, waited for, first, as magpie web's
