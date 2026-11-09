@@ -214,32 +214,34 @@ const All = 5000
 // state is what one file's parse has come to, enough to read on from Off.
 type state struct {
 	// the agent whose file it is, for its parseVersions
-	Agent         string            `json:"agent,omitempty"`
-	Codex         *codexUsageState  `json:"-"`
-	codexPath     string            // the rollout read, for its fork's parent
-	Claude        *claudeUsageState `json:"claude,omitempty"`
-	Head          string            `json:"head,omitempty"`
-	HeadSize      int               `json:"head_size,omitempty"`
-	ContentHash   string            `json:"content_hash,omitempty"`
-	Size          int64             `json:"size"`
-	Mod           int64             `json:"mod"` // unix nanoseconds
-	Off           int64             `json:"off"` // after the last whole line read
-	ID            string            `json:"id,omitempty"`
-	CodexIdentity *CodexIdentity    `json:"codex_identity,omitempty"`
-	Cwd           string            `json:"cwd,omitempty"`
-	Title         string            `json:"title,omitempty"`
-	Start         time.Time         `json:"start"`
-	Last          time.Time         `json:"last"`
-	Models        named[Tokens]     `json:"models,omitempty"`
+	Agent     string            `json:"agent,omitempty"`
+	Codex     *codexUsageState  `json:"-"`
+	codexPath string            // the rollout read, for its fork's parent
+	Claude    *claudeUsageState `json:"claude,omitempty"`
+	Head      string            `json:"head,omitempty"`
+	// int32 beside CdRead: the head is headLen bytes at most, and the 8 bytes
+	// it saves take a state from the 448-byte size class to 416 (#2278)
+	HeadSize int32 `json:"head_size,omitempty"`
+	// Claude Code: parsed by a magpie that reads /cd's relocated lines
+	// (ccRelocated), so Cwd is the folder the session was last moved to
+	CdRead        bool           `json:"cd_read,omitempty"`
+	ContentHash   string         `json:"content_hash,omitempty"`
+	Size          int64          `json:"size"`
+	Mod           int64          `json:"mod"` // unix nanoseconds
+	Off           int64          `json:"off"` // after the last whole line read
+	ID            string         `json:"id,omitempty"`
+	CodexIdentity *CodexIdentity `json:"codex_identity,omitempty"`
+	Cwd           string         `json:"cwd,omitempty"`
+	Title         string         `json:"title,omitempty"`
+	Start         time.Time      `json:"start"`
+	Last          time.Time      `json:"last"`
+	Models        named[Tokens]  `json:"models,omitempty"`
 	// Days is Models again, split by the local date each message was
 	// written on: a session that runs past midnight counts on both days.
 	Days named[*day] `json:"days,omitempty"`
 	// Claude Code: the entrypoint its first line naming one says, which
 	// tells a session Claude Desktop's Code tab ran (desktopEntrypoint)
 	Entry string `json:"entry,omitempty"`
-	// Claude Code: parsed by a magpie that reads /cd's relocated lines
-	// (ccRelocated), so Cwd is the folder the session was last moved to
-	CdRead bool `json:"cd_read,omitempty"`
 	// Claude Code: the message last counted, whose later lines repeat it,
 	// and the day it was counted on
 	Msg      string `json:"msg,omitempty"`
@@ -363,8 +365,8 @@ type day struct {
 	// it runs while its session's own file goes on.
 	Active int64 `json:"a,omitempty"`
 	// Hours is Active again, by the local hour of the day it was put on
-	// (24 of them, or none)
-	Hours []int64 `json:"h,omitempty"`
+	// (only the hours that have some, or none; 24 numbers in the cache)
+	Hours hours `json:"h,omitempty"`
 	// Prompts are the messages typed in the session's own file, Replies
 	// the agent's messages back (Claude Code's, Codex's, Pi's and omp's)
 	Prompts int `json:"u,omitempty"`
@@ -469,10 +471,7 @@ func (s *state) saw(t time.Time, main bool) {
 		if gap := t.Sub(s.Last); main && !s.Last.IsZero() && gap < idleGap {
 			d := s.day(dateOf(t))
 			d.Active += gap.Milliseconds()
-			if d.Hours == nil {
-				d.Hours = make([]int64, 24)
-			}
-			d.Hours[t.In(time.Local).Hour()] += gap.Milliseconds()
+			d.Hours.add(t.In(time.Local).Hour(), gap.Milliseconds())
 		}
 		s.Last = t
 	}
@@ -505,9 +504,7 @@ func (s *state) clone() *state {
 	for i, e := range c.Days {
 		v := e.v
 		d := &day{Active: v.Active, Models: slices.Clone(v.Models), Prompts: v.Prompts, Replies: v.Replies}
-		if v.Hours != nil {
-			d.Hours = append([]int64(nil), v.Hours...)
-		}
+		d.Hours = slices.Clone(v.Hours)
 		d.Tools, d.Skills = slices.Clone(v.Tools), slices.Clone(v.Skills)
 		c.Days[i].v = d
 	}
@@ -651,7 +648,7 @@ func statFiles(files []file, follow bool) []file {
 				return
 			}
 			if s.Mode == 0 {
-				f.size, f.mod, ok[i] = s.Size, s.Mod, true
+				f.size, f.mod, ok[i] = s.Size, s.ModTime(), true
 				return
 			}
 		}
@@ -1167,12 +1164,12 @@ func listedRollouts(root string) (out []file, ok bool) {
 				}
 				if len(seen) > 0 && filepath.Base(seen[0].path) == name {
 					f := seen[0]
-					f.size, f.mod = e.Size, e.Mod
+					f.size, f.mod = e.Size, e.ModTime()
 					out = append(out, f)
 					continue
 				}
 				if m := rolloutName.FindStringSubmatch(name); m != nil {
-					out = append(out, file{agent: "codex", key: "codex:" + m[1], path: filepath.Join(shown, name), main: true, size: e.Size, mod: e.Mod})
+					out = append(out, file{agent: "codex", key: "codex:" + m[1], path: filepath.Join(shown, name), main: true, size: e.Size, mod: e.ModTime()})
 					made = true
 				}
 			}
@@ -2141,13 +2138,13 @@ func parseRead(f file, old *state, calls *callsRide) *state {
 
 	headBytes := headOf(f.path)
 	var s *state
-	if old != nil && !packed(f.path) && f.size >= old.Size && old.Off <= f.size && sameHead(headBytes, old.Head, old.HeadSize) && old.ContentHash != "" && prefixHash(f.path, old.Size) == old.ContentHash {
+	if old != nil && !packed(f.path) && f.size >= old.Size && old.Off <= f.size && sameHead(headBytes, old.Head, int(old.HeadSize)) && old.ContentHash != "" && prefixHash(f.path, old.Size) == old.ContentHash {
 		s = old.clone()
 	} else {
 		s = &state{}
 	}
 	s.Size, s.Mod = f.size, f.mod.UnixNano()
-	s.Head, s.HeadSize = hashHead(headBytes), len(headBytes)
+	s.Head, s.HeadSize = hashHead(headBytes), int32(len(headBytes))
 	s.CdRead = parser.claude
 	s.ContentHash = prefixHash(f.path, f.size)
 	var head func([]byte) bool

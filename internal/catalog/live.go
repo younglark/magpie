@@ -1,7 +1,10 @@
 package catalog
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,6 +60,8 @@ type liveFile struct {
 	// the list each time cost 2,500 models' /v1/models seconds (K.Liu on
 	// Discord)
 	byID map[string][]Model
+	// key names what the file holds but for when it was fetched (LiveKey)
+	key string
 }
 
 func readLive(provider string) (liveFile, error) {
@@ -65,6 +70,7 @@ func readLive(provider string) (liveFile, error) {
 		if err := json.Unmarshal(b, &f); err != nil {
 			return f, err
 		}
+		f.key = liveKey(b, f.Since != nil)
 		mendKinds(f.Models)
 		for _, side := range f.Sides {
 			mendKinds(side)
@@ -93,6 +99,40 @@ func mendKinds(ms []Model) {
 			m.ImageInput, m.Images = &yes, true
 		}
 	}
+}
+
+// LiveKey names the list saved for provider by what it holds, not by
+// when it was fetched: each account's list is fetched again every 45
+// minutes and on every start, and saved again with only its fetch time
+// moved (saveLive). Usage keyed its whole index on the file's mtime, so
+// each of those saves dropped it, and every start and every refresh read
+// the whole session history again (~1.5 GB allocated, seconds of CPU).
+// "missing" when there is no list; ok is false when it can't be read.
+func LiveKey(provider string) (key string, ok bool) {
+	f, err := readLive(provider)
+	if errors.Is(err, os.ErrNotExist) {
+		return "missing", true
+	}
+	if err != nil {
+		return "", false
+	}
+	return f.key, true
+}
+
+// liveKey hashes a saved list's bytes without its fetch time, the first
+// key saveLive writes. A list saved before Since was kept is dated by its
+// fetch (LiveSince), so its fetch time is part of what it holds.
+func liveKey(b []byte, dropFetched bool) string {
+	h := sha256.New()
+	if i := bytes.Index(b, []byte(`"fetched":`)); dropFetched && i >= 0 {
+		if j := bytes.IndexByte(b[i:], '\n'); j >= 0 {
+			h.Write(b[:i])
+			h.Write(b[i+j:])
+			return hex.EncodeToString(h.Sum(nil))
+		}
+	}
+	h.Write(b)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // LiveByID are the models of Live with this id, in the list's order
@@ -313,13 +353,43 @@ func saveLive(provider, base, asked string, models []Model, sides map[string][]M
 		return err
 	}
 	now := time.Now()
-	b, _ := json.MarshalIndent(liveFile{Fetched: now, Base: base, Models: models, Sides: sides, Kinded: true,
-		Since: liveSince(provider, models, now), Asked: asked}, "", "  ")
+	f := liveFile{Fetched: now, Base: base, Models: models, Sides: sides, Kinded: true,
+		Since: liveSince(provider, models, now), Asked: asked}
+	same := sameLive(p, f)
+	b, _ := json.MarshalIndent(f, "", "  ")
 	if err := os.WriteFile(p, b, 0o644); err != nil {
 		return err
 	}
+	if same {
+		// the list as it was, fetched again (an account's each 45
+		// minutes, KeepAccountsListed): only when it was fetched is other.
+		// Its next read looks at the file, and nothing else is told:
+		// Touched had every agent's lists built and compared again, and
+		// Forget moved the stamp dsh's rounds build magpie's models by,
+		// ~40 MB of allocations a time in a magpie at rest.
+		filememo.Look(p)
+		return nil
+	}
 	Touched()
 	return nil
+}
+
+// sameLive is whether the list saved at p is f but for when it was
+// fetched: the bytes on the disk are f's, written at the time they say.
+func sameLive(p string, f liveFile) bool {
+	old, err := os.ReadFile(p)
+	if err != nil {
+		return false
+	}
+	var at struct {
+		Fetched time.Time `json:"fetched"`
+	}
+	if json.Unmarshal(old, &at) != nil {
+		return false
+	}
+	f.Fetched = at.Fetched
+	b, err := json.MarshalIndent(f, "", "  ")
+	return err == nil && bytes.Equal(b, old)
 }
 
 // liveSince is Since for models about to be saved for provider at now:

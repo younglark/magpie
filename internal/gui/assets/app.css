@@ -1282,6 +1282,9 @@ body.masked :hover > .acct-eye, body.masked .pq-card:hover .acct-eye, body.maske
 /* the last label can be wider than its bar's column: let it spill left, not off the card */
 .chart .labels span:last-child { display: flex; justify-content: flex-end; }
 .row.stat .who { flex: 0 0 180px; }
+/* the line under a name (a sign-in's id, its calls, credits and speed) is
+   read whole at every width, not cut where the column ends */
+.row.stat .who .sub { white-space: normal; overflow-wrap: anywhere; }
 .row.stat .who .name.faint { color: var(--faint); font-weight: 400; }
 .row.stat .share { flex: 1 1 auto; height: 4px; border-radius: 2px; background: var(--pill); overflow: hidden; margin: 0 6px; }
 .row.stat .share i { display: block; height: 100%; border-radius: 2px; background: var(--accent); opacity: .7; }
@@ -4284,7 +4287,6 @@ body.panel .modal { padding: 16px 12px; }
   body.web .kpi small { white-space: normal; overflow: visible; overflow-wrap: anywhere; }
   body.web .row.stat { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 6px 8px; }
   body.web .row.stat .who { grid-column: 2; grid-row: 1; }
-  body.web .row.stat .who .sub { white-space: normal; }
   body.web .row.stat .cost { grid-column: 3; grid-row: 1; }
   body.web .row.stat .num { grid-column: 2 / 4; grid-row: 2; min-width: 0; align-items: flex-start; }
   body.web .row.stat .num small { max-width: 100%; white-space: normal; }
@@ -4790,8 +4792,8 @@ body.window .row + .row.agent.conn > .who { min-height: 41px; } /* the line abov
 .ag-menu-cap > .ag-dot { margin-top: calc(0.8em - 3px); }
 .ag-menu-cap > span:last-child { flex: 1; min-width: 0; }
 /* Claude Desktop's "largest window only" switch (#1272): its words beside it, the hint after them */
-.ag-longest { cursor: pointer; }
-.ag-longest-say { color: var(--fg-2); }
+.ag-longest, .ag-isolated { cursor: pointer; }
+.ag-longest-say, .ag-isolated-say { color: var(--fg-2); }
 /* which copy is left on the old list: a sentence that wraps as one, under the warning's words */
 .ag-vl.ag-stale-copy { display: block; padding-left: 14px; font-size: 12px; line-height: 1.6; color: var(--fg-2); }
 /* Codex's daemon: restarted from its line, a button that sits in the sentence */
@@ -4917,7 +4919,7 @@ input[type="checkbox"]:disabled { opacity: .45; }
 
 /* a disabled model's pattern, as typed (#1867): an id or a glob */
 .disabled-model .name { font-family: var(--code); font-size: 12px; overflow-wrap: anywhere; }
-/* Settings › Images: the way to the Magpie Image tool, under its words (#2091) */
+/* Settings › Models › Images: the way to the Magpie Image tool, under its words (#2091) */
 .lib-way .link { padding-left: 0; padding-right: 0; white-space: normal; text-align: start; }
 /* Settings › Proxy's Test result (#2076): under the row's text */
 .row.pref .sub.proxy-check { margin-top: 3px; white-space: normal; overflow-wrap: anywhere; }
@@ -4945,6 +4947,9 @@ body .row.agent .ag-prefs .row.pref .who { display: block; }
 .editor .prov-prefs[hidden] { display: none; }
 .prov-prefs .list.prefs { margin: 0; }
 .prov-prefs .list.prefs[hidden] { display: none; }
+/* the editor's Claude Code runs as row switches it; magpie web as a
+   gateway has that row's switch off, so this one shows there */
+.prov-prefs #claudeRunList:not(.gw) #claudeTuiRow { display: none; }
 .prov-prefs .row.pref .sub { white-space: normal; }
 .prov-prefs .row.pref { flex-wrap: wrap; row-gap: 8px; }
 .prov-prefs .row.pref .who { flex: 1 1 240px; min-width: 0; }

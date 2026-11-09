@@ -573,7 +573,7 @@ resets are still used on bigmodel.cn.
 
 Codex's native image tool first asks the provider that served its conversation
 turn for the requested image model. If that provider does not list the model,
-or the turn cannot be identified, it uses Settings → Images → Image generation
+or the turn cannot be identified, it uses Settings → Models → Images → Image generation
 (including Automatic). Off disables this fallback, not a matching model on the
 turn's provider. An explicit `provider/model` keeps its destination; an upstream
 image error does not retry through the setting. Magpie Image MCP is not required.
@@ -1281,6 +1281,12 @@ OpenCode ignores:
   are asked first, as in OpenCode, and reach `authorize(inputs)`. A prompt of
   `type: "password"` (magpie's own; OpenCode has `text` and `select`) is typed unseen:
   a masked field in the app, no echo in `magpie plugin login` (#1982).
+- **Sign-in words in other languages**: beside OpenCode's English, a
+  method's `labels`, a prompt's `messages`, and a select option's `labels`
+  and `hints`, each an object of language code to text (`{"zh": "…",
+  "zh-TW": "…", "ja": "…", "de": "…"}`), as a page's `titles` are. The app
+  shows the window's language, then its first part (`zh` for `zh-TW`), else
+  the English; `magpie plugin login` stays English.
 
 ```js
 export const LemonPlugin = async () => ({
@@ -2178,7 +2184,7 @@ it as above.
 refuses before any of it is said rests nobody: it is about what was asked,
 not the account. By default the same request is asked of the model's other
 accounts, then the routing group's other members, until one answers.
-Settings › Models › Replies › *Ask again after a refusal* sets how many more
+Settings › Models › Routing › *Ask again after a refusal* sets how many more
 are asked: 1, 2 or 3, or *Never ask again*. When nobody else is asked, an
 agent on Anthropic's Messages API (Claude Code) gets the refusal as the
 vendor said it, `stop_reason` `refusal` with its category, which Claude Code

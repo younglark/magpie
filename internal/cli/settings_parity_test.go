@@ -263,6 +263,7 @@ var notYet = map[string]string{
 	"POST /api/settings/codex-titles":            S2, // api.go
 	"POST /api/settings/codex-warm-at":           S2, // api.go
 	"POST /api/settings/cors":                    S2, // api.go
+	"POST /api/settings/desktop-isolated":        A,  // api.go; `magpie claude-desktop launcher`, an agent's form this check can't read
 	"POST /api/settings/desktop-longest":         S2, // api.go
 	"POST /api/settings/disabled-models":         S2, // api.go
 	"POST /api/settings/full-context":            S2, // api.go
@@ -365,6 +366,7 @@ var notYet = map[string]string{
 	"POST /api/omarchy/widget":                   W,  // omarchy.go
 	"GET /api/plugin-pages":                      W,  // pluginpage.go
 	"GET /api/plugin-panels":                     W,  // pluginpage.go
+	"POST /api/plugin-pages/image":               W,  // pageimage.go
 	"POST /api/plugin-pages/options":             W,  // pluginpage.go
 	"POST /api/plugin-pages/read":                W,  // pluginpage.go
 	"GET /api/plugins/agents":                    P,  // plugins.go

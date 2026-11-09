@@ -151,7 +151,12 @@ function archivePanel(name, id, redraw) {
   return box;
 }
 
-const PERIODS = [["today", "Today"], ["7d", "7 days"], ["30d", "30 days"], ["all", "All"]];
+// "24 hours" is the day up to now rather than since midnight (mahiro233 on
+// Discord), the server's rolling window (#2075). The reader's pick of these
+// is kept for the next time the page opens; picked days are not, as they
+// go stale.
+const PERIODS = [["today", "Today"], ["last:24h", "24 hours"], ["7d", "7 days"], ["30d", "30 days"], ["all", "All"]];
+try { const v = localStorage.getItem("magpie.usagePeriod"); if (PERIODS.some(([id]) => id === v)) period = v; } catch {}
 
 // The reader's time zone, which magpie reads the period's days, the chart's
 // hours and a picked day in: magpie web may be read from another zone than
@@ -287,6 +292,7 @@ function renderPeriod(loading) {
 
 function pickPeriod(id) {
   period = id; ledDay = ""; ledOffset = 0;
+  if (PERIODS.some(([p]) => p === id)) try { localStorage.setItem("magpie.usagePeriod", id); } catch {}
   loadUsage().catch((e) => status(e.message, "err"));
 }
 
@@ -301,7 +307,7 @@ function rangeName({ from, to }) {
 // noCallsIn is what an empty page says of the period it is on
 function noCallsIn(p) {
   if (periodDays(p)) return "No calls on the days picked.";
-  return { today: "No calls today.", "7d": "No calls in the last 7 days.", "30d": "No calls in the last 30 days.", all: "No calls yet." }[p] || "No calls yet.";
+  return { today: "No calls today.", "last:24h": "No calls in the last 24 hours.", "7d": "No calls in the last 7 days.", "30d": "No calls in the last 30 days.", all: "No calls yet." }[p] || "No calls yet.";
 }
 
 // openRangeMenu is the app's own menu for picking days (#1492): a few
@@ -609,6 +615,10 @@ const USAGE_FOLD_TITLES = {
   keys: ["Show the gateway keys", "Fold the gateway keys away"],
 };
 function mountUsageFolds() {
+  // how the allowances are shown, and their alerts, are set in
+  // Settings › Allowances
+  const toSet = $("#usageToSet");
+  if (toSet) toSet.onclick = (e) => openSettingsAt(e, "usage", "#quotaLeftRow");
   for (const b of $$("#usagePane .row-head .fold[data-fold]")) {
     b.prepend(svg(CHEV_R, 11, 1.6));
     b.onclick = () => {
@@ -726,7 +736,7 @@ function renderUsage() {
   const hit = u.cache_read && hitRate !== null ? t("hit rate {p}", { p: Math.round(100 * hitRate) + "%" }) : "";
   tile(fmtN(u.cache_read), t("cache read"), hit, u.cache_write ? t("{n} written", { n: fmtN(u.cache_write) }) + cacheTTLs(u, fmtN) : "");
   tile(fmtN(u.reasoning), t("reasoning"), t("inside output"));
-  tile(String(u.calls), t(u.calls === 1 ? "call" : "calls"), [u.credited ? ledCredits(u).textContent : "", u.errors ? t("{n} failed", { n: u.errors }) : "", u.retried ? t("{n} answered on a retry", { n: u.retried }) : "", u.canceled ? t("{n} canceled", { n: u.canceled }) : "", u.unpriced ? t("{n} unpriced", { n: u.unpriced }) : ""].filter(Boolean).join(" · "), u.unpriced ? unpricedCallsWhy(u.unpriced) : "");
+  tile(String(u.calls), t(u.calls === 1 ? "call" : "calls"), [u.credited ? ledCredits(u).textContent : "", u.errors ? t("{n} failed", { n: u.errors }) : "", u.retried ? t("{n} answered on a retry", { n: u.retried }) : "", u.canceled ? t("{n} canceled", { n: u.canceled }) : "", u.unpriced ? unpricedCalls(u.unpriced) : ""].filter(Boolean).join(" · "), u.unpriced ? unpricedCallsWhy(u.unpriced) : "");
 
   // the timeline: one bar per hour, day or week; output sits on top of input
   const chart = $("#chart");
@@ -1695,7 +1705,9 @@ function renderLedgerDash(l) {
     strip.lastChild.append(io);
   }
   const c = fmtCost(l);
-  block("Cost", c ? "≈" + c : "—", line(l.unpriced ? t(l.unpriced === 1 ? "{n} call had no known price and is not counted" : "{n} calls had no known price and are not counted", { n: l.unpriced }) : t("effective prices")), c ? "cost" : "");
+  // the count in the words the quick panel uses too, the whole sentence on
+  // hover (tenacious_eagle on Discord)
+  block("Cost", c ? "≈" + c : "—", line(l.unpriced ? unpricedCalls(l.unpriced) : t("effective prices")), c ? "cost" : "", l.unpriced ? unpricedCallsWhy(l.unpriced) : "");
   const hit = block("Cache hit rate", rate === null ? "—" : (100 * rate).toFixed(1) + "%", cacheLeftOut(l) ? line(cacheLeftOut(l)) : null, "", t("The share of the prompt read from the cache"));
   const meter = el("div", "meter"), fill = el("i");
   fill.style.width = (100 * (rate || 0)).toFixed(1) + "%";

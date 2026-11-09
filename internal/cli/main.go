@@ -34,6 +34,7 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/shortcut"
 	"github.com/yetone/magpie/internal/tui"
 	"github.com/yetone/magpie/internal/update"
 )
@@ -324,6 +325,10 @@ func run(args []string) error {
 	if ok, err := claudeLaunchCmd(args); ok {
 		return err
 	}
+	// Claude Magpie.app (claude_desktop_launch_cli.go), --help too
+	if ok, err := claudeDesktopLaunchCmd(args); ok {
+		return err
+	}
 	// before anything is read, moved or started: --help on any command
 	// prints its usage and does nothing else
 	if helpAsked(args) {
@@ -583,6 +588,11 @@ func run(args []string) error {
 	case "restore":
 		return restoreCmd(args[1:])
 	case "uninstall":
+		// Windows' Installed apps: the app's window asks (shortcut.UninstallArgs)
+		if hasGUI && slices.Equal(args, shortcut.UninstallArgs) {
+			gateway.Serves = "app"
+			return runUninstallWindow()
+		}
 		return uninstallCmd(args[1:])
 	case "webdav", "dav":
 		return webdavCmd(args[1:])
