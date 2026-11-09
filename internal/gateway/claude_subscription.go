@@ -3342,8 +3342,8 @@ func (r *subscriptionRun) park() {
 // turnKey is what a conversation has been so far, for the run that had it
 // to be found again: whom it runs as, the model, its settings and tools,
 // and the messages' words, tool calls and results. Whitespace, thinking and
-// how a reply is split into messages are left out, as clients keep those
-// differently. Its effort is not in it, only whether it asked for one (or
+// how a reply is split into messages or text blocks are left out, as
+// clients keep those differently. Its effort is not in it, only whether it asked for one (or
 // turned thinking off, which its Claude Code was started with): a
 // run is told another level as its turn starts (setEffort), where one
 // started anew would write the whole conversation to the cache again (#502).
@@ -3422,6 +3422,15 @@ func (r *subscriptionRun) follows(msgs []Message) bool {
 // answers, not by their ids: a client may name the calls it was told with
 // ids of its own, the same in every request after (AmpCode's TU-…), and its
 // conversation is the same one all the same.
+//
+// Its words have no whitespace in them at all (messageWords), so where a
+// reply's text is split into blocks is left out too: the run keeps its
+// reply as the one text it said, and the client as Anthropic's stream told
+// it, a block for each run of words between a thinking block, a web search
+// or an attempt Claude Code asked again. Read with a space where its blocks
+// met ("Looking at it: Here" for "Looking at it:Here"), the client's
+// conversation was none the run had, and the next turn was told to a new
+// Claude Code, all of it written to the cache again (#5705).
 func hashMessages(h hash.Hash, msgs []Message, after func(i int)) {
 	role := ""
 	for i, words := range messageWords(msgs) {
@@ -3430,7 +3439,7 @@ func hashMessages(h hash.Hash, msgs []Message, after func(i int)) {
 				role = m.Role
 				fmt.Fprintf(h, "\x00%s:", role)
 			}
-			h.Write([]byte(words + " "))
+			h.Write([]byte(words))
 		}
 		if after != nil {
 			after(i)
@@ -3439,15 +3448,18 @@ func hashMessages(h hash.Hash, msgs []Message, after func(i int)) {
 }
 
 // messageWords is each message's words, tool calls and results, as
-// hashMessages reads them.
+// hashMessages reads them: with no whitespace, so neither how the client
+// spaced them nor where it split them into blocks or messages counts.
 func messageWords(msgs []Message) []string {
 	out := make([]string, len(msgs))
 	for i, parts := range messageParts(msgs) {
-		words := make([]string, len(parts))
-		for k, p := range parts {
-			words[k] = p.words
+		var b strings.Builder
+		for _, p := range parts {
+			for _, f := range strings.Fields(p.words) {
+				b.WriteString(f)
+			}
 		}
-		out[i] = strings.Join(words, " ")
+		out[i] = b.String()
 	}
 	return out
 }
@@ -5589,6 +5601,77 @@ func withTaskNotices(results []Part, msgs []Message) []Part {
 	return out
 }
 
+// skillBody is the text Claude Code sends after a Skill call's result:
+// the skill's SKILL.md, headed with where its files are.
+var skillBody = regexp.MustCompile(`^Base directory for this skill: `)
+
+// withSkillBodies hands the run each skill's body that came after the
+// results, at the end of its Skill call's result. Claude Code answers a
+// Skill call with "Launching skill: pdf" and sends the skill's SKILL.md
+// as a text block after the results; since #5403 that text counts as the
+// agent's (desktopNote), not the user's, and was handed to no one, so the
+// run's model loaded a skill and never saw what it says.
+func withSkillBodies(results []Part, msgs []Message) []Part {
+	if len(results) == 0 {
+		return results
+	}
+	i := len(msgs)
+	for i > 0 && msgs[i-1].Role != "assistant" {
+		i--
+	}
+	skills := map[string]bool{}
+	if i > 0 {
+		for _, p := range msgs[i-1].Parts {
+			if p.Kind == ToolCall && p.Name == "Skill" {
+				skills[p.CallID] = true
+				skills[p.ID] = true
+			}
+		}
+	}
+	var out []Part
+	seen := false
+	for _, m := range msgs[i:] {
+		if withImages(m) {
+			continue
+		}
+		var last string
+		for _, p := range m.Parts {
+			switch {
+			case p.Kind == ToolResult:
+				seen = true
+				last = p.CallID
+			case p.Kind != Text || !seen:
+			default:
+				body := strings.TrimSpace(reminderTag.ReplaceAllString(p.Text, ""))
+				if !skillBody.MatchString(body) {
+					continue
+				}
+				if out == nil {
+					out = slices.Clone(results)
+				}
+				// the Skill call's result, else the one it follows, else the last
+				k := slices.IndexFunc(out, func(r Part) bool {
+					return r.CallID != "" && skills[r.CallID] && !strings.Contains(r.Text, "Base directory for this skill: ")
+				})
+				if k < 0 {
+					k = slices.IndexFunc(out, func(r Part) bool { return r.CallID == last })
+				}
+				if k < 0 {
+					k = len(out) - 1
+				}
+				if out[k].Text != "" {
+					out[k].Text += "\n\n"
+				}
+				out[k].Text += body
+			}
+		}
+	}
+	if out == nil {
+		return results
+	}
+	return out
+}
+
 var (
 	// midTurnHead heads a message the user sent while a tool ran, as
 	// Claude Code tells its model one: "The user sent a new message while
@@ -6770,7 +6853,7 @@ func (s *Server) serveSubscriptionAs(w http.ResponseWriter, r *http.Request, fro
 			run.mu.Lock()
 			run.allowed = allowedTools(req)
 			run.mu.Unlock()
-			events, err = run.continueWith(withTaskNotices(results, req.Messages), saidWithResults(req.Messages), more)
+			events, err = run.continueWith(withTaskNotices(withSkillBodies(results, req.Messages), req.Messages), saidWithResults(req.Messages), more)
 		}
 		if err != nil {
 			// it ended while it waited, or can't take the results: a new

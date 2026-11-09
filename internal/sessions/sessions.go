@@ -20,6 +20,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -173,6 +174,12 @@ type Session struct {
 	// own replies are known to belong to a fork of that opening
 	// (gui's ownerOf)
 	SeedConvs []string `json:"-"`
+	// TurnConvs are the ids of its newest turn's user messages, one
+	// spelling each and the newest dshTurnKept at most: a request still
+	// answering has no reply id yet, and the messages it carried — in
+	// this session's file before it went out — say which branch it is of
+	// (gui's ownerLast)
+	TurnConvs []string `json:"-"`
 	// Copies are the ids of the sessions that are copies of its
 	// conversation, not listed apart from it (ccCopies)
 	Copies []string `json:"-"`
@@ -241,7 +248,11 @@ type state struct {
 	// (dshConvs), kept when its seed's end takes them off Convs: the
 	// opening a fork and its source share is the source's, and this is
 	// the fork's own record that it came from that opening (ownerSeed)
-	SeedConvs []string      `json:"seed_convs,omitempty"`
+	SeedConvs []string `json:"seed_convs,omitempty"`
+	// TurnConvs are the ids of its newest turn's user messages (the first
+	// of dshConvs each, the newest dshTurnKept), reset at the turn's start
+	// and not kept from a fork's seed (gui's ownerLast)
+	TurnConvs []string      `json:"turn_convs,omitempty"`
 	Start     time.Time     `json:"start"`
 	Last      time.Time     `json:"last"`
 	Models    named[Tokens] `json:"models,omitempty"`
@@ -317,9 +328,18 @@ type day struct {
 	Skills named[int] `json:"k,omitempty"`
 }
 
+// routerSkill is the one skill magpie's skill router gives an agent
+// (library.RouterSkill). Calling it up only lists the skills behind it,
+// and the one the agent then reads is counted (routedSkill), so it isn't
+// counted as a skill of its own: every routed use would be counted twice.
+const routerSkill = "magpie-skills"
+
 // tool counts a call of a tool, and of a skill when it calls one up; a
 // skill called up with no tool (Pi's /skill:name) has no name.
 func (s *state) tool(at time.Time, name, skill string) {
+	if skill == routerSkill {
+		skill = ""
+	}
 	if name == "" && skill == "" {
 		return
 	}
@@ -330,6 +350,23 @@ func (s *state) tool(at time.Time, name, skill string) {
 	if skill != "" {
 		*d.Skills.at(skill)++
 	}
+}
+
+// routedSkill is the skill a read of path calls up through magpie's
+// skill router (library's skill_router.go): an agent given magpie-skills
+// reads a skill's SKILL.md under magpie-skills/.skills/<name>/ with its
+// file tool, not its Skill tool. "" for any other path.
+func routedSkill(path string) string {
+	p := strings.ReplaceAll(path, `\`, "/")
+	rest, ok := strings.CutSuffix(p, "/SKILL.md")
+	if !ok {
+		return ""
+	}
+	dir, name := pathpkg.Split(rest)
+	if name == "" || !strings.HasSuffix(dir, "/"+routerSkill+"/.skills/") {
+		return ""
+	}
+	return name
 }
 
 // idleGap is the longest pause between two lines still counted as work.
@@ -407,6 +444,7 @@ func (s *state) clone() *state {
 	c.Convs = slices.Clone(s.Convs)
 	c.ResponseIDs = slices.Clone(s.ResponseIDs)
 	c.SeedConvs = slices.Clone(s.SeedConvs)
+	c.TurnConvs = slices.Clone(s.TurnConvs)
 	c.CodexSpawnNames = maps.Clone(s.CodexSpawnNames)
 	c.CodexSpawnConflicts = maps.Clone(s.CodexSpawnConflicts)
 	c.CodexAgentIDs = maps.Clone(s.CodexAgentIDs)
@@ -1186,7 +1224,9 @@ const cacheVersion = 29
 // (gemini-4-argon-d) is its model's (GeminiDeployment), not -n alone.
 // antigravity 2: a conversation's folder is its summary row's workspace
 // (a parse kept from before has none, under the same row revision).
-var parseVersions = map[string]int{"codex": 3, "zcode": 1, "dsh": 2, "antigravity": 2}
+// dsh 3: the ids of its newest turn's messages (TurnConvs), which a
+// request still answering carried and has no reply id for yet.
+var parseVersions = map[string]int{"codex": 3, "zcode": 1, "dsh": 3, "antigravity": 2}
 
 type cacheFile struct {
 	Version int    `json:"version"`
@@ -1898,6 +1938,7 @@ func assembleListed(fs []file, price func(string) *catalog.Price, codexTitle fun
 			s.Convs = append(s.Convs, st.Convs...)
 			s.ResponseIDs = append(s.ResponseIDs, st.ResponseIDs...)
 			s.SeedConvs = append(s.SeedConvs, st.SeedConvs...)
+			s.TurnConvs = append(s.TurnConvs, st.TurnConvs...)
 			if d := st.Dsh; d != nil && d.Head.IsSeeded && d.Head.DelegationDepth == 0 {
 				s.ForkOf = d.Head.ParentSession
 			}
