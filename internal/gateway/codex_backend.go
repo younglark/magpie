@@ -1670,7 +1670,8 @@ func codexAccountOut(status int, body []byte) bool {
 
 // codexFallsBack says Codex's turn on one of its own models has fallbacks
 // to go on to (codexFallBack): the Codex subscription's, set in magpie, at
-// least one of them found. A turn compacting natively is the backend's to
+// least one of them found, or a routing group the user built with the
+// model in it (provider.GroupsAfter). A turn compacting natively is the backend's to
 // answer, and goes nowhere else.
 func (s *Server) codexFallsBack(model string, body []byte) bool {
 	if model == "" || strings.Contains(model, "/") || compactionTriggerIn(body) {
@@ -1680,7 +1681,7 @@ func (s *Server) codexFallsBack(model string, body []byte) bool {
 	if !ok || p.Account == nil || p.Account.Agent != "codex" {
 		return false
 	}
-	return len(provider.FallbackModels(p)) > 0
+	return len(provider.FallbackModels(p)) > 0 || len(provider.GroupsAfter(p.ID+"/"+model)) > 0
 }
 
 // codexFallBack serves Codex's turn on its own sign-in, which the backend
@@ -2055,7 +2056,7 @@ func callKind(h http.Header) string {
 		v = threadSource(h.Get("x-codex-turn-metadata"))
 	}
 	if v == "" && dshCompacts(h) {
-		v = "compact" // DSH's compaction of its context
+		v = KindCompact // DSH's compaction of its context
 	}
 	if v == "" && h.Get("User-Agent") == SearchAgent {
 		v = "web_search"
