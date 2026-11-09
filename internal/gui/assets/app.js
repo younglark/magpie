@@ -300,14 +300,9 @@ function keepIcons(...roots) {
     keptIcons.get(e.dataset.icon).push(e);
   }
 }
-// A mono logo is a CSS mask, not an <img>: a row drawn again makes its
-// span afresh, and only the spans on the page keep the picture, so the
-// engine may let it go between rows and paint the new one empty until it
-// is loaded again: the logo blinks, an <img> beside it doesn't (#1847). Every
-// mask picture that has loaded is kept by a span of its own on a hidden
-// shelf for as long as the page is open, so a logo drawn again paints at
-// once on any page. Each picture is tried once, not once per logo: a
-// probe made for every logo asked for the file again on a redraw.
+// A mono logo is a CSS mask, which a redrawn row can paint empty until it
+// loads again (#1847): each loaded picture is kept by a span on a hidden
+// shelf, and tried once, not once per logo.
 const maskLoads = new Map();
 let maskShelf = null;
 function maskSpan(src, failed) {
@@ -4313,13 +4308,9 @@ function fit(extra = 0, glide) {
   const still = !glide || calm();
   fitSend("window/fit?h=" + h + (still ? "" : "&ms=" + glide.ms + "&ease=" + glide.ease));
 }
-// fitSend asks for one height at a time. Wails serves each of the page's
-// requests on a goroutine of its own, so two fits asked together reached
-// the panel in either order (69 of 400 pairs the wrong way round in a real
-// WKWebView), and the older one landing last kept the panel at its height:
-// fit.last and the panel's own height then took the newer as done, and the
-// Allowances tab's card was cut off by the foot (robot_yz on X). A fit
-// asked while one is on its way waits for it, and only the latest goes.
+// fitSend asks for one height at a time: Wails serves requests on their own
+// goroutines, so two fits could land in either order and the older keep the
+// panel short (robot_yz on X). One asked meanwhile waits; only the latest goes.
 function fitSend(path) {
   if (fitSend.busy) { fitSend.next = path; return; }
   fitSend.busy = true;
@@ -5649,7 +5640,7 @@ function keptNote(m) {
   } else {
     words.append(el("span", "", t("{provider} is used only through routing groups, and {model} is in none, so no agent can use it. Make a group of it, or untick “Only through routing groups” in {provider}'s models.", { provider: m.provider, model })));
     act.textContent = t("Make a routing group of it");
-    act.dataset.feature = "routing"; // made on the Routing page
+    act.dataset.feature = "routing groups";
     act.onclick = (ev) => {
       ev.stopPropagation();
       closePicker();
@@ -6791,14 +6782,10 @@ function accountPlan(a) {
 // page that gets anything else connected to it: base URL, key, model ids,
 // and a snippet in whichever language the reader is holding.
 
-// copy asks magpie to put text on the clipboard, as the page's own
-// clipboard API is refused inside the app's window; a browser tab on the
-// dev UI falls back to it. A tab on `magpie web` reached over plain http
-// from another computer (a NAS's) has no clipboard API at all, so the
-// older copy command is the last try there. magpie refuses a copy it
-// couldn't read back (#1881: GTK 3 on KDE Plasma without middle-click
-// paste served it empty), and the page's ways are tried then too. When
-// none copies, the page says so and shows the text to copy by hand.
+// copy asks magpie for the clipboard (the window refuses the page's API),
+// then the page's API, then the old copy command (plain-http `magpie web`).
+// magpie refuses a copy it can't read back (#1881); none copying, the page
+// shows the text to copy by hand.
 async function copy(text, what, btn, message) {
   const done = () => { status(message || t("{what} copied", { what }), "ok"); flashCopied(btn); };
   const res = await fetch("/api/copy", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) }).catch(() => null);
@@ -9015,10 +9002,11 @@ function openModal(content, quiet) {
     || focusIndex >= 0 && content.querySelectorAll("input, textarea, select, button")[focusIndex];
   // the focus given back is not a press: what was pressed stays held, by
   // the element a redraw put back or by the focused copy of it
-  modalRefocus = !fresh;
+  const copy = held && (content.contains(held) ? held : held === active && focus) || null;
+  modalRefocus = !!copy;
   try { (focus || content.querySelector("input:not([disabled]), textarea, select, button:not([disabled])") || d).focus(NO_SCROLL); }
   finally { modalRefocus = false; }
-  if (held) modalHold.copy = content.contains(held) ? held : held === active && focus || null;
+  modalHold.copy = copy;
   const body = content.querySelector(":scope > .ebody");
   if (body) body.scrollTop = top; // a re-render keeps the place
   const nextNames = content.querySelector(".mnames:not([hidden])");
@@ -11522,7 +11510,7 @@ function renderModels(p) {
     if (!p.unlisted) { lost.append(" " + t("Once saved, make a group of them in Routing groups.")); return; }
     for (const id of none.slice(0, 4)) {
       const b = el("button", "text action", t("Make a routing group of {model}", { model: id }));
-      b.dataset.feature = "routing"; // made on the Routing page
+      b.dataset.feature = "routing groups";
       b.onclick = (ev) => { if (mode !== "window") api("window/main?view=groups&newgroup=" + encodeURIComponent(p.id + "/" + id), {}); else window.newGroupWith?.(p.id + "/" + id, "", ev); };
       lost.append(b);
     }
@@ -14138,9 +14126,18 @@ function accountCapOf(p, user) { return p?.accountCaps?.[String(user).toLowerCas
 function windowOwnCapOf(p, user, w) {
   return (w?.capId && p?.accountWindowCaps?.[String(user).toLowerCase()]?.[w.capId]) || 0;
 }
-function windowCapsOf(p, user) { return Object.keys(p?.accountWindowCaps?.[String(user).toLowerCase()] || {}).length; }
-// windowCapOf: the share the window holds the account at, 0 for none
+function windowCapsOf(p, user) { const k = String(user).toLowerCase(); return Object.keys({ ...p?.accountWindowCaps?.[k], ...p?.accountWindowAmounts?.[k] }).length; }
+// A window's cap at a fixed amount of its own unit (provider.AccountWindowAmounts,
+// 9won_25273 on Discord), by capId: 0 when it has none.
+function windowAmountOf(p, user, w) {
+  return (w?.capId && p?.accountWindowAmounts?.[String(user).toLowerCase()]?.[w.capId]) || 0;
+}
+// windowCapOf: the share the window holds the account at, 0 for none; an
+// amount as a share of the window's total, which a window read without one
+// leaves aside
 function windowCapOf(p, user, w) {
+  const amount = windowAmountOf(p, user, w);
+  if (amount && w?.limit > 0) return amount / w.limit * 100;
   const own = windowOwnCapOf(p, user, w);
   if (own) return own >= 100 ? 0 : own;
   return w?.ownCap ? 0 : accountCapOf(p, user);
@@ -14169,7 +14166,7 @@ function capHeldOf(q, capFor) {
     if (!r) h.unknown = true; else h.back = Math.max(h.back, r);
   }
   const h = all.n ? all : some.n ? some : null;
-  return h && { used: h.used, cap: h.cap, back: h.unknown ? 0 : h.back, all: h === all, some: some.names };
+  return h && { used: h.used, cap: Math.ceil(h.cap), back: h.unknown ? 0 : h.back, all: h === all, some: some.names };
 }
 // directNote: why the cap can't stop agent, signed in to the account and
 // asking its vendor itself, with no other account on to move it to
@@ -14205,7 +14202,7 @@ function capMark(track, w, cap) {
   if (!cap || !w.capped) return;
   const mk = el("span", "aq-cap");
   mk.style.left = (quotaLeft ? 100 - cap : cap) + "%";
-  mk.title = t("Usage cap {n}%", { n: cap });
+  mk.title = t("Usage cap {n}%", { n: Math.round(cap) });
   track.classList.add("capped");
   track.append(mk);
 }
@@ -14236,14 +14233,22 @@ function pillNumber(at, val, ph, cls, label, parse, bad, own, set) {
 // sets the window's own cap, a family's its models' (tiers); not on-demand's.
 function windowCapMeter(m, p, user, w) {
   const ids = (w.tiers || [w]).map((x) => x.capId), owns = ids.map((capId) => windowOwnCapOf(p, user, { capId }));
-  if (!ids.every(Boolean) || w.ownCap && !(owns[0] % 100)) return m;
+  const amounts = ids.map((capId) => windowAmountOf(p, user, { capId }));
+  const amount = new Set(amounts).size > 1 ? 0 : amounts[0];
+  if (!ids.every(Boolean) || w.ownCap && !(owns[0] % 100) && !amount) return m;
   const own = new Set(owns).size > 1 ? 0 : owns[0], cap = accountCapOf(p, user);
   const name = t(w.name);
-  const b = spanBtn(el("span", m.className + " aq-set" + (own ? " own" : "")));
+  // a window counted in a unit, with its total, can be capped at an amount
+  // of it in place of a share
+  const unit = w.limit > 0 && w.unit ? t(w.unit) : "";
+  const amountText = (v) => (countFormat.format(v) + " " + unit).trim();
+  const b = spanBtn(el("span", m.className + " aq-set" + (own || amount ? " own" : "")));
   b.append(...m.childNodes);
-  if (own) b.append(el("span", "aq-own", own >= 100 ? t("No cap") : t("Cap {n}%", { n: own })));
+  if (amount) b.append(el("span", "aq-own", t("Cap {n}", { n: amountText(amount) })));
+  else if (own) b.append(el("span", "aq-own", own >= 100 ? t("No cap") : t("Cap {n}%", { n: own })));
   const reset = m.title || (w.resetsAt ? resetText(new Date(w.resetsAt), new Date(w.resetsAt).toLocaleString(intlLang())) : "");
-  b.title = [reset, own >= 100 ? t("No cap on {window}: it is used to 100%, whatever this account's cap. Click to change", { window: name })
+  b.title = [reset, amount ? t("{window} has a cap of its own: magpie counts this account as used up once it has used {n} of {window}, until it renews. Click to change", { window: name, n: amountText(amount) })
+    : own >= 100 ? t("No cap on {window}: it is used to 100%, whatever this account's cap. Click to change", { window: name })
     : own ? t("{window} has a cap of its own: magpie counts this account as used up once {window} is at {n}%, until it renews. Click to change", { window: name, n: own })
     : t("Click to give {window} a cap of its own, apart from this account's", { window: name })].filter(Boolean).join("\n");
   b.setAttribute("aria-haspopup", "menu");
@@ -14253,6 +14258,10 @@ function windowCapMeter(m, p, user, w) {
       : v >= 100 ? t("{window} of {who} has no cap", { window: name, who: user })
       : t("{who} stops at {n}% of {window}", { who: user, n: v, window: name }));
   const other = () => pillNumber(b, own && own < 100 ? String(own) : "", "1–99", "acap-in", t("Cap for {window}, in percent", { window: name }), capOf, t("A cap is a share from 1% to 99%"), own, set);
+  const setAmount = (v) => accountAction("provider/windowcap", { id: p.id, account: user, window: w.capId, ...w.tiers && { windows: ids }, amount: v },
+    t("{who} stops at {n} of {window}", { who: user, n: amountText(v), window: name }));
+  const amountOf = (v) => { v = Number(v.replace(/[\s,]/g, "")); return v > 0 && Number.isFinite(v) ? v : null; };
+  const otherAmount = () => pillNumber(b, amount ? String(amount) : "", unit, "acap-in", t("Cap for {window}, in {unit}", { window: name, unit }), amountOf, t("An amount above 0"), amount, setAmount);
   b.onclick = (e) => {
     e.stopPropagation();
     if (b.classList.contains("open")) return closeProtoMenu();
@@ -14264,9 +14273,11 @@ function windowCapMeter(m, p, user, w) {
     ];
     for (const n of shares) opts.push({ v: n, name: n + "%", note: "", literalName: true });
     opts.push({ v: -1, name: "Other…", note: "A share of your own, 1–99%" });
-    openProtoMenu(b, opts, own, (v) => {
+    if (unit) opts.push({ v: -2, name: t("Amount…"), note: amount ? amountText(amount) : t("At most this much {unit}", { unit }), literalName: true });
+    openProtoMenu(b, opts, amount ? -2 : own, (v) => {
       if (v === -1) return other();
-      if (v !== own) set(v);
+      if (v === -2) return otherAmount();
+      if (v !== own || amount) set(v);
     }, t("Cap for {window}", { window: name }), "sess-menu");
   };
   return b;
@@ -14627,14 +14638,10 @@ async function accountAction(path, body, okMsg, confirmed = false, say = (m) => 
   }
 }
 
-// An account's or key's own models (#474): one of several can be kept for
-// some of the provider's models only — a small allowance kept for the cheap
-// ones — and the gateway never sends it another. Unset, it serves all the
-// provider's, as before. The pill on its row says which it serves; a click
-// opens the provider's models under it as chips, picked and saved apart
-// from the editor's Save. acctModels is the row being picked: { id, ref,
-// chosen }. Picks left unsaved there go with the editor's Save, which says
-// it saved them (#2862).
+// An account's or key's own models (#474): kept for some models only, the
+// gateway sends it no other; unset, all. Its pill opens them as chips,
+// saved apart from the editor's Save, which takes unsaved picks (#2862).
+// acctModels is the row being picked: { id, ref, chosen }.
 let acctModels = null;
 function accountModelsOf(p, ref) { return p.accountModels?.[String(ref).toLowerCase()] || []; }
 // accountModelsDraft: the open picker's unsaved picks as accountmodels takes
@@ -21836,6 +21843,7 @@ function renderRedact(s, keep) {
   box.replaceChildren();
   find.replaceChildren();
   share.replaceChildren();
+  featOff(box, s, "redact", t("Nothing is masked until it is on. Choosing anything to mask below turns it on"));
   const rowIn = (into, name, sub, ...tools) => {
     const r = el("div", "row pref");
     const who = el("div", "who");
@@ -23054,14 +23062,8 @@ function hold(h) {
     // button held, and room made for the button slid the chip up under the
     // tabs, out of sight
     if (want > max && h.top) want = max;
-    // room is only kept while some of the view stays in sight: a redraw can take
-    // away the whole of what the reader was looking at (a group's editor closed
-    // on its Save, the list it had in it), and scrolled to `want` not one row of
-    // the view would be in sight, only the room — a blank page. The browser's own
-    // clamp after the content shrank stands instead.
-    // A sliver is as blank: with the group editor's rows folded under
-    // Advanced, its Save left the last settings card, 88px of a 594px window,
-    // above the room. So a third of the window is content, or no room.
+    // room only while a third of the window still shows the view, never a
+    // blank page; the browser's own clamp stands instead
     if (want > max && contentEnd(v) - want < v.clientHeight / 3) want = max;
     if (want > max) setRoom(v, want + v.clientHeight - contentEnd(v));
     v.scrollTop = want;
@@ -23166,8 +23168,8 @@ async function show(v) {
   v = magpie.replacing?.(v) || v;
   // a page gateway mode leaves out (a link to it, an address kept) opens Providers
   if (gatewayMode && GATEWAY_HIDES.includes(v)) v = "providers";
-  // and one a built-in plugin switched off has, Agents
-  if (featureHides($(`#nav button[data-view="${v}"]`))) v = gatewayMode ? "providers" : "agents";
+  // and one a built-in plugin switched off has, offView
+  v = offView(v);
   if (v !== view) {
     if (v === "plugins" && pluginUpdates) window.pluginTabTo?.("installed");
     if (view === "providers" && (editing !== null || importing || importingApps)) {
@@ -23256,6 +23258,12 @@ function setGatewayMode(on) {
   else if (!sideNav()) slide($("#nav"), "nav");
   navSubs();
 }
+// offView: v, or the page a plugin switched off sends it to (yyddbds)
+function offView(v) {
+  if (!featureHides($(`#nav button[data-view="${v}"]`))) return v;
+  if (v === "groups" && !featureHides($('#nav button[data-view="routing"]'))) return "routing";
+  return gatewayMode ? "providers" : "agents";
+}
 // navHides leaves out the tabs of the pages gateway mode or a built-in
 // plugin switched off leaves out
 function navHides() {
@@ -23277,7 +23285,8 @@ function applyFeatures(list) {
   if (mode === "panel" && panelTab !== "agents") setPanelTab(panelTab); // its tab may be gone
   if (mode !== "window") return;
   navHides();
-  if (featureHides($(`#nav button[data-view="${view}"]`))) show(gatewayMode ? "providers" : "agents");
+  window.routingGroupsHome?.();
+  if (offView(view) !== view) show(offView(view));
   else if (!sideNav()) slide($("#nav"), "nav");
   setSetTab(setTab);
   navSubs();
@@ -23296,6 +23305,10 @@ function renderBuiltins(box, list, done) {
     const who = el("div", "who");
     who.append(el("div", "name", t(f.name)), el("div", "sub", t(f.sub)));
     if (f.inUse > 0) who.append(el("div", "sub feat-why", t(f.use, { n: f.inUse })));
+    const line = el("div", "sub feat-go");
+    featWho[f.id]?.(line, f, who); // what it does now (plugins/search)
+    featGo(line, f);
+    if (line.childNodes.length) who.append(line);
     const b = el("button", "lib-switch use-credits" + (f.on ? " on" : ""));
     b.type = "button";
     b.setAttribute("role", "switch");
@@ -23343,6 +23356,47 @@ function renderBuiltins(box, list, done) {
   box.replaceChildren(...out, ...rows);
 }
 window.renderBuiltins = renderBuiltins;
+const featWho = {};
+// featGo: a built-in's row goes to its settings and its page, as their
+// settings and page go back (featOff, Masking's head; netube99 on X)
+function featGo(line, f) {
+  const [tab, row] = f.setAt?.split(" ") || [];
+  if (!tab) return;
+  const to = [];
+  // not to settings hidden while it is off (Observability, warm-ups)
+  if (f.on || !$(row)?.closest("[data-feature]")) to.push([t("Settings") + " › " + $("#setTab-" + tab).textContent, (e) => openSettingsAt(e, tab, row + " .row")]);
+  const nav = f.on && f.page && $(`#nav [data-view="${f.page}"]`);
+  if (nav) to.push([nav.textContent, () => nav.click()]);
+  for (const [say, go] of to) {
+    const b = el("button", "link", say);
+    b.type = "button";
+    b.onclick = go;
+    line.append(line.childNodes.length ? " · " : "", b);
+  }
+}
+// featOff: the settings of a built-in switched off say so, and turn it on
+function featOff(box, s, id, sub) {
+  if (s.builtins?.find((f) => f.id === id)?.on !== false) return;
+  const r = el("div", "row pref feat-off"), who = el("div", "who"), val = el("div", "val");
+  r.dataset.of = id;
+  who.append(el("div", "name", t("Off in Plugins › Built-in")), el("div", "sub", sub));
+  const on = el("button", "text", t("Turn on"));
+  on.type = "button";
+  on.onclick = async () => {
+    on.disabled = true;
+    try {
+      applyFeatures(prefs.builtins = await api("plugins/builtin", { id, on: true }));
+      renderSettings();
+      status(t("Saved"), "ok", 1500);
+    } catch (err) {
+      on.disabled = false;
+      status(t(err.message), "err");
+    }
+  };
+  val.append(on);
+  r.append(who, val);
+  box.append(r);
+}
 // openSettings: the Settings page, in the window (the panel opens it there)
 function openSettings() {
   if (mode !== "window") { api("window/main?view=settings", {}); return; }
@@ -23537,13 +23591,9 @@ function markNav(v) {
 }
 
 // ---- the sidebar ----------------------------------------------------------
-// A window wide enough has its pages down a sidebar, as a Mac app's: in
-// groups, the open page's own tabs under it, Settings at its foot and the
-// gateway's address under that, the header saying where the reader is
-// ("Work / Library / MCP servers"). Narrower, and magpie web on a phone,
-// the pages go back into the header as tabs and each page shows its own
-// tabs again, as iPadOS's sidebar turns into a tab bar when it has no room.
-// It is the same #nav, moved between the two.
+// A wide window has its pages down a sidebar, as a Mac app's; narrower
+// (and on a phone) they go back into the header as tabs, as iPadOS's
+// sidebar does. It is the same #nav, moved between the two.
 var SIDE_AT = 1024;
 var sideQuery = matchMedia(`(min-width: ${SIDE_AT}px)`);
 function sideNav() { return document.body.classList.contains("side-nav"); }
