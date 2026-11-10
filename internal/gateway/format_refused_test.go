@@ -28,6 +28,9 @@ type formatRefuser struct {
 	mu     sync.Mutex
 	bodies []map[string]any
 	object bool
+	// none is an upstream that takes every format (OpenCode Go's
+	// deepseek-v4.1-flash since 2026-11)
+	none bool
 }
 
 func (v *formatRefuser) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +51,7 @@ func (v *formatRefuser) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		oc, _ := m["output_config"].(map[string]any)
 		f, _ = oc["format"].(map[string]any)
 	}
-	if f != nil && (f["type"] == "json_schema" || v.object && f["type"] == "json_object") {
+	if !v.none && f != nil && (f["type"] == "json_schema" || v.object && f["type"] == "json_object") {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
 		if strings.HasSuffix(r.URL.Path, "/messages") {

@@ -58,14 +58,49 @@ func checkSchemaLine(t *testing.T, content any) {
 	}
 }
 
-// The rebuilt Chat request for a DeepSeek model asks for json_object, the
-// schema in a trailing system message; the client's system and user
-// messages come first unchanged, so the cached prefix holds.
-func TestBuildChatDeepSeekJSONSchemaAsObject(t *testing.T) {
+// The first rebuilt Chat request for a DeepSeek model keeps the client's
+// json_schema: it is not rewritten until the upstream turns it away.
+func TestBuildChatDeepSeekJSONSchemaPassedThrough(t *testing.T) {
 	r, err := parseChat([]byte(grokMemoryBody))
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, c := range []struct{ host, model string }{
+		{"opencode.ai", "deepseek-v4.1-flash"},
+		{"api.deepseek.com", "deepseek-chat"},
+	} {
+		m := decodeChatOut(t, buildChat(r, c.model, c.host, false))
+		rf, _ := m["response_format"].(map[string]any)
+		if rf["type"] != "json_schema" {
+			t.Fatalf("%s: response_format = %v, want json_schema", c.host, m["response_format"])
+		}
+		js, _ := rf["json_schema"].(map[string]any)
+		if js["name"] != "structured_output" || js["strict"] != true {
+			t.Fatalf("%s: json_schema = %v", c.host, js)
+		}
+		msgs := m["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("%s: messages = %v", c.host, msgs)
+		}
+		first := msgs[0].(map[string]any)
+		if first["role"] != "system" || first["content"] != "You extract durable memories." {
+			t.Fatalf("%s: client system changed: %v", c.host, first)
+		}
+		if m["reasoning_effort"] != "low" {
+			t.Fatalf("%s: reasoning_effort = %v", c.host, m["reasoning_effort"])
+		}
+	}
+}
+
+// After the schema is turned away, the rebuilt Chat request asks for
+// json_object, the schema in a trailing system message; the client's
+// system and user messages come first unchanged, so the cached prefix holds.
+func TestBuildChatDeepSeekJSONSchemaAsObjectTrail(t *testing.T) {
+	r, err := parseChat([]byte(grokMemoryBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r = r.asObjectTrail()
 	for _, c := range []struct{ host, model string }{
 		{"opencode.ai", "deepseek-v4.1-flash"},
 		{"api.deepseek.com", "deepseek-chat"},
@@ -190,7 +225,7 @@ func TestDeepSeekFormatBodyPassthrough(t *testing.T) {
 	}
 }
 
-func TestChatTakesObjectOnly(t *testing.T) {
+func TestChatSchemaTrails(t *testing.T) {
 	for _, c := range []struct {
 		host, model string
 		want        bool
@@ -201,18 +236,18 @@ func TestChatTakesObjectOnly(t *testing.T) {
 		{"api.openai.com", "gpt-5.4", false},
 		{"api.moonshot.ai", "kimi-k2", false},
 	} {
-		if got := chatTakesObjectOnly(c.host, c.model); got != c.want {
+		if got := chatSchemaTrails(c.host, c.model); got != c.want {
 			t.Fatalf("%s %s: %v", c.host, c.model, got)
 		}
 	}
 }
 
 // Grok Build's memory extraction (Chat, passed through) and a Responses
-// client's schema (built again for Chat) reach a DeepSeek model asking
-// for json_object from the first request, the schema told once in a
-// trailing system message: no 400 to recover from, the client's own
-// messages first as they were.
-func TestDeepSeekSchemaAskedAsObjectUpfront(t *testing.T) {
+// client's schema (built again for Chat) first reach a DeepSeek model
+// as json_schema; when that is turned away, they are asked again for
+// json_object, the schema told once in a trailing system message, and
+// so from then on. The client's own messages stay first as they were.
+func TestDeepSeekSchemaRetryAfterRefusal(t *testing.T) {
 	for _, c := range []struct{ name, path, body, firstSystem string }{
 		{"chat passthrough", "/v1/chat/completions", strings.Replace(grokMemoryBody, `"deepseek-v4.1-flash"`, `"ds/deepseek-v4.1-flash"`, 1), "You extract durable memories."},
 		{"responses rebuilt", "/v1/responses", strings.Replace(sdkResponsesParse, "%s", "ds/deepseek-v4.1-flash", 1), "Extract the event information."},
@@ -233,12 +268,26 @@ func TestDeepSeekSchemaAskedAsObjectUpfront(t *testing.T) {
 					t.Fatalf("turn %d: status %d: %s", i, rec.Code, rec.Body.String())
 				}
 				bodies := up.all()
-				if len(bodies) != i+1 {
-					t.Fatalf("turn %d: %d upstream requests, want one per turn", i, len(bodies))
+				if i == 0 && len(bodies) != 2 {
+					t.Fatalf("turn 0: %d upstream requests, want 2 (schema, then object)", len(bodies))
 				}
-				sent := bodies[i]
+				if i == 1 && len(bodies) != 3 {
+					t.Fatalf("turn 1: %d upstream requests, want 3 (retry remembered)", len(bodies))
+				}
+				firstSent := bodies[0]
+				if i == 0 {
+					rf, _ := firstSent["response_format"].(map[string]any)
+					if rf["type"] != "json_schema" {
+						t.Fatalf("first request response_format %s, want json_schema", jsonOf(firstSent["response_format"]))
+					}
+					msgs, _ := firstSent["messages"].([]any)
+					if n := strings.Count(jsonOf(msgs), "matching this JSON schema"); n != 0 {
+						t.Fatalf("schema told on the first request: %s", jsonOf(msgs))
+					}
+				}
+				sent := bodies[len(bodies)-1]
 				if jsonOf(sent["response_format"]) != `{"type":"json_object"}` {
-					t.Fatalf("turn %d: response_format %s", i, jsonOf(sent["response_format"]))
+					t.Fatalf("turn %d: last response_format %s", i, jsonOf(sent["response_format"]))
 				}
 				msgs, _ := sent["messages"].([]any)
 				first, _ := msgs[0].(map[string]any)
@@ -252,6 +301,94 @@ func TestDeepSeekSchemaAskedAsObjectUpfront(t *testing.T) {
 				}
 				if n := strings.Count(jsonOf(msgs), "matching this JSON schema"); n != 1 {
 					t.Fatalf("turn %d: schema told %d times", i, n)
+				}
+			}
+		})
+	}
+}
+
+// When the upstream turns json_object away as well, the schema is still
+// told, once, with no format field: the first turn retries twice, and
+// from then on the format goes in words from the start.
+func TestDeepSeekSchemaObjectRefusedToo(t *testing.T) {
+	for _, c := range []struct{ name, path, body string }{
+		{"chat passthrough", "/v1/chat/completions", strings.Replace(grokMemoryBody, `"deepseek-v4.1-flash"`, `"ds/deepseek-v4.1-flash"`, 1)},
+		{"responses rebuilt", "/v1/responses", strings.Replace(sdkResponsesParse, "%s", "ds/deepseek-v4.1-flash", 1)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fresh(t)
+			up := &formatRefuser{object: true}
+			srv := httptest.NewServer(up)
+			t.Cleanup(srv.Close)
+			if err := provider.Save(provider.Provider{ID: "ds", Name: "DeepSeek", Key: "k", Chat: srv.URL + "/v1", Models: []string{"deepseek-v4.1-flash"}}); err != nil {
+				t.Fatal(err)
+			}
+			h := New().Handler()
+			var firstLast []byte
+			for i, want := range []int{3, 4} {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest("POST", c.path, strings.NewReader(c.body)))
+				if rec.Code != 200 {
+					t.Fatalf("turn %d: status %d: %s", i, rec.Code, rec.Body.String())
+				}
+				bodies := up.all()
+				if len(bodies) != want {
+					t.Fatalf("turn %d: %d upstream requests, want %d", i, len(bodies), want)
+				}
+				sent := bodies[len(bodies)-1]
+				if rf, ok := sent["response_format"]; ok && rf != nil {
+					t.Fatalf("turn %d: response_format still sent: %s", i, jsonOf(rf))
+				}
+				if n := strings.Count(jsonOf(sent["messages"]), "matching this JSON schema"); n != 1 {
+					t.Fatalf("turn %d: schema told %d times: %s", i, n, jsonOf(sent["messages"]))
+				}
+				// the remembered turn sends what the first turn's last
+				// retry did, so the prefix it cached holds
+				b, _ := json.Marshal(map[string]any{"messages": sent["messages"], "instructions": sent["instructions"]})
+				if i == 0 {
+					firstLast = b
+				} else if !bytes.Equal(b, firstLast) {
+					t.Fatalf("turn 1 differs from turn 0's last retry:\n%s\n%s", firstLast, b)
+				}
+			}
+		})
+	}
+}
+
+// An upstream that takes the schema (OpenCode Go's deepseek-v4.1-flash
+// as of 2026-11-10) gets it once, as the client asked, with nothing told
+// in words.
+func TestDeepSeekSchemaAcceptedAsSent(t *testing.T) {
+	for _, c := range []struct{ name, path, body string }{
+		{"chat passthrough", "/v1/chat/completions", strings.Replace(grokMemoryBody, `"deepseek-v4.1-flash"`, `"ds/deepseek-v4.1-flash"`, 1)},
+		{"responses rebuilt", "/v1/responses", strings.Replace(sdkResponsesParse, "%s", "ds/deepseek-v4.1-flash", 1)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fresh(t)
+			up := &formatRefuser{none: true}
+			srv := httptest.NewServer(up)
+			t.Cleanup(srv.Close)
+			if err := provider.Save(provider.Provider{ID: "ds", Name: "OpenCode Go", Key: "k", Chat: srv.URL + "/v1", Models: []string{"deepseek-v4.1-flash"}}); err != nil {
+				t.Fatal(err)
+			}
+			h := New().Handler()
+			for i := range 2 {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest("POST", c.path, strings.NewReader(c.body)))
+				if rec.Code != 200 {
+					t.Fatalf("turn %d: status %d: %s", i, rec.Code, rec.Body.String())
+				}
+				bodies := up.all()
+				if len(bodies) != i+1 {
+					t.Fatalf("turn %d: %d upstream requests, want %d", i, len(bodies), i+1)
+				}
+				sent := bodies[i]
+				rf, _ := sent["response_format"].(map[string]any)
+				if rf["type"] != "json_schema" {
+					t.Fatalf("turn %d: response_format %s, want json_schema", i, jsonOf(sent["response_format"]))
+				}
+				if n := strings.Count(jsonOf(sent["messages"]), "matching this JSON schema"); n != 0 {
+					t.Fatalf("turn %d: schema told in words: %s", i, jsonOf(sent["messages"]))
 				}
 			}
 		})

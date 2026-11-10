@@ -6552,16 +6552,23 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		body, _, _ = withHistoryTools(proto, body)
 	}
 	// structured output an upstream turned away before (#2126): a schema
-	// as any JSON object, or the format told in the system prompt alone
-	// a schema to DeepSeek, which takes json_object only: asked for as an
-	// object from the start, the schema in a trailing system message
-	if proto == provider.Chat && chatTakesObjectOnly(p.Host(), model) {
-		body, _ = deepseekFormatBody(body)
-	}
+	// as any JSON object, or the format told in the system prompt alone.
+	// A DeepSeek-family Chat model keeps the conversation prefix and
+	// tells the schema in a trailing system message (deepseekFormatBody).
 	if !s.fits(p.ID, formatRefused(model), proto) {
+		// a DeepSeek-family Chat model is sent the body its first turn's
+		// last retry was (schema trailing, then no field), byte for byte,
+		// so that turn's cached prefix still holds
+		if proto == provider.Chat && chatSchemaTrails(p.Host(), model) {
+			body, _ = deepseekFormatBody(body)
+		}
 		body, _ = formatInBody(proto, body, false)
 	} else if !s.fits(p.ID, schemaRefused(model), proto) {
-		body, _ = formatInBody(proto, body, true)
+		if proto == provider.Chat && chatSchemaTrails(p.Host(), model) {
+			body, _ = deepseekFormatBody(body)
+		} else {
+			body, _ = formatInBody(proto, body, true)
+		}
 	}
 	// xAI's own API takes neither a sealed reasoning item's null content
 	// nor a system turn in Messages (xai_body.go, #3392)
@@ -6684,7 +6691,13 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		if !refusesFormat(res.StatusCode, b) {
 			break
 		}
-		nb, ok := formatInBody(proto, body, object)
+		var nb []byte
+		var ok bool
+		if object && proto == provider.Chat && chatSchemaTrails(p.Host(), model) {
+			nb, ok = deepseekFormatBody(body)
+		} else {
+			nb, ok = formatInBody(proto, body, object)
+		}
 		if !ok {
 			continue
 		}
@@ -7825,7 +7838,11 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		if req.Format != nil && !s.fits(p.ID, formatRefused(model), to) {
 			req = req.inSystem()
 		} else if req.Format != nil && to != provider.Anthropic && !s.fits(p.ID, schemaRefused(model), to) {
-			req = req.asObject()
+			if to == provider.Chat && chatSchemaTrails(p.Host(), model) {
+				req = req.asObjectTrail()
+			} else {
+				req = req.asObject()
+			}
 		}
 		if req.LastIsTurn && !req.Resume && req.endsWithAssistant() && !s.fits(p.ID, prefillRefused(model), to) {
 			// a model that takes no prefill is asked to answer after the
@@ -8141,9 +8158,14 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 				// a schema turned away by an upstream that takes any
 				// JSON object (DeepSeek; Xiaomi MiMo's Token Plan,
 				// #2126): asked again for an object, the schema in the
-				// system prompt, and so from then on
+				// system prompt (or a trailing system message for a
+				// DeepSeek-family Chat model), and so from then on
 				s.markUnfit(p.ID, schemaRefused(model), to)
-				req = req.asObject()
+				if to == provider.Chat && chatSchemaTrails(p.Host(), model) {
+					req = req.asObjectTrail()
+				} else {
+					req = req.asObject()
+				}
 				continue
 			}
 			// structured output turned away by the model or the relay in

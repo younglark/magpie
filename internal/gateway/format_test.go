@@ -206,8 +206,8 @@ func TestResponsesTextKeepsVerbosityBesideFormat(t *testing.T) {
 }
 
 // An upstream that turns a schema away but takes any JSON object
-// (Xiaomi MiMo's Token Plan, #2126; a DeepSeek model is asked for an
-// object from the start, TestDeepSeekSchemaAskedAsObjectUpfront) is asked again for an object, the schema in the
+// (Xiaomi MiMo's Token Plan, #2126; a DeepSeek-family model is retried
+// the same way, TestDeepSeekSchemaRetryAfterRefusal) is asked again for an object, the schema in the
 // system prompt; one that turns the object away too, with the format in
 // the system prompt alone. Each from then on, rather than the client
 // getting a 400 for a field the model could have been told in words.

@@ -552,12 +552,11 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	showSeen()
 	msgs, _ = withoutSilentAssistants(msgs)
 	msgs = pairToolMessages(msgs)
-	// DeepSeek's Chat takes response_format text or json_object only: a
-	// schema goes as a JSON object, the schema told in a system message
-	// of its own after the conversation, so the prefix the upstream
-	// cached is left as it was (deepseekSchemaLine)
-	objectOnly := r.Format != nil && r.Format.Type == "json_schema" && chatTakesObjectOnly(host, model)
-	if objectOnly {
+	// After a DeepSeek-family Chat upstream turned a schema away, the
+	// retry asks for a JSON object, the schema in a trailing system
+	// message so the prefix the upstream cached is left as it was
+	// (asObjectTrail, deepseekSchemaLine).
+	if r.Format != nil && r.Format.trail {
 		msgs = append(msgs, map[string]any{"role": "system", "content": deepseekSchemaLine(r.Format.Schema)})
 	}
 	out := map[string]any{"model": model, "messages": msgs, "stream": r.Stream}
@@ -644,9 +643,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 			out["parallel_tool_calls"] = *r.Parallel
 		}
 	}
-	if objectOnly {
-		out["response_format"] = map[string]any{"type": "json_object"}
-	} else if r.Format != nil {
+	if r.Format != nil {
 		out["response_format"] = r.Format.chat()
 	}
 	if r.WebSearch && host == "openrouter.ai" {

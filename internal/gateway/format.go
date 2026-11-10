@@ -29,6 +29,10 @@ type Format struct {
 	// told is a JSON object asked for in place of a schema the system
 	// prompt already holds (asObject).
 	told bool
+	// trail is a JSON object asked for in place of a schema, the schema
+	// told in a trailing system message (asObjectTrail) so the prefix the
+	// upstream cached is left as it was.
+	trail bool
 }
 
 // formatName is the name a schema goes under when the client's API names
@@ -134,7 +138,13 @@ func (r *Request) inSystem() *Request {
 	}
 	q := *r
 	q.Format, q.FormatTold = nil, true
-	if !r.Format.told {
+	switch {
+	case r.Format.trail:
+		// the schema was told only in the trailing system message
+		// buildChat adds for a trail format, which goes with the field:
+		// told in the system prompt instead (asObjectTrail)
+		q.System = withLine(q.System, (&Format{Type: "json_schema", Schema: r.Format.Schema}).instruction())
+	case !r.Format.told:
 		q.System = withLine(q.System, r.Format.instruction())
 	}
 	return &q
@@ -175,13 +185,31 @@ func (r *Request) asObject() *Request {
 	return &q
 }
 
-// chatTakesObjectOnly is whether a Chat upstream takes response_format
-// {type: "json_object"} but no json_schema: DeepSeek's API ("Must be one
-// of text or json_object", api-docs.deepseek.com/api/create-chat-completion)
-// and DeepSeek models on other hosts (OpenCode Go's deepseek-v4.1-flash),
-// the same family chatWantsThinkingType names. A schema is asked for as a
-// JSON object there from the start, not after a 400 (schemaRefused).
-func chatTakesObjectOnly(host, model string) bool { return chatWantsThinkingType(host, model) }
+// asObjectTrail is r asking for any JSON object, its schema told in a
+// trailing system message rather than folded into the first system
+// prompt, so the conversation prefix the upstream cached is left as it
+// was. r itself when it asks for no schema.
+func (r *Request) asObjectTrail() *Request {
+	if r.Format == nil || r.Format.Type != "json_schema" {
+		return r
+	}
+	q := *r
+	q.Format = &Format{Type: "json_object", Schema: r.Format.Schema, told: true, trail: true}
+	return &q
+}
+
+// chatSchemaTrails is whether a schema a Chat upstream turned away is
+// asked for again as a JSON object with the schema in a trailing system
+// message (asObjectTrail, deepseekFormatBody) rather than folded into
+// the first system prompt. The family once known to take
+// response_format {type: "json_object"} but no json_schema:
+// DeepSeek's official API ("Must be one of text or json_object",
+// api-docs.deepseek.com/api/create-chat-completion) and DeepSeek-named
+// models on other hosts (OpenCode Go's deepseek-v4.1-flash), the same
+// family chatWantsThinkingType names. A schema is sent as the client
+// asked first; only after a 400 (schemaRefused) is it asked for as a
+// JSON object, the schema in a trailing system message.
+func chatSchemaTrails(host, model string) bool { return chatWantsThinkingType(host, model) }
 
 // deepseekSchemaLine is a schema said in words for DeepSeek's JSON Output,
 // which wants the word "json" in a system or user message and the shape
@@ -211,9 +239,9 @@ func canonicalJSON(raw json.RawMessage) []byte {
 	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
 }
 
-// deepseekFormatBody is a Chat body passed through to a chatTakesObjectOnly
-// upstream asking for a json_schema made to ask for any JSON object, the
-// schema told in a system message appended after the conversation
+// deepseekFormatBody is a Chat body asking for a json_schema rewritten,
+// after the upstream turned the schema away, to ask for any JSON object,
+// the schema told in a system message appended after the conversation
 // (deepseekSchemaLine): the messages before it are left as the client
 // sent them, so the upstream's cached prefix still holds. The body and
 // false when it asks for no schema.
