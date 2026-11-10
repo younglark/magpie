@@ -286,6 +286,7 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	in.Port = cur.Port                                 // set on its own (port), which moves the gateway
 	in.CORSOrigins = cur.CORSOrigins                   // set on its own (cors)
 	in.AllowIPs = cur.AllowIPs                         // set on its own (allowips)
+	in.MTLS = cur.MTLS                                 // set on its own (mtls)
 	in.FetchPrivate = cur.FetchPrivate                 // in settings.json only
 	in.RouterNote = cur.RouterNote                     // set on its own (the Library's servers/hub-note)
 	in.RouterAllTools = cur.RouterAllTools             // set on its own (the Library's servers/hub-tools)
@@ -328,6 +329,7 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	in.ClientAgents = cur.ClientAgents
 	// how agents' lists name models, set on its own for the agents to be told
 	in.PlainNames, in.PlainOwnNames = cur.PlainNames, cur.PlainOwnNames
+	in.AgentSuffix = cur.AgentSuffix   // and each agent's own (agent-suffix)
 	in.BareModelIDs = cur.BareModelIDs // set on its own (bare-ids)
 	in.BusyLoad = cur.BusyLoad         // and so is this (busy-load)
 	in.CodexAgentsV1 = cur.CodexAgentsV1
@@ -352,6 +354,7 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	// in their Agents rows
 	in.CodexSubagentModel = cur.CodexSubagentModel
 	in.DesktopSubagentModel = cur.DesktopSubagentModel
+	in.CodexServiceTier = cur.CodexServiceTier // codex-service-tier
 	// and the model DeepSeek Harness compacts on, set in its row
 	in.DshCompactModel = cur.DshCompactModel
 	// and the model for requests masking would change (redact-route)

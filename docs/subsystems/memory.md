@@ -93,11 +93,20 @@ agents ticked under Instructions, unless `Instructions.NoMemory`
 | `GET /api/memory` | `{memories, projects, digest, agents}` |
 | `POST /api/memory` | `{id?, …Input}`: `Edit` with an id, else `Save` as the user's |
 | `POST /api/memory/remove` | `{ids}` |
+| `POST /api/memory/status` | `{ids, status}`: `SetStatus`, in one write, as `Edit` by the user per memory (`TestSetStatusOfSome`, `TestMemoryStatusRouteActsOnSome`) |
 | `POST /api/memory/digest` | `{on}` |
 
 A reply after a change carries `problem` when publishing the digest
 failed. The tab is in [plugins/library/client.js](../../internal/gui/assets/plugins/library/client.js)
 (`renderMemory`), tested by `internal/gui/tests/library-memory.test.cjs`.
+Its Select puts a box on each memory listed: a click picks one, a
+Shift-click the range from the last one clicked, ↑ ↓ move between the
+boxes (Shift picks as it goes), ⌘A / Ctrl+A picks every one shown, Escape
+ends it. The bar under the list keeps (To review), archives (In use) or
+restores (Archived) the ones picked through `/api/memory/status`, and
+deletes them on a second click through `/api/memory/remove`; a search or
+filter unpicks what it hides (RealZeroP27 on X,
+`library-memory-select.test.cjs`).
 
 ### Distillation
 
@@ -110,11 +119,20 @@ further (`State.Since`), unless a range is picked.
   (`memdistill.All`, -1); 0 is the 7-day default, so a state from before
   the picker keeps its own `Since` until a range is picked
   (`TestRangePicked`). Every range reads from the latest 400 conversations
-  (`Listed`) at 10 an hour (`PerRun`), so All costs at most ~240 requests
-  a day until the backlog is read; the picker's All says so.
+  (`Listed`).
+- A backlog is read at once when the user asks (`ReadAll`, through
+  `distillNow`): switched on, a model or a longer range picked, Read now.
+  It reads every conversation due, one request at a time, and the row
+  shows how far it has gone (`Progress`, `doing` of `of` in the view)
+  with a Stop (`Stop`, `POST /api/memory/distill/stop`; switching off
+  stops it too). A stop or a failure leaves the rest for the next run,
+  and the row says how many (`State.Left`) (`TestBacklogReadAtOnce`,
+  `TestStopEndsTheRun`). Before, every run read 10, and 400 took 40
+  hours (RealZeroP27 on X).
 - State is `distill.json` beside `memory.json` (`memdistill.Path`):
   the switch, the model, the reasoning level, the range, the
-  conversations done, and the last run's time, counts and error. A
+  conversations done, and the last run's time, counts, error and how
+  many it left. A
   conversation's mark is dropped once it is before `Since`, or older
   than 30 days and past the oldest conversation listed; before that a
   conversation older than 30 days was read again every hour
@@ -123,7 +141,7 @@ further (`State.Since`), unless a range is picked.
   (`TestUnreadableStateRunsNothing`).
 - `Keep` runs 5 minutes after the GUI backend starts, then hourly
   (`keepDistilling` in `internal/gui/memory_distill.go`). `Run` takes at
-  most 10 conversations (`PerRun`) quiet for 30 minutes (`Quiet`) with at
+  most 30 conversations (`PerRun`, more than a busy hour brings) quiet for 30 minutes (`Quiet`) with at
   least two turns, and skips the gateway's own records, read-only
   agents, subagent sessions and its own agent (`memory`). One run at a
   time, in this process and across processes (`.run` lock).
@@ -204,5 +222,5 @@ mote-run go test ./internal/memory ./internal/memdistill ./internal/library
 mote-run go test -run 'Distill|Dream' ./internal/gui
 mote-run go test -tags nogui -run 'MemoryMCP|OwnMCP' ./internal/gateway
 mote-run go test ./internal/browsermcp ./internal/cli
-mote-run node --test internal/gui/tests/library-memory.test.cjs
+mote-run node --test internal/gui/tests/library-memory.test.cjs internal/gui/tests/library-memory-select.test.cjs
 ```

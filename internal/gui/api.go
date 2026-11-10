@@ -235,6 +235,9 @@ type agentJSON struct {
 	// Isolated: Claude Desktop's Claude Magpie app (#5671), only where it
 	// can be (macOS): whether it is on, and the app
 	Isolated *agent.DesktopIsolated `json:"isolated,omitempty"`
+	// Telemetry: the agent's own telemetry to its vendor, where magpie
+	// knows the switch for it (agent/telemetry.go)
+	Telemetry *agent.TelemetryState `json:"telemetry,omitempty"`
 	// Joined: connected with its own models still in its list (Codex
 	// signed in with ChatGPT, agent.Agent.Join)
 	Joined bool `json:"joined,omitempty"`
@@ -418,6 +421,12 @@ type settingsJSON struct {
 	AllowIPsEnv     string   `json:"allowIPsEnv,omitempty"`
 	AllowIPsFromEnv []string `json:"allowIPsFromEnv,omitempty"`
 	OnNetwork       bool     `json:"onNetwork,omitempty"`
+	// the client certificates issued and still good (mtls.go), while
+	// other computers can reach magpie or mTLS is on; MTLSSaved: the
+	// folder the one just issued was saved to
+	MTLSCerts []mtlsCert `json:"mtlsCerts,omitempty"`
+	MTLSErr   string     `json:"mtlsError,omitempty"`
+	MTLSSaved string     `json:"mtlsSaved,omitempty"`
 	// Dir is the data folder beside a portable magpie (#508)
 	Portable bool `json:"portable,omitempty"`
 	// Log is the log the desktop app writes (applog), as shown; "" for a
@@ -444,7 +453,9 @@ type settingsJSON struct {
 	// it is served by magpie web, where the mode can be set
 	GatewayOn  bool   `json:"gatewayOn,omitempty"`
 	GatewayWhy string `json:"gatewayWhy,omitempty"`
-	Web        bool   `json:"web,omitempty"`
+	// GatewayPaused: the user paused the gateway (gatewaypause.go)
+	GatewayPaused bool `json:"gatewayPaused,omitempty"`
+	Web           bool `json:"web,omitempty"`
 	// the proxy vendor requests go through now, and where it came from:
 	// settings, environment, system, off or none
 	ProxyNow    string `json:"proxyNow"`
@@ -815,6 +826,9 @@ func settingsState() settingsJSON {
 	if list, env := gateway.AllowIPs(); env {
 		s.AllowIPsEnv, s.AllowIPsFromEnv = os.Getenv(gateway.AllowIPsEnv), list
 	}
+	if s.LAN || s.OnNetwork || s.MTLS {
+		s.MTLSCerts, s.MTLSErr = mtlsCerts()
+	}
 	if s.LAN || gateway.OnNetwork() {
 		s.PublicURL = gateway.PublicURL()
 		s.PublicKind = gateway.URLKind(s.PublicURL)
@@ -822,6 +836,7 @@ func settingsState() settingsJSON {
 	s.WSL = runtime.GOOS == "windows"
 	s.Web = webPage.Load()
 	s.GatewayOn, s.GatewayWhy = gatewayMode(s.Web)
+	s.GatewayPaused = pausedNow()
 	s.LANKey = "" // the retained credential belongs on disk, not in UI state
 	// the GitHub token, masked, and where the library's requests take one
 	// from: Settings, or the environment variable named
@@ -1228,6 +1243,9 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			fail(rw, err)
 			return
 		}
+		if !wired {
+			resumeOnWire(a)
+		}
 		s := state()
 		if a.Notice != nil && (!f.Live || !wired && a.Wired()) {
 			s.Notice = a.Notice()
@@ -1319,6 +1337,24 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		home, _ := os.UserHomeDir()
 		if _, err := agent.SetDesktopIsolated(home, in.On); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, state())
+	})
+	// an agent's own telemetry off, or back (agent/telemetry.go)
+	mux.HandleFunc("POST /api/agents/telemetry/{id}", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Off bool }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		a, err := agent.Find(r.PathValue("id"))
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := a.SetTelemetry(in.Off); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -1418,6 +1454,9 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			var c agent.Connection
 			c, err = a.ConnectHow()
 			how = &c
+			if err == nil {
+				resumeOnWire(a)
+			}
 		case "disconnect":
 			err = a.Disconnect()
 		default:
@@ -1495,6 +1534,8 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	sessionRoutes(mux, w)
 	sessionManageRoutes(mux, w)
 	backupRoutes(mux, w)
+	dataFolderRoutes(mux, w)
+	mtlsRoutes(mux, w)
 	uninstallRoutes(mux, w)
 	archiveRoutes(mux)
 	libraryRoutes(mux, w)
@@ -1503,9 +1544,11 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	cliBehindRoutes(mux)
 	configRepairRoutes(mux, !isWeb(w))
 	gatewayFixRoutes(mux)
+	gatewayPauseRoutes(mux)
 	gatewayModeRoutes(mux)
 	if !isWeb(w) {
 		appPageRoutes(mux)
+		remoteRoutes(mux, w)
 	}
 	privacyModelRoutes(mux)
 	maskingRoutes(mux)
@@ -1832,6 +1875,25 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		writeJSON(rw, settingsState())
 	})
+	// an agent's own Provider in model names (settings.AgentSuffix): Mode
+	// "" follows the one for every agent again
+	mux.HandleFunc("POST /api/settings/agent-suffix", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Agent, Mode string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		a, err := agent.Find(in.Agent)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := provider.SetAgentSuffix(a.ListsFor(), in.Mode); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
 	// takes out of Codex's config the keys it reads before Long
 	// conversations (agent.CodexCompactHeld), on the user's click
 	mux.HandleFunc("POST /api/settings/codex-compact-held/drop", func(rw http.ResponseWriter, r *http.Request) {
@@ -1991,6 +2053,20 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			}
 		}
 		if err := provider.SetCodexAutoReview(v); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// the service tier every request of Codex's goes at (JackyFill on X):
+	// "" as Codex asks it, "default" with none, "priority" or "ultrafast"
+	mux.HandleFunc("POST /api/settings/codex-service-tier", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Tier string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := provider.SetCodexServiceTier(in.Tier); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -2841,6 +2917,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	})
 	agentModelsAPI(mux)
 	speedsAPI(mux)
+	modelPriceRoutes(mux)
 	devListen(mux)
 	return noFramedAPI(held(mux))
 }
@@ -2953,6 +3030,13 @@ func state() stateJSON {
 			if iso, ok := agent.DesktopIsolatedHere(); ok {
 				aj.Isolated = &iso
 			}
+		}
+		if a.Telemetry != nil {
+			st, err := a.Telemetry.Get()
+			if err != nil {
+				st.Error = err.Error()
+			}
+			aj.Telemetry = &st
 		}
 		if a.Import != nil {
 			aj.Import = a.Import()

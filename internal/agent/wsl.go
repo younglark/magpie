@@ -514,6 +514,17 @@ var wslKinds = []wslKind{
 			}
 			return nil
 		}},
+	// mu, Pi's files in ~/.mu/agent: the distro's variables that move it
+	// and its old ~/.kyrn aren't read. No bin: mu is maildir-utils' too
+	{id: "mu", name: "mu", dir: ".mu/agent", in: muIn,
+		asleep: func(key string) func(map[string]string) []Option {
+			if key == "model" {
+				return func(cur map[string]string) []Option {
+					return withVia(ownOptions("", cur["model"]), "mu", magpieID+"/")
+				}
+			}
+			return nil
+		}},
 	{id: "stepcode", name: "StepCode", dir: ".stepcode", in: stepcodeIn,
 		asleep: wslOwnAsleep("stepcode", "model")},
 	// only its settings.json: its sign-in, sessions and prompt history,
@@ -562,7 +573,9 @@ var wslKinds = []wslKind{
 	// this machine, at their default folders: the distro's variables that
 	// move them (OPENCODE_CONFIG_DIR, KIMI_CODE_HOME, HERMES_HOME, …)
 	// aren't read. Each one's restart advice is its own Notice's.
-	{id: "opencode", name: "OpenCode", dir: ".config/opencode", bin: "opencode", in: opencodeIn,
+	// its version says whether its config is written in OpenCode 2's words
+	// (ocFile)
+	{id: "opencode", name: "OpenCode", dir: ".config/opencode", bin: "opencode", in: opencodeIn, version: true,
 		restart: newNotice("{agent} in WSL {distro} reads its config at start-up — restart open opencode sessions to use this."),
 		asleep:  wslOwnAsleep("opencode", "model", "small")},
 	{id: "mimocode", name: "MiMo Code", dir: ".config/mimocode", bin: "mimo", in: mimocodeIn,
@@ -686,6 +699,10 @@ var wslKinds = []wslKind{
 	// no bin: nanobot is other tools' name too
 	{id: "nanobot", name: "nanobot", dir: ".nanobot", in: nanobotIn,
 		restart: newNotice("{agent} in WSL {distro}: its gateway and WebUI take this at their next reply; restart an open `nanobot agent` chat to use it there.")},
+	{id: "paimon", name: "Paimon", dir: ".config/paimon", bin: "paimon", in: paimonIn,
+		restart: newNotice("{agent} in WSL {distro} reads its model at start-up — restart open paimon sessions there to use this.")},
+	{id: "miniq", name: "miniQ", dir: ".local/share/miniq", bin: "miniq", in: miniqIn,
+		restart: newNotice("{agent} in WSL {distro}: magpie tells its running daemon; if it still answers with the old model, restart miniQ there.")},
 	// Ante ships macOS and Linux builds alone, and suggests WSL on Windows,
 	// so a Windows machine's Ante is usually this one
 	{id: "ante", name: "Ante", dir: ".ante", bin: "ante", in: anteIn,

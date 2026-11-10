@@ -6,7 +6,6 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -61,6 +60,9 @@ func TokenFor(agent string) string { return Token + "-" + agent }
 // agentOf is the agent a request came from: the one its token names
 // (TokenFor), else the one its User-Agent does.
 func agentOf(r *http.Request) string {
+	if id := pathAgent(r); id != "" {
+		return id
+	}
 	if id, ok := strings.CutPrefix(callerKey(r), Token+"-"); ok && id != "" {
 		return usage.AgentOf(id)
 	}
@@ -115,6 +117,9 @@ func codexForClaudeCode(h http.Header) bool {
 // came with the plain gateway token, not one magpie gave an agent, and
 // its User-Agent names no agent.
 func startedByAgent(r *http.Request, agent string) bool {
+	if pathAgent(r) != "" {
+		return false
+	}
 	if _, ok := strings.CutPrefix(callerKey(r), Token+"-"); ok {
 		return false
 	}
@@ -570,7 +575,7 @@ type Server struct {
 	// sockets are the Responses WebSockets being served (responses_ws.go)
 	sockets clientSockets
 	// what it serves other computers TLS with, nil without (tls.go)
-	tls *tls.Config
+	tls *tlsServer
 	// the images described for models that can't see them (vision.go);
 	// completed inline descriptions also survive a restart (vision_cache.go)
 	sightMu        sync.Mutex
@@ -781,7 +786,7 @@ var WhileServing []func(context.Context)
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	migrateLANKeyBestEffort()
 	ScopeOwnBrowserKey()
-	cfg, err := tlsConfig()
+	cfg, err := serverTLS()
 	if err != nil {
 		return err
 	}
@@ -1636,7 +1641,7 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 		} else if agent == ScienceID {
 			data = scienceModels(shown)
 		} else {
-			labels := provider.Labels(shown)
+			labels := provider.LabelsFor(agent, shown)
 			// for another magpie: how it searches the web for each model
 			magpie := r.Header.Get(provider.DrawersHeader) != ""
 			searches := magpie && canSearch()
@@ -1707,7 +1712,17 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 				// plain, so two providers' models of one name are told apart
 				// there as they are here
 				m["magpie_label"] = labels[i]
-				if agentOf(r) == "cursor-local" {
+				// for DeepSeek Harness: the same name as its name. Its
+				// Models page's model discovery (llm-pi-ai's readListing)
+				// names a row by name, then display_name, and display_name
+				// is the name alone, so two providers' models of one name
+				// read the same there, Kimi-K3.1-Pro of WorkBuddy and of
+				// Qoder CN (LeiWang_2000 on X), where the route magpie
+				// writes for it names them as its list does (dshKindConfig)
+				if agent == "dsh" {
+					m["name"] = labels[i]
+				}
+				if agent == "cursor-local" {
 					cursorLocalModel(m, e)
 				}
 				data = append(data, m)
@@ -1728,7 +1743,7 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 		for i := range deciders {
 			deciders[i].Name = cmp.Or(deciders[i].Name, deciders[i].Model)
 		}
-		labels := provider.Labels(deciders)
+		labels := provider.LabelsFor(agentOf(r), deciders)
 		for i, e := range deciders {
 			m := modelObject(e)
 			m["kind"], m["magpie_label"] = "decision", labels[i]
@@ -1768,7 +1783,7 @@ func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 			if agentOf(r) == ScienceID {
 				// by the alias it asked by, which it keeps what it reads
 				// under
-				writeJSON(w, 200, scienceObject(e, provider.Labels([]provider.Entry{e})[0]))
+				writeJSON(w, 200, scienceObject(e, provider.LabelsFor(ScienceID, []provider.Entry{e})[0]))
 				return
 			}
 			writeJSON(w, 200, pricedModelObject(r, e))
@@ -2108,6 +2123,9 @@ func (s *Server) handle(from provider.Protocol) http.HandlerFunc {
 		// (Gearclickist on Discord)
 		if from == provider.Responses && (fromCodex(r.Header) || agentOf(r) == "codex") {
 			body = spawnAgentModels(r, body, model, false)
+			// the service tier set for Codex, in place of the one it
+			// asked (codexTiered)
+			body = codexTiered(r, body, model)
 		}
 		if from == provider.Chat {
 			body = thinkingEffort(body)
@@ -2508,6 +2526,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		asked = m
 		move(m, movedDshCompact)
 	}
+	// and, its provider out of its limit, on the same model from another
+	// provider: DSH compacts on the model it switches away from
+	if m := s.dshCompactElsewhere(r, agent, call.Kind, asked, from); m != "" {
+		asked = m
+		move(m, movedDshCompactRested)
+	}
 	// a Codex subagent on the model set for Codex's subagents, whatever
 	// its lead asked for (willz on Discord), and a Claude Desktop
 	// subagent's tool turn on the one set for Desktop's; one already put
@@ -2901,13 +2925,18 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			return kept
 		}
 		cands, pl = s.planPaused(p, model, from, pausedIn)
-		if len(cands) == 0 && len(pl.capped) > 0 && !p.CapStop || handedOnOf(r) != nil {
+		if len(cands) == 0 && len(pl.capped) > 0 && !p.CapStop && !namedProvider(r, call.Model) || handedOnOf(r) != nil {
 			// every account held at the usage cap the user set, or Codex's
 			// own sign-in handed on (codexFallBack), and no fallback left:
 			// the groups the user built with this model in them go on from
 			// it, as a request to the group would (the Codex app asks
-			// Codex's own model, never the group)
-			if q, ok := groupsAfter(p, model); ok {
+			// Codex's own model, never the group). Not for a request that
+			// named the provider itself ("claude/…", another magpie's
+			// call): that one is answered the cap's 429 unless the
+			// provider has fallbacks of its own (Anotiaww on X)
+			// Codex's auto-review on codex-auto-review, which no group has,
+			// goes on where its conversation's turns go (codexReviewAfter)
+			if q, ok := groupsAfter(p, model, s.codexReviewAfter(r, p, model, body)...); ok {
 				cands, pl = s.planPaused(q, model, from, pausedIn)
 			}
 		}
@@ -2915,6 +2944,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// Codex's own sign-in, asked as often as it is asked: only
 			// the fallbacks are left (codexFallBack)
 			cands, pl = fallbacksOnly(cands, pl, p.ID, model)
+			if lead := s.codexReviewLead(r, p, model, body); lead != "" && !strings.Contains(lead, "/") {
+				// and an auto-review's, on the conversation's model through
+				// that same sign-in, in a group it goes on to
+				cands, pl = fallbacksOnly(cands, pl, p.ID, lead)
+			}
 		}
 		if provider.IsFastPick(agent, p.ID+"/"+model) {
 			// the agent's pick of it is sent in its vendor's fast mode
@@ -8023,7 +8057,14 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			p.Chat = strings.TrimSuffix(p.Chat, "/v1")
 			path = "/beta" + path
 		}
-		res, err := s.forward(ctx, p, to, path, p.Prepare(body), in)
+		fctx := ctx
+		if p.IsPlugin() && req.Effort != "" {
+			// the effort picked, which a plugin's model with variants is
+			// told in X-Magpie-Effort: the body says only what Gemini's
+			// thinkingConfig can, and loses minimal and xhigh
+			fctx = provider.WithEffort(ctx, req.Effort)
+		}
+		res, err := s.forward(fctx, p, to, path, p.Prepare(body), in)
 		if err != nil || res.StatusCode < 400 {
 			if dropped && err == nil {
 				// it was the key: not sent there again

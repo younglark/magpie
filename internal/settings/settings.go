@@ -45,6 +45,15 @@ const CodexAutoReviewSession = "session"
 // names for it in spawn_agent.
 const CodexSubagentLead = "lead"
 
+// CodexTierStandard is the CodexServiceTier that sends Codex's requests
+// with no service tier, the standard one, whatever Codex asked; the
+// sentinel codex-rs itself uses for that (SERVICE_TIER_DEFAULT_REQUEST_VALUE).
+const CodexTierStandard = "default"
+
+// CodexServiceTiers are the values CodexServiceTier may take, "" (as
+// Codex asks) first.
+var CodexServiceTiers = []string{"", CodexTierStandard, "priority", "ultrafast"}
+
 // Settings is what the user chose. "" and "system" both mean "follow the OS".
 type Settings struct {
 	Theme string `json:"theme,omitempty"` // system | light | dark
@@ -220,6 +229,13 @@ type Settings struct {
 	// its place (gateway.AllowIPs). This computer's own (KeepOwn), as LAN
 	// is: the addresses are of the network this computer is on.
 	AllowIPs []string `json:"allowIPs,omitempty"`
+	// MTLS has other computers show a client certificate magpie issued
+	// (`magpie mtls`, Settings → Network and sharing) before anything is
+	// answered (hhdaxia on X, #5596): the gateway and magpie web's page
+	// are served over TLS with magpie's own CA, and a remote request
+	// without a good certificate is refused. This computer's own
+	// (KeepOwn), as LAN is.
+	MTLS bool `json:"mtls,omitempty"`
 	// FetchPrivate are the private hosts and ranges (a name, name:port, an
 	// IP or a CIDR range) magpie may download a URL from that it didn't
 	// choose itself: an image or video a request names or a vendor answers
@@ -703,6 +719,11 @@ type Settings struct {
 	// it (#92: "Opus 5.5", not "Opus 5.5 · Claude Code"), the vendor's names
 	// keeping their provider's after them (see provider.Labels).
 	PlainOwnNames bool `json:"plainOwnNames,omitempty"`
+	// AgentSuffix is an agent's own Provider in model names, by the id
+	// its lists are kept by (lower-cased): "on", "own" or "off", over
+	// PlainNames and PlainOwnNames for that agent alone (KillTry27355 on
+	// X). An agent it doesn't name follows those two (provider.LabelsFor).
+	AgentSuffix map[string]string `json:"agentSuffix,omitempty"`
 	// BareModelIDs has the gateway's /v1/models list each model by its id
 	// without the provider as well ("gpt-5.6-sol" beside
 	// "codex/gpt-5.6-sol"), for clients moved from another proxy that ask
@@ -758,6 +779,13 @@ type Settings struct {
 	// lead asked for; CodexSubagentLead puts each on the model its lead's
 	// own turns go on, even when the lead names another.
 	CodexSubagentModel string `json:"codexSubagentModel,omitempty"`
+	// CodexServiceTier is the service tier the gateway puts on every
+	// request Codex sends, whatever Codex asked (JackyFill on X): "" as
+	// Codex asks it (its /fast, Ultra Fast or neither), CodexTierStandard
+	// with no tier at all, "priority" (Codex's Fast) or "ultrafast" (its
+	// Ultra Fast). Codex's words, as codex-rs ServiceTier::request_value
+	// sends them; its Flex is not offered, the ChatGPT backend takes none.
+	CodexServiceTier string `json:"codexServiceTier,omitempty"`
 	// DesktopSubagentModel is the model the gateway puts Claude Desktop's
 	// subagent tool turns on. "" leaves them on the model their lead asks
 	// for; tool-less helpers and the lead's own turns are never moved.
@@ -1499,7 +1527,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.NoWSLAgents = cur.NoWSLAgents
 	s.QuotaReads = cur.QuotaReads
 	s.NoAccountDiscovery = cur.NoAccountDiscovery
-	s.LAN, s.AllowIPs = cur.LAN, cur.AllowIPs
+	s.LAN, s.AllowIPs, s.MTLS = cur.LAN, cur.AllowIPs, cur.MTLS
 	s.RouterNote, s.RouterAllTools = cur.RouterNote, cur.RouterAllTools
 	s.FetchPrivate = cur.FetchPrivate
 	s.SessionTerminal = cur.SessionTerminal
@@ -1990,6 +2018,18 @@ func SetGatewayConversations(on bool) error {
 	return save(s, true)
 }
 
+// SetMTLS sets MTLS alone, from what the file holds now. A settings file
+// that can't be read is left as it is, with the error.
+func SetMTLS(on bool) error {
+	defer lockFile()()
+	s, err := loadChecked()
+	if err != nil {
+		return err
+	}
+	s.MTLS = on
+	return save(s, false)
+}
+
 // SetQuitNoAsk sets QuitNoAsk alone, from what the file holds now (the
 // Quit question's "Don't ask again"). A settings file that can't be read
 // is left as it is, with the error.
@@ -2336,6 +2376,10 @@ func saveOwn(s Settings, recording, reads bool) error {
 	s.CodexSubagentModel = strings.TrimSpace(s.CodexSubagentModel)
 	if s.CodexSubagentModel != "" && s.CodexSubagentModel != CodexSubagentLead && !strings.Contains(s.CodexSubagentModel, "/") {
 		return fmt.Errorf("the model for Codex's subagents must be a model's id such as codex/gpt-5.5, not %q", s.CodexSubagentModel)
+	}
+	s.CodexServiceTier = strings.TrimSpace(s.CodexServiceTier)
+	if !slices.Contains(CodexServiceTiers, s.CodexServiceTier) {
+		return fmt.Errorf("Codex's service tier must be one of %q, not %q", CodexServiceTiers[1:], s.CodexServiceTier)
 	}
 	s.RedactRouteTo = strings.TrimSpace(s.RedactRouteTo)
 	if s.RedactRouteTo != "" && !strings.Contains(s.RedactRouteTo, "/") {
