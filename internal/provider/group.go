@@ -25,13 +25,13 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"regexp"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -383,6 +383,11 @@ type Member struct {
 	// Fast is set on a member the group sends in its vendor's fast mode
 	// (Group.Fast), where its model has one.
 	Fast bool
+	// Account is the one account or key of Provider the member is sent
+	// on, "<provider>/<stable id>", as Group.Accounts has them
+	// ("provider/model#<id>", groupaccount.go); "" for every one the
+	// groups it is in allow.
+	Account string
 	// At is where the walk down the group met it, counting every model of
 	// every group in it, the same model's later places too: a group's own
 	// models are met in its own order.
@@ -449,7 +454,7 @@ func (m Member) Groups() []string {
 // Below is the member as the group at depth (0 the group itself, 1 the
 // group in it Path[0] names, …) has it.
 func (m Member) Below(depth int) Member {
-	out := Member{ID: m.Path[depth], Path: m.Path[depth:], Via: m.Via[depth:], Provider: m.Provider, Model: m.Model, Effort: m.Effort, Levels: m.Levels, EffortMap: m.EffortMap, Fast: m.Fast, At: m.At}
+	out := Member{ID: m.Path[depth], Path: m.Path[depth:], Via: m.Via[depth:], Provider: m.Provider, Model: m.Model, Effort: m.Effort, Levels: m.Levels, EffortMap: m.EffortMap, Fast: m.Fast, Account: m.Account, At: m.At}
 	// its other places in the same group at depth
 	for _, o := range m.Also {
 		if len(o.Path) > depth && slices.Equal(o.Path[:depth], m.Path[:depth]) {
@@ -528,6 +533,7 @@ func cloneGroups(gs []Group) []Group {
 			rs := make([]Rule, len(g.Rules))
 			for j, r := range g.Rules {
 				r.Agents, r.Folders, r.ExceptFolders, r.More = slices.Clone(r.Agents), slices.Clone(r.Folders), slices.Clone(r.ExceptFolders), slices.Clone(r.More)
+				r.Where = slices.Clone(r.Where)
 				if r.Time != nil {
 					t := *r.Time
 					t.Days = slices.Clone(t.Days)
@@ -722,6 +728,7 @@ func (g Group) own() Group {
 		g.Rules[i].Folders = slices.Clone(r.Folders)
 		g.Rules[i].ExceptFolders = slices.Clone(r.ExceptFolders)
 		g.Rules[i].More = slices.Clone(r.More)
+		g.Rules[i].Where = slices.Clone(r.Where)
 		if r.Time != nil {
 			w := *r.Time
 			w.Days = slices.Clone(w.Days)
@@ -784,7 +791,7 @@ func SetAutoGroups(on bool) error {
 // vendor spells it: "auto-claude-opus-5-5" for claude-opus-5.5.
 func AutoGroupID(model string) string { return "auto-" + Slug(sameModel(model)) }
 
-var groupDots = regexp.MustCompile(`\.{2,}`)
+var groupDots = lazyre.New(`\.{2,}`)
 
 // GroupSlug derives a group's own id from a name as Slug does, the dots
 // kept: "GPT 6.1 Sol" → "gpt-6.1-sol", so an agent sending group/<id> sends
@@ -1242,13 +1249,19 @@ func membersOff(entries []Entry, all []Group, g Group, off func(pid, model strin
 // most of what the Providers page spent on groups. A model also says is
 // the group's whatever p's picks are (FindDrawingGroup); nil for none.
 func membersFound(entries []Entry, find entryOf, all []Group, g Group, off func(pid, model string) bool, also func(p Provider, model string) bool) []Member {
-	var out []Member
-	seen := map[string]int{} // where in out
+	// made at the group's own count: a Member is large, and growing out
+	// by append was 9 MB of what forty polls of the Providers page
+	// allocated with real accounts. A group in it can add more.
+	n := len(g.Members)
+	if g.Routing == Manual {
+		n = 1
+	}
+	out := make([]Member, 0, n)
+	seen := make(map[string]int, n) // where in out
 	at := 0
 	var walk func(g Group, path []string, via []Group, in []string)
 	walk = func(g Group, path []string, via []Group, in []string) {
 		for _, id := range g.routes() {
-			here := append(slices.Clone(path), id)
 			if gid, ok := strings.CutPrefix(id, GroupPrefix); ok {
 				sub, ok := groupOf(all, gid)
 				if !ok || sub.Disabled || slices.Contains(in, gid) || len(via) >= maxNest {
@@ -1257,17 +1270,24 @@ func membersFound(entries []Entry, find entryOf, all []Group, g Group, off func(
 				// its own copy: all may be the groups held (sharedGroupsIn),
 				// and a member's Via and EffortMap are its caller's
 				sub = cloneGroup(sub).Within(g)
-				walk(sub, here, append(slices.Clone(via), sub.Live()), append(slices.Clone(in), gid))
+				walk(sub, append(slices.Clone(path), id), append(slices.Clone(via), sub.Live()), append(slices.Clone(in), gid))
 				continue
 			}
 			model, effort := memberEffortIn(entries, id)
 			p, m, ok := resolveIn(entries, model)
-			key := WithMemberEffort(p.ID+"/"+m, effort)
 			if !ok || unpicked(find, p, m) && (also == nil || !also(p, m)) {
 				continue // none serves it, or the user unchecked it (#3911)
 			}
+			// on one account of its own (EastonXvii on X): the same model
+			// on another account is another member, asked in its own place
+			_, acct := MemberAccount(id)
+			if acct != "" {
+				acct = p.ID + "/" + acct
+			}
+			key := WithMemberAccount(WithMemberEffort(p.ID+"/"+m, effort), acct)
+			here := append(slices.Clone(path), id)
 			fixed, levels := MemberLevels(effort)
-			mem := Member{ID: here[0], Path: here, Via: via, Provider: p, Model: m, Effort: fixed, Levels: levels, Fast: g.IsFast(id), At: at}
+			mem := Member{ID: here[0], Path: here, Via: via, Provider: p, Model: m, Effort: fixed, Levels: levels, Fast: g.IsFast(id), Account: acct, At: at}
 			if fixed == "" && levels == nil {
 				mem.EffortMap = g.MemberEffortMap(id)
 			}
@@ -1286,6 +1306,9 @@ func membersFound(entries []Entry, find entryOf, all []Group, g Group, off func(
 		}
 	}
 	walk(g, nil, nil, []string{g.ID})
+	if len(out) == 0 {
+		return nil // none, as before it was made at its size
+	}
 	return out
 }
 
@@ -1692,6 +1715,9 @@ func SaveGroup(g Group) error {
 	named := len(g.Members)
 	g.Members = append(g.Members, matchesIn(entries, g)...)
 	if err := cleanFast(entries, &g); err != nil {
+		return err
+	}
+	if err := checkMemberAccounts(g.Members, wasMembers(f.Groups, g.ID)); err != nil {
 		return err
 	}
 	for i, m := range g.Members {

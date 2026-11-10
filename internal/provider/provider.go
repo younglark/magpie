@@ -18,7 +18,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -29,6 +28,7 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 )
@@ -760,7 +760,12 @@ func (e *unreadableError) Unwrap() []error { return []error{ErrUnreadable, e.err
 
 // Reads used for an edit must keep errors: a broken file is not an empty
 // catalog to write over. Only a missing file is a first use.
+// fileReads counts read, for the test that a page's look at whether the
+// file parses doesn't parse it again.
+var fileReads atomic.Int64
+
 func read() (file, error) {
+	fileReads.Add(1)
 	var f file
 	b, err := steady.ReadFile(Path())
 	if errors.Is(err, os.ErrNotExist) {
@@ -798,6 +803,11 @@ var utf8BOM = []byte("\xef\xbb\xbf")
 // FileError is why providers.json can't be read, nil when it can or isn't
 // there: for what lists the providers to say so, not "none yet".
 func FileError() error {
+	// a file that parses, parsed once until it changes (storedFile): each
+	// Providers page parsed the whole of it again only to see it does
+	if _, err := filememo.Read("providers", Path(), parseProviders); err == nil {
+		return nil
+	}
 	_, err := read()
 	return err
 }
@@ -1075,6 +1085,12 @@ func accountSettings(a, pk Provider) Provider {
 func Hidden() []Provider {
 	var out []Provider
 	saved := storedFile().Providers
+	// most users removed none: then no account is made at all (Accounts
+	// reads every sign-in, ~0.6 MB each poll of the Providers page,
+	// which asks twice, here and through Excluded)
+	if !slices.ContainsFunc(saved, func(p Provider) bool { return p.Hidden }) {
+		return nil
+	}
 	for _, a := range Accounts() {
 		for _, p := range saved {
 			if p.ID == a.ID && p.Hidden {
@@ -1147,7 +1163,7 @@ func readElsewhere() string {
 	return fmt.Sprintf("\n  this magpie reads its files from %s, as XDG_CONFIG_HOME says; the app opened from the Dock or Start menu keeps them in %s. Run it with XDG_CONFIG_HOME unset (env -u XDG_CONFIG_HOME magpie …) to use those", appdir.Config(), def)
 }
 
-var idRe = regexp.MustCompile(`[^a-z0-9]+`)
+var idRe = lazyre.New(`[^a-z0-9]+`)
 
 // Slug derives an id from a name: "My Relay" → "my-relay".
 func Slug(name string) string {
