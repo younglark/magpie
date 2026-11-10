@@ -202,6 +202,11 @@ var cliForRoute = map[string]string{
 	"GET /api/groups":                      "magpie groups",
 	"POST /api/groups/{action}":            "magpie group",
 	"GET /api/import/{id}":                 "magpie import",
+	"GET /api/settings/https":              "magpie https",
+	"POST /api/settings/https":             "magpie https on",
+	"POST /api/settings/https/ca":          "magpie https ca",
+	"POST /api/settings/https/import":      "magpie https import",
+	"POST /api/settings/https/remove":      "magpie https remove",
 	"POST /api/settings/mtls":              "magpie mtls on",
 	"POST /api/settings/mtls/issue":        "magpie mtls issue",
 	"POST /api/settings/mtls/revoke":       "magpie mtls revoke",
@@ -284,6 +289,7 @@ var notYet = map[string]string{
 	"POST /api/settings/full-context":            S2, // api.go
 	"POST /api/settings/github-token":            S2, // api.go
 	"POST /api/settings/guide":                   W,  // api.go
+	"POST /api/settings/join":                    S2, // join.go: the join password, set or turned off
 	"POST /api/settings/lan":                     S2, // api.go
 	"POST /api/settings/log/reveal":              W,  // api.go
 	"POST /api/settings/login":                   S2, // api.go
@@ -358,6 +364,7 @@ var notYet = map[string]string{
 	"GET /api/library/icon":                      W,  // library.go
 	"GET /api/library/market/servers":            L,  // library.go
 	"GET /api/library/market/skills":             L,  // library.go
+	"GET /api/library/market/pi":                 L,  // library.go
 	"GET /api/library/mcp-signin/{id}":           L,  // library.go
 	"GET /api/library/pi":                        L,  // library.go
 	"GET /api/library/rtk":                       L,  // library.go
@@ -372,6 +379,8 @@ var notYet = map[string]string{
 	"POST /api/library/mcp/config":               L,  // library.go
 	"POST /api/library/pi":                       L,  // library.go
 	"POST /api/library/pi/copy":                  L,  // library.go
+	"POST /api/library/pi/install":               L,  // library.go
+	"POST /api/library/pi/remove":                L,  // library.go
 	"POST /api/library/projects/choose":          W,  // library.go
 	"POST /api/library/reveal":                   W,  // library.go
 	"POST /api/library/rtk":                      L,  // library.go
@@ -441,6 +450,7 @@ var notYet = map[string]string{
 	"POST /api/signin/import":                    P,  // providers.go
 	"POST /api/stepfun/{id}/session":             P,  // providers.go
 	"POST /api/stepfun/{id}/signout":             P,  // providers.go
+	"GET /api/speeds":                            U,  // sessions_manage.go: the Sessions row's speed curve
 	"GET /api/sessions/manage":                   U,  // sessions_manage.go
 	"GET /api/sessions/search":                   U,  // sessions_manage.go
 	"POST /api/sessions/codex-provider":          U,  // sessions_manage.go
@@ -488,6 +498,7 @@ var notYet = map[string]string{
 	"POST /api/usage/requests/export":            U,  // usage.go
 	"POST /api/usage/trae-checkin":               U,  // usage.go
 	"GET /api/update/notes":                      W,  // update.go
+	"POST /api/update/using":                     W,  // update.go
 	"GET /api/whatsnew":                          W,  // whatsnew.go
 	"POST /api/whatsnew/seen":                    W,  // whatsnew.go
 	"POST /api/whatsnew/today":                   W,  // whatsnew.go

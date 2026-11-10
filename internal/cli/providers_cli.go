@@ -58,6 +58,9 @@ const providerUsage = `usage:
                                           image-files=off sends DeepSeek's API an agent's images inline on every
                                           turn; image-files=on, the default, uploads each once (for a day)
                                           and names it by its file id
+                                          upstream-providers=on, on a Remote magpie, names its models by the
+                                          provider serving each there (Claude · Office › RelayA); off, the
+                                          default, as that magpie's own list names them
                                           patience=2m keeps a request to it alone (not through a group) that long
                                           while it is busy or briefly rate limited, asking again after a pause
                                           (at most 4m); patience=off hands the agent the error at once;
@@ -176,6 +179,9 @@ const providerUsage = `usage:
                                    (Settings' redaction leaves its requests as written, at any address: your call,
                                     so mind a relay that passes them on to a vendor; a subscription or a plugin's
                                     provider too, whose vendor gets them so; never another magpie)
+       magpie provider set claude fallback-for-others=no
+                                   (no other model's fallback, nor a routing group's next after one:
+                                    a local model that is down or full doesn't send its requests on to it)
        magpie provider set modelscope free=yes
                                    (every model of it counts as free, so a Free first routing spends it before
                                     paid ones, as a free daily quota; prices and Usage's costs stay as listed)
@@ -905,6 +911,9 @@ func showProviderAsking(p provider.Provider, ask bool) error {
 		}
 		kv("unmasked", "yes"+muted.Render(why))
 	}
+	if p.NoStandIn {
+		kv("fallback-for-others", "no"+muted.Render("  never takes another model's request"))
+	}
 	switch b := p.BillingKind(); {
 	case b == "":
 	case p.Billing != "":
@@ -1216,6 +1225,20 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			default:
 				return fmt.Errorf("image-files=on|off, not %q", v)
 			}
+		case "upstream-providers":
+			// on: a Remote magpie's models named by the provider serving
+			// each there (Provider.UpstreamProviders, lcc580 on X)
+			if !p.IsRemoteMagpie() {
+				return fmt.Errorf("upstream-providers is a Remote magpie's; %s is not one", p.ID)
+			}
+			switch strings.ToLower(v) {
+			case "on", "yes":
+				p.UpstreamProviders = true
+			case "off", "no", "default":
+				p.UpstreamProviders = false
+			default:
+				return fmt.Errorf("upstream-providers=on|off, not %q", v)
+			}
 		case "prompt":
 			// as-written: Antigravity's subscription is sent the system
 			// prompt exactly as the agent wrote it, the lines Google turns
@@ -1326,6 +1349,19 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 				return fmt.Errorf("unmasked=yes|no, not %q", v)
 			}
 			p.Unredacted = v == "yes"
+		case "fallback-for-others":
+			// no: never a fallback for another model, nor a routing
+			// group's next after one (sonnnnnnnnnnnna on X: a local
+			// uncensored model's request reaching a vendor that bans for
+			// it); yes, the default, again (provider.NoStandIn)
+			switch strings.ToLower(v) {
+			case "yes", "on":
+				p.NoStandIn = false
+			case "no", "off":
+				p.NoStandIn = true
+			default:
+				return fmt.Errorf("fallback-for-others=yes|no, not %q", v)
+			}
 		case "free":
 			// yes: every model of it counts as free for Free first and
 			// Cheapest routing, by the user's word (jiabubu on Discord:

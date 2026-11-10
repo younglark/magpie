@@ -1798,14 +1798,15 @@ magpie.plugin("library", (ctx) => {
           const tags = [tag(k.kind)];
           if (!k.installed) tags.push(tag(t("Not installed"), "", t("Pi installs it when it next starts")));
           else if (k.version) tags.push(tag("v" + k.version));
-          list.append(piRow(p, others, { pkg: k.source }, k.name, k.source, k.on, tags, k.filtered));
+          list.append(piRow(p, others, { pkg: k.source }, k.name, k.source, k.on, tags, k.filtered, () => confirmRemovePi(p, k)));
         }
         if (!(p.extensions || []).length && !(p.packages || []).length) list.append(el("div", "lib-none", t("No extensions or packages yet.")));
       }
       body.append(list);
     }
+    if (live.length) body.append(discover("pi"));
   }
-  function piRow(p, others, what, name, sub, on, tags, filtered) {
+  function piRow(p, others, what, name, sub, on, tags, filtered, remove) {
     const key = p.id + " " + (what.ext || what.pkg);
     const row = el("div", "row lib-row lib-pi-row");
     row.dataset.id = what.ext || what.pkg;
@@ -1825,6 +1826,13 @@ magpie.plugin("library", (ctx) => {
     if (filtered) sw.title = t("This entry loads only some of the package; change it with pi config");
     sw.disabled = !!filtered || piBusy.has(key);
     row.append(sw);
+    if (remove) {
+      const rm = button("", "lib-icon danger lib-rm lib-pi-rm", remove);
+      rm.append(svg(GLYPH.trash, 13, 1.4));
+      rm.title = t("Remove");
+      rm.disabled = piBusy.has(key);
+      row.append(rm);
+    }
     return row;
   }
   async function setPi(p, what, name, on) {
@@ -5664,7 +5672,7 @@ magpie.plugin("library", (ctx) => {
     const all = projectAgents();
     const shown = projectShown.get(p.dir) || new Set();
     projectShown.set(p.dir, shown);
-    const has = (s) => !!(p.skills[s.name]?.length || p.problems?.[s.name]);
+    const has = (s) => !!(p.skills[s.name]?.length || p.problems?.[s.name] || p.skillsOff?.[s.name]?.length);
     for (const s of lib.skills) if (has(s)) shown.add(s.name);
     opts.append(projectSkillsPick(p, all, has));
     card.append(opts);
@@ -5684,13 +5692,11 @@ magpie.plugin("library", (ctx) => {
       const on = p.skills[s.name] || [];
       // an agent reading the same folder as one that has it has it too
       const via = (a) => { const o = on.find((id) => agentOf(id)?.projectSkills === a.projectSkills); return o ? nameOf(o) : ""; };
-      row.append(mark(s.icon, GLYPH.skill), w, agentChips(all, on, projectChange("projects/skill", p.dir, s.name, (next) => next.length
-        ? t("{skill} is in {name} for {agents}", { skill: s.name, name: p.name, agents: next.map(nameOf).join(", ") })
-        : t("{skill} is out of {name}", { skill: s.name, name: p.name })), { via }));
+      row.append(mark(s.icon, GLYPH.skill), w, scopedChips(p, s, all, "skill", { via, cantOff: routedOff }));
       card.append(row);
     }
     const dirs = [...new Set(all.map((a) => a.projectSkills))];
-    card.append(el("p", "lib-aside lib-projfoot", t("Placed in {dirs} of the project and listed in its .gitignore. A folder there that isn't magpie's is left as it is.", { dirs: dirs.join(", ") })));
+    card.append(el("p", "lib-aside lib-projfoot", t("Placed in {dirs} of the project and kept out of git, its .gitignore untouched. A folder there that isn't magpie's is left as it is.", { dirs: dirs.join(", ") })));
     const skip = shownAgents().filter((a) => a.skills && !a.projectSkills);
     if (skip.length) card.append(el("p", "lib-aside lib-projfoot", t("{agents} reads no project skills folder magpie knows of.", { agents: skip.map((a) => a.name).join(", ") })));
     return card;
@@ -5703,10 +5709,30 @@ magpie.plugin("library", (ctx) => {
   // taken out of the project. The rest keep their agents.
   function projectSkillsPick(p, all, has) {
     const b = menuButton(t("Skills"), "lib-projpick", () => {
-      const now = lib.skills.filter(has).map((s) => s.name);
+      // a skill from the Library is ticked while on in the project for
+      // an agent that can have it turned off here; unticking turns it off
+      const offIds = all.filter((a) => a.projectSkillOff).map((a) => a.id);
+      const global = (s) => (s.agents || []).filter((id) => offIds.includes(id) && !routedOff(agentOf(id) || { name: id }, s));
+      const inherited = (s) => !p.skills[s.name]?.length && global(s).some((id) => !(p.skillsOff?.[s.name] || []).includes(id));
+      const now = lib.skills.filter((s) => p.skills[s.name]?.length || p.problems?.[s.name] || inherited(s)).map((s) => s.name);
       const opts = lib.skills.map((s) => ({ v: s.name, name: s.name, literalName: true, note: "" }));
       openProtoMenu(b, opts, now, async (next) => {
-        const adds = next.filter((n) => !now.includes(n)), outs = now.filter((n) => !next.includes(n));
+        const byName = (n) => lib.skills.find((s) => s.name === n);
+        let adds = next.filter((n) => !now.includes(n)), outs = now.filter((n) => !next.includes(n));
+        // from the Library: on and off in the project, not the project's own
+        const back = adds.filter((n) => p.skillsOff?.[n]?.length);
+        const offs = outs.filter((n) => inherited(byName(n)));
+        adds = adds.filter((n) => !back.includes(n));
+        outs = outs.filter((n) => !offs.includes(n));
+        if (back.length) {
+          await change("projects/skill-off", { dir: p.dir, names: back, agents: [] }, t("{item} is back on in {name}", { item: back.join(", "), name: p.name }));
+        }
+        if (offs.length) {
+          const shown = projectShown.get(p.dir);
+          for (const n of offs) shown?.add(n);
+          const ids = [...new Set(offs.flatMap((n) => global(byName(n))))];
+          await change("projects/skill-off", { dir: p.dir, names: offs, agents: ids }, t("{item} is off in {name} for {agents}", { item: offs.join(", "), name: p.name, agents: ids.map(nameOf).join(", ") }));
+        }
         const ids = new Set(all.map((a) => a.id));
         const used = [...new Set(Object.values(p.skills || {}).flat())].filter((id) => ids.has(id));
         const agents = used.length ? used : all.filter((a) => !a.gone && !a.unseen && !a.asleep).map((a) => a.id);
@@ -5734,9 +5760,9 @@ magpie.plugin("library", (ctx) => {
   // answered the first counts from it; the clicks are sent one at a time,
   // the last of them winning, and the page drawn again once they're in.
   const projectWriting = new Map();
-  function projectChange(path, dir, name, done) {
+  function projectChange(path, dir, name, done, offs = false) {
     return async (next, c) => {
-      const on = next.includes(c.dataset.agent);
+      const on = offs ? !next.includes(c.dataset.agent) : next.includes(c.dataset.agent);
       c.classList.toggle("on", on);
       if (on) c.classList.remove("via");
       c.setAttribute("aria-pressed", on ? "true" : "false");
@@ -5763,6 +5789,42 @@ magpie.plugin("library", (ctx) => {
     };
   }
 
+  // A project is the Library's global set with its own added and some of
+  // the global ones turned off there. A row's chip is lit for an agent
+  // that has the item in the project: given it in the Library (and not
+  // turned off here), or by the project. A click on an agent that has it
+  // from the Library turns it off, or back on, in this project alone; an
+  // agent that can't have one turned off for a project keeps it lit, and
+  // says so.
+  function scopedChips(p, item, all, kind, opts = {}) {
+    const skill = kind === "skill";
+    const global = (id) => (item.agents || []).includes(id) && !item.hidden;
+    const canOff = (a) => (skill ? a.projectSkillOff : a.projectOff) && !opts.cantOff?.(a, item);
+    const offs = ((skill ? p.skillsOff : p.serversOff) || {})[item.name] || [];
+    const own = ((skill ? p.skills : p.servers) || {})[item.name] || [];
+    const on = all.filter((a) => (global(a.id) ? !offs.includes(a.id) : own.includes(a.id))).map((a) => a.id);
+    const path = skill ? "projects/skill" : "projects/server";
+    const say = (next) => next.length
+      ? t(skill ? "{skill} is in {name} for {agents}" : "{server} is in {name} for {agents}", { skill: item.name, server: item.name, name: p.name, agents: next.map(nameOf).join(", ") })
+      : t(skill ? "{skill} is out of {name}" : "{server} is out of {name}", { skill: item.name, server: item.name, name: p.name });
+    const add = projectChange(path, p.dir, item.name, say);
+    const off = projectChange(path + "-off", p.dir, item.name, (next) => next.length
+      ? t("{item} is off in {name} for {agents}", { item: item.name, name: p.name, agents: next.map(nameOf).join(", ") })
+      : t("{item} is back on in {name}", { item: item.name, name: p.name }), true);
+    const change = (next, c) => {
+      if (!global(c.dataset.agent)) return add(next.filter((id) => !global(id)), c);
+      return off(all.filter((a) => global(a.id) && canOff(a) && !next.includes(a.id)).map((a) => a.id), c);
+    };
+    const always = (a) => global(a.id) && !canOff(a) ? opts.cantOff?.(a, item) || t("{agent} has it from the Library, and can't have it turned off in one project", { agent: a.name }) : "";
+    return agentChips(all, on, change, { ...opts, always });
+  }
+
+  // A skill the skill router lists is reached through the router's own
+  // skill, which a project can't turn one off in.
+  const routedOff = (a, s) => lib.skillRouter && s.router !== "direct" && !s.manual
+    ? t("{agent} reaches {skill} through the skill router, which can't leave it out in one project: set it to not go through the router first", { agent: a.name, skill: s.name })
+    : "";
+
   // The project's card, open on the MCP tab: each library server with the
   // chips of the agents that read a project's own servers.
   function projectServers(p, card) {
@@ -5777,13 +5839,11 @@ magpie.plugin("library", (ctx) => {
       const sub = el("div", "sub mono", problem || serverLine(s));
       sub.title = problem || serverLine(s);
       w.append(sub);
-      row.append(mark(s.icon, s.transport === "stdio" ? GLYPH.cmd : GLYPH.web), w, agentChips(all, p.servers?.[s.name] || [], projectChange("projects/server", p.dir, s.name, (next) => next.length
-        ? t("{server} is in {name} for {agents}", { server: s.name, name: p.name, agents: next.map(nameOf).join(", ") })
-        : t("{server} is out of {name}", { server: s.name, name: p.name })), { blocked: sseBlocked(s) }));
+      row.append(mark(s.icon, s.transport === "stdio" ? GLYPH.cmd : GLYPH.web), w, scopedChips(p, s, all, "server", { blocked: sseBlocked(s) }));
       card.append(row);
     }
     if (!lib.servers.length) card.append(el("p", "lib-aside lib-projfoot", t("No servers in the library yet")));
-    card.append(el("p", "lib-aside lib-projfoot", t("Written into {files} of the project, beside what's in them; a file magpie makes is listed in its .gitignore. A server there by the same name that isn't magpie's is left as it is.", { files: projectFiles() })));
+    card.append(el("p", "lib-aside lib-projfoot", t("Written into {files} of the project, beside what's in them; a file magpie makes is kept out of git, its .gitignore untouched. A server there by the same name that isn't magpie's is left as it is.", { files: projectFiles() })));
     card.append(el("p", "lib-aside lib-projfoot", t("Claude Code asks before it starts a project's servers; Codex reads .codex/config.toml, and Pi .pi/mcp.json, only in a project you trust.")));
     const skip = shownAgents().filter((a) => a.mcp && !a.projectMCP);
     if (skip.length) card.append(el("p", "lib-aside lib-projfoot", t("{agents} reads no project MCP file magpie knows of.", { agents: skip.map((a) => a.name).join(", ") })));
@@ -5804,8 +5864,8 @@ magpie.plugin("library", (ctx) => {
     keep.type = "checkbox";
     const tell = () => {
       say.textContent = keep.checked
-        ? t("magpie forgets the project. The skills and MCP servers it put in the folder stay there as they are, with their lines in its .gitignore, and are yours from then on; a linked skill still follows the library's.")
-        : t("The skills and MCP servers magpie put in it are taken away, with their lines in its .gitignore. Nothing else in the folder is touched.");
+        ? t("magpie forgets the project. The skills and MCP servers it put in the folder stay there as they are, kept out of git, and are yours from then on; a linked skill still follows the library's.")
+        : t("The skills and MCP servers magpie put in it are taken away. Nothing else in the folder is touched.");
     };
     keep.onchange = tell;
     if (has) {
@@ -7105,6 +7165,7 @@ magpie.plugin("library", (ctx) => {
   const market = {
     mcp: { q: "", items: null, error: "", loading: false, seq: 0, timer: 0, custom: null, shown: 0 },
     skills: { q: "", items: null, error: "", loading: false, seq: 0, timer: 0, shown: 0 },
+    pi: { q: "", items: null, error: "", loading: false, seq: 0, timer: 0, shown: 0 },
   };
   // how many cards a list shows at first, and each Show more adds
   const MARKET_PAGE = 60;
@@ -7116,7 +7177,7 @@ magpie.plugin("library", (ctx) => {
     m.loading = true;
     drawMarket(kind);
     try {
-      const r = await api("library/market/" + (kind === "mcp" ? "servers" : "skills") + "?q=" + encodeURIComponent(m.q.trim()));
+      const r = await api("library/market/" + ({ mcp: "servers", skills: "skills", pi: "pi" })[kind] + "?q=" + encodeURIComponent(m.q.trim()));
       if (seq !== m.seq) return;
       m.items = r.items || [];
       m.shown = MARKET_PAGE;
@@ -7136,6 +7197,7 @@ magpie.plugin("library", (ctx) => {
     m.loading = false;
     drawMarket(kind);
     if (kind === "skills") describeSkills();
+    if (kind === "pi") return;
     // The market reads the library as it is now; one it calls added that
     // this page doesn't list was added elsewhere — another window, the CLI.
     const mine = new Set((kind === "mcp" ? lib?.servers : lib?.skills)?.map((x) => x.name) || []);
@@ -7171,7 +7233,7 @@ magpie.plugin("library", (ctx) => {
     const inp = el("input");
     inp.type = "search";
     inp.dataset.lib = "market-" + kind;
-    inp.placeholder = kind === "mcp" ? t("Search MCP servers — GitHub, Postgres, Figma…") : t("Search skills on skills.sh — react, pdf, testing…");
+    inp.placeholder = kind === "mcp" ? t("Search MCP servers — GitHub, Postgres, Figma…") : kind === "pi" ? t("Search Pi packages on npm — mcp, web, subagents…") : t("Search skills on skills.sh — react, pdf, testing…");
     inp.spellcheck = false;
     inp.autocomplete = "off";
     inp.value = m.q;
@@ -7179,7 +7241,7 @@ magpie.plugin("library", (ctx) => {
       m.q = inp.value;
       clearTimeout(m.timer);
       const q = m.q.trim();
-      if (kind === "skills" && q.length === 1) return;
+      if (kind !== "mcp" && q.length === 1) return;
       m.timer = setTimeout(() => fetchMarket(kind), 320);
     };
     inp.onkeydown = (e) => {
@@ -7202,7 +7264,7 @@ magpie.plugin("library", (ctx) => {
     box.classList.toggle("loading", m.loading);
     const note = box.querySelector(".mk-note");
     note.textContent = q && m.items ? (m.items.length === 1 ? t("1 result") : t("{n} results", { n: m.items.length }))
-      : kind === "mcp" ? t("Featured, and the official MCP Registry") : t("Popular on skills.sh");
+      : kind === "mcp" ? t("Featured, and the official MCP Registry") : kind === "pi" ? t("Most downloaded on npm") : t("Popular on skills.sh");
     const grid = box.querySelector(".mk-grid");
     grid.replaceChildren();
     if (!m.items) {
@@ -7225,6 +7287,7 @@ magpie.plugin("library", (ctx) => {
     if (m.error && m.failed && m.items.length) {
       grid.append(el("div", "mk-msg mk-partial", kind === "mcp"
         ? t("The MCP Registry didn't answer ({error}), so these are only magpie's featured servers that match.", { error: m.failed.cause })
+        : kind === "pi" ? t("npm's search didn't answer ({error}), so these are only the matches among the most downloaded packages.", { error: m.failed.cause })
         : t("skills.sh's search didn't answer ({error}), so these are only the matches among magpie's picks and the most installed skills.", { error: m.failed.cause })));
     } else if (m.error) grid.append(el("div", "mk-msg err", m.error));
     if (kind === "mcp" && q && m.custom) grid.append(customAt(q, m.custom, m.items.length));
@@ -7232,9 +7295,11 @@ magpie.plugin("library", (ctx) => {
       grid.append(el("div", "mk-msg", q ? t("Nothing matches “{q}”.", { q }) : t("Nothing to show.")));
       return;
     }
-    for (const x of m.items.slice(0, m.shown)) grid.append(kind === "mcp" ? serverCard(x) : skillCard(x));
+    for (const x of m.items.slice(0, m.shown)) grid.append(cardOf(kind, x));
     moreCards(kind, grid);
   }
+
+  const cardOf = (kind, x) => kind === "mcp" ? serverCard(x) : kind === "pi" ? piCard(x) : skillCard(x);
 
   // The rest of a long list, a page at a time: the cards added under the
   // ones shown, which stay where they are.
@@ -7245,7 +7310,7 @@ magpie.plugin("library", (ctx) => {
     const more = button(t("Show more ({n} left)", { n: left.toLocaleString(intlLang()) }), "mk-more", () => {
       const from = m.shown;
       m.shown += MARKET_PAGE;
-      more.before(...m.items.slice(from, m.shown).map((x) => kind === "mcp" ? serverCard(x) : skillCard(x)));
+      more.before(...m.items.slice(from, m.shown).map((x) => cardOf(kind, x)));
       more.remove();
       moreCards(kind, grid);
       if (kind === "skills") describeSkills();
@@ -7586,6 +7651,102 @@ magpie.plugin("library", (ctx) => {
     const ok = await change("market/skill", body, t("{name} is in the library now", { name: x.name }));
     if (ok) { x.have = x.name; drawMarket("skills"); } // take asked the market again
     return ok;
+  }
+
+  // A package from Pi's market: who has it, or Install into a Pi (picked
+  // when there are several). Pi itself installs it.
+  const piLive = () => (piView?.pis || []).filter((p) => !p.asleep && !p.err && !isHidden({ id: p.id }));
+  const piHas = (x) => piLive().filter((p) => (p.packages || []).some((k) => k.kind === "npm" && k.name === x.name));
+  function piCard(x) {
+    const has = piHas(x);
+    const c = el("div", "mk-card" + (has.length ? " have" : ""));
+    c.dataset.id = x.source;
+    const top = el("div", "mk-top");
+    const who = el("div", "mk-who");
+    const nm = el("div", "mk-name");
+    nm.append(el("span", "mk-title", x.name));
+    who.append(nm);
+    const meta = el("div", "mk-meta");
+    if (x.publisher) meta.append(el("span", "mk-pub", x.publisher));
+    if (x.version) meta.append(el("span", "mk-badge", "v" + x.version));
+    who.append(meta);
+    top.append(logo(x.icon, x.name), who);
+    const d = el("p", "mk-desc", x.description || "");
+    d.title = x.description || "";
+    const foot = el("div", "mk-foot");
+    if (x.downloads) {
+      const n = el("span", "mk-installs");
+      n.append(svg(GLYPH.down, 11, 1.5), el("span", "", compact(x.downloads)));
+      n.title = t("{n} downloads last month", { n: x.downloads.toLocaleString(intlLang()) });
+      foot.append(n);
+    }
+    foot.append(extLink(x.repo || x.npm, x.repo ? t("Source") : "npm"), el("span", "grow"));
+    const live = piLive();
+    const want = live.filter((p) => !has.includes(p));
+    if (has.length && !want.length) {
+      const b = el("span", "mk-have");
+      b.append(svg(CHECK, 11, 2), el("span", "", t("Installed")));
+      b.title = t("In {agents}", { agents: has.map((p) => p.name).join(", ") });
+      foot.append(b);
+    } else if (want.length) {
+      const busy = want.some((p) => piBusy.has(p.id + " " + x.source));
+      const b = button(busy ? t("Installing…") : t("Install"), "action mk-add", () => {
+        if (want.length === 1) return installPi(want[0], x);
+        openProtoMenu(b, want.map((p) => ({ v: p.id, name: p.name, literalName: true, note: "" })), "", (id) => installPi(want.find((p) => p.id === id), x), "Install into", "", "right");
+      });
+      if (busy) { b.disabled = true; b.classList.add("busy"); }
+      if (has.length) b.title = t("In {agents}", { agents: has.map((p) => p.name).join(", ") });
+      foot.append(b);
+    }
+    c.append(top, d, foot);
+    return c;
+  }
+  async function installPi(p, x) {
+    if (!p) return;
+    const key = p.id + " " + x.source;
+    piBusy.add(key);
+    drawMarket("pi");
+    status(t("Installing {name} into {agent}…", { name: x.name, agent: p.name }), "", 300000);
+    try {
+      const v = await api("library/pi/install", { pi: p.id, source: x.source });
+      piView = v;
+      status(v.pending
+        ? t("{name} is in {agent}'s packages now: Pi installs it when it next starts", { name: x.name, agent: p.name })
+        : t("{name} is installed in {agent}: Pi loads it when it next starts, or at /reload", { name: x.name, agent: p.name }), "ok", 8000);
+    } catch (e) {
+      status(e.message, "err", 10000);
+    }
+    piBusy.delete(key);
+    if (tab === "pi") render();
+  }
+  function confirmRemovePi(p, k) {
+    const ed = el("div", "editor lib-editor lib-rmone");
+    const head = el("div", "ehead");
+    head.append(glyph(GLYPH.trash), el("b", "", t("Remove {name} from {agent}?", { name: k.name, agent: p.name })));
+    ed.append(head);
+    ed.append(el("p", "lib-confirm", p.wsl
+      ? t("It is taken out of {agent}'s settings.json; Pi stops loading it when it next starts.", { agent: p.name })
+      : t("pi remove takes it out of {agent}'s settings.json and uninstalls it.", { agent: p.name })));
+    const bar = el("div", "bar");
+    const go = button(t("Remove"), "primary danger-fill", async () => {
+      go.disabled = true;
+      const key = p.id + " " + k.source;
+      piBusy.add(key);
+      try {
+        piView = await api("library/pi/remove", { pi: p.id, source: k.source });
+        status(t("{name} removed from {agent}", { name: k.name, agent: p.name }), "ok", 6000);
+        closeLibModal(true);
+      } catch (e) {
+        status(e.message, "err", 10000);
+        go.disabled = false;
+      }
+      piBusy.delete(key);
+      if (tab === "pi") render();
+    });
+    bar.append(el("span", "grow"), button(t("Cancel"), "", closeLibModal), go);
+    ed.append(bar);
+    modal = { save: () => go.click() };
+    openLib(ed);
   }
 
   function skillSheet(x) {

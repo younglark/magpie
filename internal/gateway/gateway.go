@@ -1045,7 +1045,13 @@ func (s *Server) routes() *routeMux {
 	// another magpie looking for it at a new address (remote_prove.go)
 	mux.HandleFunc("POST "+provider.RemoteProvePath, s.prove)
 	mux.HandleFunc("GET "+KeyPagePath, s.keyPage)
+	mux.HandleFunc("GET "+CAPath, s.caFile)
 	mux.HandleFunc("GET "+keyPageData, s.keyInfo)
+	// the join page, where another computer that knows the join password
+	// gets a gateway key of its own (join.go)
+	mux.HandleFunc("GET "+JoinPagePath, s.joinPage)
+	mux.HandleFunc("GET "+joinData, s.joinOpen)
+	mux.HandleFunc("POST "+joinData, s.joinKey)
 	// the Claude Code processes the Claude subscription runs, for magpie
 	// claude-code runs (loopback only)
 	mux.HandleFunc("GET "+ClaudeRunsPath, s.claudeRuns)
@@ -1695,6 +1701,10 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 					// magpie that is this one's remote too doesn't take
 					// back its own models (catalog's magpie_via.go)
 					m["magpie_via"] = catalog.ViaHere(viaOf(e))
+					// the provider serving it, the first in a chain of
+					// magpies, for one that names its models by it
+					// (provider.UpstreamNames, lcc580 on X)
+					m["magpie_by"] = e.ServedBy()
 				}
 				if ts := tiers[e.ID]; len(ts) > 0 {
 					m["service_tiers"] = ts
@@ -1749,6 +1759,7 @@ func (s *Server) listModels(w http.ResponseWriter, r *http.Request) {
 			m["kind"], m["magpie_label"] = "decision", labels[i]
 			m["native_endpoints"] = []string{"/v1/systemone"}
 			m["magpie_via"] = catalog.ViaHere(viaOf(e))
+			m["magpie_by"] = e.ServedBy()
 			data = append(data, m)
 		}
 	}
@@ -3037,7 +3048,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// spend its credits
 	var resetFirst *AutoReset
 	if len(cands) == 0 && len(pl.held) > 0 && strings.TrimSpace(r.Header.Get(AccountHeader)) == "" &&
-		(strictHeld != nil || !slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 })) {
+		(strictHeld != nil || !slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 && !w.StandIn })) {
 		// every account there is is held, and one held only as it won't
 		// spend its credits is out of its allowance at the vendor's own
 		// 100%: one that spends its resets by itself, its week used up,
@@ -3049,7 +3060,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 	}
 	if len(cands) == 0 && (strictHeld != nil || slices.ContainsFunc(pl.left, func(w Weighed) bool { return w.Capped > 0 }) &&
-		!slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 })) {
+		!slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 && !w.StandIn })) {
 		// every account there is is held at its usage cap: used up, as far
 		// as routing goes, until a window renews — or the one a strict
 		// conversation stays on is
@@ -3093,7 +3104,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		return
 	}
 	if len(cands) == 0 && slices.ContainsFunc(pl.left, func(w Weighed) bool { return w.HeldBy != "" }) &&
-		!slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 }) {
+		!slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 && !w.StandIn }) {
 		// every one left was held by a group in the group, or a group a
 		// fallback reached, held to other accounts
 		call.Status, call.Error = 403, "every account outside the group's accounts"
@@ -3101,7 +3112,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		turnedAway()
 		return
 	}
-	if len(cands) == 0 && len(pl.left) > 0 && !slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred }) {
+	if len(cands) == 0 && slices.ContainsFunc(pl.left, func(w Weighed) bool { return w.Barred }) && !slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.StandIn }) {
 		// every account or key there is was set not to serve the model
 		call.Status, call.Error = 403, "every account barred"
 		writeError(w, from, 403, barredError(call.Model, pl.left))
@@ -3125,7 +3136,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	if isGroup {
 		inOrder = routingOf(g.Routing) == provider.Ordered
 	}
-	cands, pl, aff, stuck := affine(scope, mode, rotate, spread, inOrder, r.Header, from, body, plain, cands, pl)
+	cands, pl, aff, stuck := affine(scope, mode, rotate, spread, inOrder, hit != nil && hit.Ended > 0, r.Header, from, body, plain, cands, pl)
 	// a strict conversation left with its own account of several: its
 	// failure rests the account as it would with the others still there,
 	// for new conversations to go elsewhere meanwhile (#1797)

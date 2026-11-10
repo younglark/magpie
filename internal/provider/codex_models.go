@@ -449,13 +449,19 @@ func (a *Account) Tiers(model string) (tiers []string, ok bool) {
 // high, doesn't lower the request a Plus one beside it answers (#520). The
 // gateway sends each account only the models and levels its own list has
 // (Account.Lists, Account.Levels) first.
-func codexPoolModels(ms []catalog.Model) []catalog.Model {
+func codexPoolModels(ms []catalog.Model) []catalog.Model { return poolModels("codex", ms) }
+
+// poolModels is ms, the list of agent's account in use first, with what
+// the agent's other accounts on add to it, as codexPoolModels says: a
+// Copilot account's plan lists other models than another's too
+// (copilotPoolModels).
+func poolModels(agent string, ms []catalog.Model) []catalog.Model {
 	var lists [][]catalog.Model
-	for _, l := range Logins("codex") {
+	for _, l := range Logins(agent) {
 		if l.Active || !l.On {
 			continue
 		}
-		if live, _, ok := catalog.Live(accountModels("codex", l.User)); ok {
+		if live, _, ok := catalog.Live(accountModels(agent, l.User)); ok {
 			lists = append(lists, live)
 		}
 	}
@@ -895,6 +901,7 @@ func codexListedIf(shown []Entry, members func(id string) []Member, listed func(
 		m := catalog.Model{ID: e.ID, Name: labels[i], Efforts: CodexEfforts(e), Images: e.Images || seen, Context: e.Context, AgentsV2: e.AgentsV2, Codex: e.Codex, Apart: apart[i]}
 		m.Compact = CompactFor(s, e, find)
 		CodexTiers(&m, e, members)
+		CodexSeals(&m, e, members)
 		ms = append(ms, m)
 	}
 	return ms
@@ -1014,6 +1021,31 @@ func CodexTiers(m *catalog.Model, e Entry, members func(id string) []Member) {
 	if len(m.Tiers) == 0 && CanFast(e.Provider, e.Model) {
 		m.Tiers = []string{codexFastTier}
 	}
+}
+
+// CodexSeals sets m.Seals: e's provider, or a member of its group, is one
+// of no sign-in on the Responses API, which may seal a V2 lead's subagent
+// tasks as the ChatGPT backend does (#1109). A ChatGPT account's model says
+// so already (codex/, a group's Fast); another account's (Copilot) seals
+// none.
+func CodexSeals(m *catalog.Model, e Entry, members func(id string) []Member) {
+	if e.Group == "" {
+		m.Seals = maySeal(e.Provider)
+		return
+	}
+	for _, mb := range members(e.ID) {
+		if maySeal(mb.Provider) {
+			m.Seals = true
+			return
+		}
+	}
+}
+
+// maySeal says p is of no sign-in and speaks the Responses API, as the
+// gateway's canSeal does (its Base, not Speaks: a list asks it of every
+// model).
+func maySeal(p Provider) bool {
+	return p.Account == nil && p.ID != "" && p.Base(Responses) != ""
 }
 
 // codexFastTier is Fast's service tier as Codex sends it.

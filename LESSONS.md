@@ -886,6 +886,26 @@ each one.
     lineWith(out, " as ") found the billing row before the "as" row
     (ea310a8c9). A test that finds a row by a word in it breaks when
     another row says the word; find a labelled row by its label.
+  - Three more the same night, after that line was written.
+    9c39edb92 (Avibe) and 4a9142ccd (Obsidian) each added an agent with
+    no Library line, and e6f151507's /api/speeds made the route guard red
+    a fifth time. All three were pushed and tagged before CI ran.
+    Writing the rule here didn't reach those sessions. Until a pre-push
+    check runs these guards, run them yourself before every push that
+    adds an agent or a route.
+  - 86825005e (#5890) wrote two hook-budget tests whose margin was the
+    one second between a hook's own timer and the RPC's 11s. That 11s
+    counts the plugin host's start, which on a busy CI machine is more
+    than a second. Both went red on CI and were fixed one at a time
+    (e39ecfec8, then 0659dc66f). When a test's margin is under a
+    deadline that also covers starting something, start it first, and
+    fix every test in the file that shares the margin.
+  - The route guard went red a sixth and seventh time before midnight:
+    e053c337a's /api/settings/join and 4623f5419's five
+    /api/settings/https routes. 4623f5419's record says it ran
+    `go test ./internal/cli -run Help|HTTPS|TLS|…`, and a -run filter
+    skips the guard, which was named for none of those words. A change
+    that adds a route runs internal/cli whole, with no -run.
 - **Done right on 10-17.** The retire stack (0f1666b38 to de671719a)
   diffed staticcheck's U1000 against its base for dead code, b98f906b1
   was red on the old code for an own-account gap, and 8 subscriptions

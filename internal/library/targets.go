@@ -349,6 +349,12 @@ func targetOf(a *agent.Agent) *Target {
 		// workspaces' own. Its MCP servers are sources of a workspace,
 		// which magpie doesn't write.
 		t.Skills = sharedSkillsDir()
+	case "tuanjie-cowork":
+		// Tuanjie Cowork counts ~/.agents/skills as the user's skills beside
+		// Codely's own ~/.codely-cli/skills (its core's skill scan, scope
+		// "user-alias", 2.1.6-stable). Its MCP servers are Codely's settings,
+		// which magpie doesn't write for it.
+		t.Skills = sharedSkillsDir()
 	case "openbot":
 		// OpenBot reads skills only from ~/.agents/skills (home-skills.ts,
 		// HOME_SKILL_FOLDER). Its MCP servers are rows in its SQLite
@@ -853,19 +859,21 @@ func wslOwnFolder(a *agent.Agent) *Target {
 
 // apps are what the library can give MCP servers to that aren't agents
 // magpie sets up: known by the folder they keep their settings in
-// (Claude Desktop), or by their program alone (Kiro CLI).
+// (Claude Desktop; on Windows by its program, agent.DesktopApp), or by
+// their program alone (Kiro CLI).
 func apps() []*agent.Agent {
 	// Desktop's own folder (%APPDATA%\Claude on Windows, the MSIX
 	// package's for a packaged Desktop, which doesn't see a file written
 	// into %APPDATA%). Desktop only ever run in its 3p mode has no Claude
 	// folder, only Claude-3p: its file is the one there
 	d := desktopdir.Here()
+	home, _ := os.UserHomeDir()
 	dir := d.Data
 	if !isDir(dir) && isDir(d.ThreeP) {
 		dir = d.ThreeP
 	}
 	out := []*agent.Agent{
-		{ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Dir: dir, Path: filepath.Join(dir, "claude_desktop_config.json")},
+		agent.DesktopApp(home, dir, filepath.Join(dir, "claude_desktop_config.json")),
 	}
 	// Kiro CLI (#4769) is no agent magpie wires a model into, but the
 	// library can give it skills, MCP servers and instructions. It is

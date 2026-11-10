@@ -56,7 +56,7 @@ line; agents connected to magpie lose it when it quits.
 - **Providers with one field.** Pick a preset (Anthropic, OpenAI, Gemini,
   Amazon Bedrock and its Mantle endpoint, DeepSeek, Kimi, GLM, MiniMax, StepFun, LongCat, Qwen, Baidu Qianfan, Tencent Cloud Token Plan,
   Huawei Cloud MaaS, Volcengine Ark, Mistral, Groq, Nous Portal, xAI, OpenRouter, Together,
-  Fireworks, SiliconFlow, NVIDIA NIM, ModelScope, AiHubMix, PipeLLM, 302.AI, Ollama, LM Studio…),
+  Fireworks, Fireworks Nexus, SiliconFlow, NVIDIA NIM, ModelScope, AiHubMix, PipeLLM, 302.AI, Ollama, LM Studio…),
   paste a key, done. Custom vendors need a name and a base URL. magpie never
   reads keys from your shell environment.
 - **Real model lists, nothing compiled in.** With a key in hand magpie asks
@@ -157,15 +157,18 @@ line; agents connected to magpie lose it when it quits.
 | OpenBot      | `OpenBot/openbot-custom-providers-v1.json` in the app data folder: `~/Library/Application Support` (macOS), `%APPDATA%` (Windows), `$XDG_CONFIG_HOME` or `~/.config` (Linux) | provider (a keyless `magpie` endpoint at `/agent/openbot/v1`, magpie's models in its model picker; the user's endpoints kept; OpenBot reads it at start, so restart it) |
 | Craft Agents | `~/.craft-agent/config.json` (or `$CRAFT_CONFIG_DIR`) | model (a keyless `pi_compat` connection `magpie` at `/agent/craft-agents/v1`, made the default; the user's connections and default kept and put back on off; new sessions use it) |
 | Obsidian     | Copilot for Obsidian 4+'s `.obsidian/plugins/copilot/data.json` in each vault `obsidian.json` lists (`~/Library/Application Support/obsidian`, `%APPDATA%\obsidian`, `$XDG_CONFIG_HOME/obsidian`, Flatpak, Snap) | provider (a keyless `magpie` provider at `/agent/obsidian/v1`, magpie's models in Copilot's chat picker and the default; the user's settings kept; reload Copilot or restart Obsidian) |
+| Tuanjie Cowork | `~/.codely/settings.json` | model (a `magpie` entry in `customModelProviders`, the gateway's `/v1` with Cowork's own key, and a `magpie` entry in `customModels` on `wireApi` `chat`; the user's providers and models kept; pick "<model> (magpie)" in Cowork's model menu once, restarting Cowork if it isn't listed yet) |
 | NewMax       | `newmax.db` (SQLite, the row `app` of its `settings` table) in `$NEWMAX_USER_DATA_DIR`, else `~/.newmax` (every OS) | provider (a `magpie-gateway` entry in its `providers` and `providerOrder`, magpie's models in its model picker; the rest of the row kept byte for byte; refused while NewMax runs, as it writes its settings back whenever one changes) |
 | LiveAgent    | `config.json` (JSONC, K-brain's) in `$LIVEAGENT_HOME`, else `$K_BRAIN_HOME`, else the folder `~/.liveagent/data-dir.json` points to, else `~/.liveagent` (every OS) | provider (`magpie`, `magpie-responses` and `magpie-anthropic` entries in its `providers`, each model on the one of the API it is served on natively: Chat Completions and Responses at the gateway's `/v1` as OpenAI providers whose request format the user can switch in LiveAgent and magpie keeps, Anthropic Messages at its root; magpie's models in its model picker; a model or provider of magpie's deleted in LiveAgent stays out; a default still K-brain's own demo model becomes magpie's first; refused while LiveAgent or its `k-brain` backend runs, as it writes its settings back whenever one changes) |
 | T3 Code      | `~/.t3/userdata/settings.json` (`$T3CODE_HOME/userdata`) | provider (a `magpie` provider instance on Claude Code, magpie's models as its custom models; a `magpie-codex` instance on Codex, whose `launchArgs` are Codex's own `-c` overrides to magpie and a `magpie-codex-models.json` catalog beside the settings. The harness is picked in T3's model picker) |
 | OpenMausBot  | `~/.openmausbot/config.json` (`$OMB_DATA_DIR`) | provider (a `magpie` engine in `instances`: OpenMausBot's own Claude endpoint shape, Claude Code with `ANTHROPIC_BASE_URL` at the gateway and magpie's models as its `endpointModels`, in its own `CLAUDE_CONFIG_DIR` under `providers/magpie`. With no `instances` saved, OpenMausBot's default engines are written beside it. OpenMausBot reads it when it starts) |
 | Avibe        | `~/.avibe/config/config.json` (`$AVIBE_HOME`; `~/.vibe_remote` from before 3.0), changed through its control socket `state/dispatch.sock` (Windows: `runtime/control-ipc/endpoint.json`) while it runs | provider (a `magpie` model source on its Models page: custom vendor, OpenAI chat completions at the gateway's `/v1`, with Avibe's own key; Avibe lists magpie's models from the gateway and adds the source to Vibey's, Claude Code's, Codex's and OpenCode's routes. Avibe has to be running to connect or disconnect it) |
+| Kun          | `~/.kun/data/model-connections.v2.json` (`$KUN_DATA_DIR`), changed through its runtime's admin API (`baseUrl` and `runtimeToken` of `runtime.json` in the same folder) while it runs | model (a `magpie` connection in Settings > Providers: HTTP, OpenAI chat completions at the gateway's `/v1`, with Kun's own key and the models picked for Kun; the model picked is Kun's default. Kun has to be running to connect or disconnect it) |
 | OpenHanako   | `~/.hanako/provider-catalog.json` + `agents/<id>/config.yaml` (`$HANA_HOME`; its local API while it runs) | model (the primary agent's; magpie's models as a provider) |
 | AtomCode     | `~/.atomcode/config.toml` (`$ATOMCODE_HOME`) | model, effort (a `magpie` provider account, one model table per catalog model as its own sign-in writes) |
 | Snow CLI     | `~/.snow/profiles/magpie.json` (`$SNOW_CONFIG_DIR`), made the active profile and copied to `config.json` | model (the user's other profiles' models too; Snow App takes the profile in with "Sync Snow CLI API config") |
 | Alma         | Alma's local API (`localhost:23001`, while Alma runs; alma-server's data in `$ALMA_DATA_DIR`, `$XDG_DATA_HOME/alma` or `~/.local/share/alma` on Linux) | model (Alma's default; magpie's models as a provider), and Image Generation's model when it is Auto: the one magpie draws with |
+| Shelley      | Shelley's local socket (`~/.config/shelley/shelley.sock`, `$XDG_CONFIG_HOME/shelley`, `$SHELLEY_SOCKET`; while `shelley serve` runs) | model (the default profile's; magpie's models as Shelley custom models of type `openai` at the gateway's `/v1` with Shelley's own key, one per model picked; the profile's model and thinking level are stashed and put back on Disconnect, and magpie's custom models go) |
 | Lody | Its own confirmation dialog (`lody://provider/import`) | adds selected Claude, Codex, Pi, DSH, Kimi Code, Grok and Bub Providers on the local machine; no settings edited by magpie |
 
 Provider-scoped agents (OpenCode, MiMo Code, DevEco Code, Pi, OmO, StepCode, MothX, PenguinHarness, Aside, Goose, Crush, omp, Hermes Agent) take `provider/model`.
@@ -958,6 +961,40 @@ port, as the agents, MCP servers and status checks magpie wires here do,
 since no certificate for the server's name covers loopback. A container or
 a WSL distro calling through its NAT address is another computer, and uses
 `https://`. Gateway keys, sharing and allowed addresses work as over HTTP.
+
+**HTTPS on the local network.** Without a certificate of your own, turn
+on Settings → Network and sharing → HTTPS (or `magpie https on`; zhangly1
+on X: Claude on another computer needed magpie at `https://`). magpie
+serves other computers `https://` with a certificate its own CA (the mTLS
+one, in `~/.config/magpie/mtls`) signs for this computer's names, its
+addresses and the name the client dialled; this computer keeps plain
+`http://`. Each computer that calls magpie trusts the CA once: Save under
+magpie's CA puts `magpie-ca.crt` in Downloads, and the gateway serves it
+to any address the share lets in, without a key, at
+`https://<this computer>:<port>/magpie-ca.crt` (`curl -kO`, then check its
+SHA-256 against the one Settings and `magpie https` show). Then:
+
+```sh
+# macOS
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain magpie-ca.crt
+# Windows, as administrator
+certutil -addstore -f Root magpie-ca.crt
+# Debian, Ubuntu
+sudo cp magpie-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates
+# Claude Code and other Node apps, which keep their own list
+export NODE_EXTRA_CA_CERTS=/path/to/magpie-ca.crt
+```
+
+Windows' own `curl.exe` checks revocation, which a private CA has none
+of, so it needs `--ssl-no-revoke`; Node, browsers and Claude Code don't.
+
+To serve a certificate of your own instead (one your network's CA, or a
+public one, signed), Import… under Certificate (or `magpie https import
+cert.pem key.pem`): PEM, the certificate with its chain and an
+unencrypted key, in one file or several. It is kept in
+`~/.config/magpie/https` and read again when it changes; Remove goes back
+to magpie's CA. `--tls-cert` comes before both. A page open from another
+computer can't turn HTTPS on or off under itself.
 
 **Client certificates (mTLS).** A magpie open to the internet can also
 ask every other computer for a client certificate it issued itself
@@ -3529,6 +3566,7 @@ magpie web                      # the app's window in a browser (WSL, a server o
                                 # (behind a reverse proxy, MAGPIE_WEB_URL=https://<the page there> prints the link through it)
 magpie serve                    # the gateway alone, no window; --web[=host:port] serves the page too, from the same process
                                 # --tls-cert <file> --tls-key <file>: https:// for other computers (see HTTPS under sharing)
+magpie https                    # https:// for other computers: on, off, import <files>, remove, ca [--out]
 magpie mtls                     # other computers need a client certificate magpie issued: on, off, issue <device>, revoke <device>, list
 magpie daemon install           # run magpie serve as a service (systemd, launchd); --web, --lan, --addr serve the page too; --tls-cert/--tls-key, --no-tls
 magpie ls                       # list every agent and its current settings

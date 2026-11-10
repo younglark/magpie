@@ -236,6 +236,13 @@ type Settings struct {
 	// without a good certificate is refused. This computer's own
 	// (KeepOwn), as LAN is.
 	MTLS bool `json:"mtls,omitempty"`
+	// HTTPS serves the gateway and magpie web's page to other computers
+	// over https:// (zhangly1 on X: Claude on another computer on the LAN
+	// needed https), with the certificate imported in Settings (kept in
+	// <dir>/https) or else one magpie's own CA signs for this computer's
+	// names and addresses (gateway.ServedCert). This computer may still
+	// call plain http://. This computer's own (KeepOwn), as LAN is.
+	HTTPS bool `json:"https,omitempty"`
 	// FetchPrivate are the private hosts and ranges (a name, name:port, an
 	// IP or a CIDR range) magpie may download a URL from that it didn't
 	// choose itself: an image or video a request names or a vendor answers
@@ -730,7 +737,9 @@ type Settings struct {
 	// for bare ids (love1sbug on X; provider.BareEntries). Off by default.
 	BareModelIDs bool `json:"bareModelIDs,omitempty"`
 	// CodexAgentsV1 has the OpenAI models magpie hands Codex — the ChatGPT
-	// account's own, their codex/ ids and the groups one is in — say
+	// account's own, their codex/ ids, the groups one is in, and those a
+	// provider that seals as that backend does serves (catalog.Model.Seals:
+	// a relay of it, brethhbbm on X) — say
 	// multi_agent_version "v1" (#141): their subagents are then handed
 	// their tasks as text, which a magpie-served subagent can read, where
 	// V2's are sealed by OpenAI's server, and it is V1 that a ChatGPT
@@ -1527,7 +1536,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.NoWSLAgents = cur.NoWSLAgents
 	s.QuotaReads = cur.QuotaReads
 	s.NoAccountDiscovery = cur.NoAccountDiscovery
-	s.LAN, s.AllowIPs, s.MTLS = cur.LAN, cur.AllowIPs, cur.MTLS
+	s.LAN, s.AllowIPs, s.MTLS, s.HTTPS = cur.LAN, cur.AllowIPs, cur.MTLS, cur.HTTPS
 	s.RouterNote, s.RouterAllTools = cur.RouterNote, cur.RouterAllTools
 	s.FetchPrivate = cur.FetchPrivate
 	s.SessionTerminal = cur.SessionTerminal
@@ -2027,6 +2036,18 @@ func SetMTLS(on bool) error {
 		return err
 	}
 	s.MTLS = on
+	return save(s, false)
+}
+
+// SetHTTPS sets HTTPS alone, from what the file holds now. A settings
+// file that can't be read is left as it is, with the error.
+func SetHTTPS(on bool) error {
+	defer lockFile()()
+	s, err := loadChecked()
+	if err != nil {
+		return err
+	}
+	s.HTTPS = on
 	return save(s, false)
 }
 

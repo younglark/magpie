@@ -360,7 +360,7 @@ function toneCheck(img) {
     swap();
   }, { once: true });
 }
-const pngIcons = new Set(["crush", "zcode", "alma", "hanako", "cindy", "lody", "typesafe", "atomcode", "snow", "mlx-serve", "mothx", "zoo-code", "kimi-code-desktop", "openbot", "avibe"]);
+const pngIcons = new Set(["crush", "zcode", "alma", "hanako", "cindy", "lody", "typesafe", "atomcode", "snow", "mlx-serve", "mothx", "zoo-code", "kimi-code-desktop", "openbot", "avibe", "kun"]);
 
 // lazy: a picture in a long list (Plugins' rows) is asked for near the
 // screen: each SVG an <img> draws is a ~0.6 MB webview document, kept (#909)
@@ -1286,15 +1286,14 @@ function fillMenuButton(b, a) {
 // what turning one on costs, said in its opened row
 const CONNECT_COST = {
   gemini: "Gemini CLI's requests all go through magpie; its Google sign-in is turned off first and comes back when you disconnect",
-  // its third-party mode has a userData of its own (xgddm88 on X)
-  "claude-desktop": "Chats and projects from your Anthropic sign-in stay in Desktop's own profile, not shown on magpie; nothing is deleted, and turning this off brings them back.",
+  // xgddm88, Jacky_yyyyyyyy on X
+  "claude-desktop": ["Chats and projects from your Anthropic sign-in stay in Desktop's own profile, not shown on magpie; nothing is deleted, and turning this off brings them back.", "To go on with them on magpie, open Settings → Import in Desktop: it can copy in your Claude.ai chats and projects and this computer's earlier sessions, and leaves the originals as they are."],
 };
 // what turning it on changes in it, said before
 const CONNECT_BEFORE = {
   "claude-desktop": "Not connected · on magpie, Claude Desktop opens a separate profile: chats and projects from your Anthropic sign-in stay, and are back when you turn it off",
 };
-// agents that read magpie's list only as they start: copies already
-// running keep the list they started with (agent.Stale)
+// read the list only at start (agent.Stale)
 const STARTS_WITH = new Set(["codex", "claude"]);
 
 let agentExpanded = null; // the connected agent opened in the window
@@ -2279,7 +2278,7 @@ function connectPanel(a, { fields, fieldBtn }) {
   if (a.native) for (const [key, detail] of Object.entries(a.native.fields || {})) {
     if (detail.detail) { const f = a.fields.find((x) => x.key === key); kv(t(f?.label || key), line(t(detail.detail))); }
   }
-  if (CONNECT_COST[kindOf(a)]) kv(t("Once connected"), line(t(CONNECT_COST[kindOf(a)])));
+  if (CONNECT_COST[kindOf(a)]) kv(t("Once connected"), line([].concat(CONNECT_COST[kindOf(a)]).map((s) => t(s)).join(" ")));
   // its own settings (agentPrefRows), shown once read
   const own = agentPrefsOf(a);
   if (own) {
@@ -4352,31 +4351,36 @@ function recoveredOnce() {
     : t("{file} was damaged (the computer likely stopped mid-write), so magpie restored it from its backup. A change made after that may be missing; the damaged file is kept beside it.", { file: files }), "warn", 20000);
 }
 
-// installFrom is what a restart to update tells the app: the window's tab,
-// for the new version to open its window there (Windows, Linux).
+// installFrom: the window's tab, for the new version to open on (Windows, Linux)
 function installFrom() {
   return mode === "window" ? { view } : {};
 }
 
-// updateBusy says what a restart would cut short (#577): the agents'
-// requests in flight through the gateway, the Claude Code turns waiting on
-// their tool results.
-function updateBusyText(b) {
-  const parts = [];
+// updateBusy: what a restart would cut short (#577), and the window in use
+function updateBusyText(b, using) {
+  const parts = using ? [t("waiting while you use magpie")] : [];
   if (b?.requests) parts.push(t("{n} in flight", { n: b.requests }));
   if (b?.tools) parts.push(t("{n} awaiting tool results", { n: b.tools }));
   return parts.join(" · ");
 }
 
-// updatePath asks for the update's state or the release notes in the
-// page's language: the notes follow Settings' language, Chinese where a
-// release has it (freecss on Discord).
+// updatePath: the update's state or notes in the page's language (freecss on Discord)
 function updatePath(p) {
   return p + (p.includes("?") ? "&" : "?") + "lang=" + encodeURIComponent(locale);
 }
 
+// input: in use, so an update waits (inUseAt)
+let usedAt = 0, usedOpen;
+for (const k of "pointerdown keydown input wheel".split(" ")) addEventListener(k, () => {
+  const open = $("#modal")?.hidden === false, now = Date.now();
+  if (now - usedAt < 2e4 && open === usedOpen) return;
+  usedAt = now, usedOpen = open;
+  api("update/using", { open }).catch(() => {});
+}, true);
+
 // renderUpdateBadge shows the header's Update pill once a newer magpie is
 // downloaded or out; Settings or its × keeps it away.
+
 async function renderUpdateBadge() {
   const b = $("#update"), label = b.querySelector("span");
   const u = await api(updatePath("update")).catch(() => null);
@@ -4427,7 +4431,7 @@ async function renderUpdateBadge() {
   // click, not as "now"
   if (u.state === "ready" && u.waiting) {
     label.textContent = t("Waiting to update");
-    const a = { v: u.latest, busy: updateBusyText(u.busy) || "…" };
+    const a = { v: u.latest, busy: updateBusyText(u.busy, u.using) || "…" };
     b.title = u.handover ? t("magpie restarts to update to {v} once the replies through a Claude subscription have finished: {busy}. Other requests carry on across the restart. Click to restart now.", a) : t("magpie restarts to update to {v} once the agents' requests through the gateway have finished: {busy}. Click to restart now.", a);
     b.onclick = () => {
       if (Date.now() - (+b.dataset.armed || 0) < 1500) return;
@@ -4469,9 +4473,8 @@ async function renderUpdateBadge() {
   };
 }
 
-// downloadingText is the pill's word while an update downloads: its percent
-// (none while the size is unknown: "NaN%", inaction on Discord) and speed,
-// then the step after the bytes, never still (esir_tech on Discord)
+// downloadingText: the pill's percent (none for an unknown size, inaction on
+// Discord) and speed, then the step after the bytes (esir_tech on Discord)
 const UPDATE_STEPS = { retry: "Reconnecting…", verify: "Verifying…", unpack: "Unpacking…", signature: "Checking signature…" };
 function downloadingText(u) {
   const p = u?.total > 0 ? Math.floor(((u.done || 0) / u.total) * 100) : NaN, s = UPDATE_STEPS[u?.step];
@@ -4480,14 +4483,12 @@ function downloadingText(u) {
 }
 const speedText = (b) => (b >= 1e6 ? t("{n} MB/s", { n: (b / 1e6).toFixed(1) }) : t("{n} KB/s", { n: Math.max(1, Math.round(b / 1e3)) }));
 
-// updatePillOff is whether the user keeps the Update pill away for v.
 function updatePillOff(v) {
   const s = state?.settings || {};
   return !!s.noUpdatePill || (!!v && s.updateSkip === v);
 }
 
-// skipUpdate hides the Update pill until a version newer than v is out
-// ("" shows it again), and says where it can be brought back.
+// skipUpdate hides the pill until a version newer than v ("" shows it again)
 async function skipUpdate(v) {
   $("#update").hidden = true;
   try {
@@ -4513,9 +4514,8 @@ async function backAsNew(was) {
   }
 }
 
-// servedAnew reloads, once, a browser's page that another version of
-// magpie now answers for (visamzh on X): its magpie restarted into an
-// update put in elsewhere. The badge and the Version row both ask.
+// servedAnew reloads, once, a page another magpie version now answers for
+// (visamzh on X); the badge and the Version row ask
 let reloadingAnew = false;
 function servedAnew(u) {
   if (!web || !pageVersion || !u?.current || u.current === pageVersion) return false;
@@ -4523,9 +4523,8 @@ function servedAnew(u) {
   return true;
 }
 
-// updateStuck says why this magpie can't replace itself where it is: off
-// the Mac, a folder it may not write to, such as C:\ (#1277), or a
-// container, whose image is what gets updated.
+// updateStuck: why magpie can't replace itself: a folder it may not write
+// to off the Mac (C:\, #1277), or a container, whose image gets updated
 function updateStuck(u) {
   const p = u.packaged;
   if (p) return p.command ? t("{manager} installed magpie ({pkg}), so {manager} updates it, not magpie: {cmd}", { manager: p.manager, pkg: p.package, cmd: p.command }) : t("{manager} installed magpie, so {manager} updates it, not magpie.", { manager: p.manager });
@@ -6232,13 +6231,10 @@ function providerHandle(p, row) {
     if (e.shiftKey) arrangeProvider(p.id, up ? 0 : onProviderIds().length - 1, true);
     else stepProvider(p.id, up ? -1 : 1, true);
   };
-  // the click that ends a drag doesn't open the row
   b.addEventListener("click", (e) => { if (b.dataset.dragged) { e.stopPropagation(); e.preventDefault(); } });
   b.onpointerdown = (e) => {
     if (providerArranging) return;
     const list = $("#providers");
-    // while a search hides some, the row moves among the ones shown: it
-    // takes the place of the one it is dropped on (shownToOn)
     const rows = [...list.children].filter((r) => r.classList.contains("provider") && !r.hidden);
     providerArranging = dragRows(e, b, row, list, rows,
       (to) => arrangeProvider(p.id, shownToOn(rows[to]?.dataset.id)), () => { closeProtoMenu(); closeAgentMenu(); }, () => {
@@ -6249,8 +6245,7 @@ function providerHandle(p, row) {
   return b;
 }
 
-// The providers on, in order, and those a search shows: while searching, one
-// moves among those shown; the hidden keep their order.
+// While searching, a row moves among those shown.
 const onProviderIds = () => providers.providers.filter((x) => !x.off).map((x) => x.id);
 const shownProviderIds = () => [...$("#providers").children].filter((r) => r.classList.contains("provider") && !r.hidden).map((r) => r.dataset.id);
 const shownToOn = (id) => (id ? onProviderIds().indexOf(id) : -1);
@@ -6260,8 +6255,7 @@ function stepProvider(id, by, keyboard) {
   arrangeProvider(id, shownToOn(shown[i + by]), keyboard);
 }
 
-// openProviderMenu: a row's right-click (#1614), and Use first, which Smart
-// tries first (hzh_1119 on Discord)
+// openProviderMenu: a row's right-click (#1614), Use first, Never a fallback
 function openProviderMenu(anchor, p) {
   if (!anchor) return;
   const again = agentMenu?.anchor === anchor;
@@ -6276,6 +6270,7 @@ function openProviderMenu(anchor, p) {
     { name: "Move down", icon: MOVE_DOWN, key: ALT + "↓", off: k < 0 || k >= shown.length - 1, run: () => stepProvider(p.id, 1) },
     { name: "Move to bottom", icon: MOVE_BOTTOM, key: ALT + SHIFT + "↓", off: i === on.length - 1, run: () => arrangeProvider(p.id, on.length - 1) },
     { name: "Use first", icon: p.useFirst ? CHECK : "", sep: !0, run: () => accountAction("provider/usefirst", { id: p.id, useFirst: !p.useFirst }, t(p.useFirst ? "{name} takes its turn with the others" : "{name} is used first", { name: p.name })) },
+    { name: "Never a fallback", icon: p.noStandIn ? CHECK : "", run: () => accountAction("provider/standin", { id: p.id, noStandIn: !p.noStandIn }, t(p.noStandIn ? "{name} can be a fallback again" : "{name} is never a fallback for another model", { name: p.name })) },
     ...magpie.actions?.("provider", { provider: { id: p.id, name: p.name } }) || [],
   ]);
 }
@@ -8999,12 +8994,8 @@ const edAlign = new ResizeObserver((es) => {
     if (!n.isConnected) { edAlign.unobserve(n); continue; }
     const cs = getComputedStyle(n.parentElement), cols = cs.gridTemplateColumns.split(" ");
     const lab = cols.length > 1 ? parseFloat(cols[0]) || 0 : 0;
-    // only when changed, and in an open fold a change after the first a
-    // frame later: its rows take the column, so set while the observer is
-    // delivering, the fold's own height changes with it (a label wrapping)
-    // and the browser reports a loop as a page error (a group's editor
-    // narrowed with the window). A closed fold only moves its chevron, so
-    // it follows at once, never a frame out of line
+    // only when changed; an open fold's later change a frame later, or its
+    // own height change is reported as an observer loop (a page error)
     const at = (lab && lab + parseFloat(cs.columnGap)) + "px";
     if (n.style.getPropertyValue("--ed-lab") === lab + "px" && n.style.getPropertyValue("--ed-at") === at) continue;
     const set = () => { n.style.setProperty("--ed-lab", lab + "px"); n.style.setProperty("--ed-at", at); };
@@ -9224,7 +9215,7 @@ function baseAPIOf(p) {
 
 // draftOf is a saved provider as its editor's form holds it.
 function draftOf(p) {
-  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), passHeaders: (p.passHeaders || []).join(", "), icon: p.icon || "", iconFrom: p.iconFrom || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], hiddenVideomakers: [...(p.hiddenVideomakers || [])], searches: !!p.searches, unredacted: !!p.unredacted, countFree: !!p.countFree, billing: p.billing || "", insecureTLS: !!p.insecureTLS, http1: !!p.http1, clientCert: p.clientCert || "", clientKey: p.clientKey || "", serverCA: p.serverCA || "", socket: p.socket || "", limitRestOff: !!p.limitRestOff, passErrors: !!p.passErrors, imageFilesOff: !!p.imageFilesOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: p.passUserAgent !== false, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", listOff: !!p.listOff, contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p), rateWindows: (p.rateWindows || []).map((w) => ({ ...w })) };
+  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), passHeaders: (p.passHeaders || []).join(", "), icon: p.icon || "", iconFrom: p.iconFrom || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], hiddenVideomakers: [...(p.hiddenVideomakers || [])], searches: !!p.searches, unredacted: !!p.unredacted, countFree: !!p.countFree, billing: p.billing || "", insecureTLS: !!p.insecureTLS, http1: !!p.http1, clientCert: p.clientCert || "", clientKey: p.clientKey || "", serverCA: p.serverCA || "", socket: p.socket || "", limitRestOff: !!p.limitRestOff, upstreamProviders: !!p.upstreamProviders, passErrors: !!p.passErrors, imageFilesOff: !!p.imageFilesOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: p.passUserAgent !== false, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", listOff: !!p.listOff, contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p), rateWindows: (p.rateWindows || []).map((w) => ({ ...w })) };
 }
 
 // duplicateProvider opens the Add form on a copy of p, its key p's unless another is pasted (#268).
@@ -9736,6 +9727,13 @@ function drawEditor(p, presetID) {
     c.onchange = () => (draft.libraryMCP = c.checked);
     ed.append(...field(t("MCP servers"), l));
   }
+  // lcc580 on X
+  if ((p?.preset || pr?.id) === "remote-magpie") {
+    const [l, c] = tick(t("With the provider serving it there"), !!draft.upstreamProviders);
+    l.classList.add("upstream-providers");
+    c.onchange = () => { draft.upstreamProviders = c.checked; draft.onUpstreamProviders?.(); };
+    ed.append(...field(t("Model names"), l));
+  }
 
   // A user-defined provider can have its own picture; presets keep theirs.
   if (custom) ed.append(...field(t("Icon"), iconPicker(ed), ""));
@@ -10234,6 +10232,7 @@ function drawEditor(p, presetID) {
     if (certTakes()) for (const k of CERT_FIELDS) body[k] = onHTTPS() ? (draft[k] || "").trim() : "";
     if (socketable()) body.socket = draft.socket || "";
     if (custom) body.limitRestOff = !!draft.limitRestOff;
+    if ((p?.preset || pr?.id) === "remote-magpie") body.upstreamProviders = !!draft.upstreamProviders;
     if (p?.takesImageFiles) body.imageFilesOff = !!draft.imageFilesOff;
     if (p ? p.takesPassErrors : custom) body.passErrors = !!draft.passErrors;
     if (!decideOnly(p || pr)) body.nativeCompaction = !!draft.nativeCompaction && carriesCompaction();
@@ -11525,12 +11524,15 @@ function renderModels(p) {
     const sayLabel = (mode) => {
       const name = prefs[first.id]?.name ?? (first.default ? first.name : "");
       const base = name || first.default || first.name || first.id;
-      let label = suffixed(base, p.name || p.id, !!name, mode);
+      // named by the provider serving it there (lcc580 on X)
+      const up = draft.upstreamProviders && first.by && !(name && (mode || suffixMode()) === "own");
+      let label = up ? (name || first.plain || base) + " · " + (p.name || p.id) + " › " + first.by : suffixed(base, p.name || p.id, !!name, mode);
       // a remote magpie's model: its name there (ARNO)
-      if (!name && first.plain && label === base) label = first.plain;
+      if (!up && !name && first.plain && label === base) label = first.plain;
       sfxSaid.textContent = t("Agents’ lists show “{label}”", { label });
     };
     sayLabel();
+    draft.onUpstreamProviders = () => sayLabel();
     sfx.dataset.mode = suffixMode();
     sfx.drawnAgain = sayLabel;
     const where = el("button", "text action", t("Change in Settings"));
@@ -17064,12 +17066,8 @@ if (mode === "panel") document.addEventListener("visibilitychange", () => {
   if (panelPeek || panelArranging) { panelPeek = ""; panelArranging = false; renderPanelQuota(); }
 });
 
-// The tray panel is four tabs over the one page: the agents, the allowances
-// of every subscription and key (the "usage" tab, as it was named before),
-// what the requests add up to (the "stats" tab, the window's Requests made
-// small) and the gateway's latest requests (routing/client.js draws those). The saved
-// profiles open from Profiles at the Agents tab's foot, over the list (a tab
-// of their own was one too many). The tab is remembered.
+// The tray panel's four tabs: agents, allowances ("usage"), totals ("stats")
+// and latest requests; Profiles opens at the Agents tab's foot.
 const profBtn = $("#profBtn"), profBox = $(".profiles");
 function placeProfiles() {
   if (!profBox.classList.contains("open")) return;
@@ -20045,6 +20043,7 @@ function renderSettings() {
   renderLAN(s);
   renderAllow(s);
   renderMTLS(s);
+  renderHTTPS(s);
   renderCORS(s);
   renderSync();
 
@@ -21661,25 +21660,24 @@ function renderReplies(s, keep) {
   box.replaceChildren();
   const onOff = [["off", t("Off")], ["on", t("On")]];
   const r = replyModelRow(s, keep);
-  // a reply stuck in a loop is ended with an error the agent can act on,
-  // not let run to its output limit (#1359): on unless turned off
+  // #1359
   const l = segRow("loopGuardRow", t("Stop looping replies"),
     t("A reply whose reasoning or text goes round the same few lines is ended with an error the agent can retry, not left to run to its output limit"),
     onOff, s.noLoopGuard ? "off" : "on", (v) => savePrefs({ ...keep, noLoopGuard: v === "off" }));
-  // how many more are asked after a safety refusal (#248): every one unless set
+  // #248
   const counts = [["0", t("Never ask again")], ["1", "1"], ["2", "2"], ["3", "3"]];
   const n = s.refusalRetries == null || s.refusalRetries < 0 ? "" : String(s.refusalRetries);
   if (n && !counts.some(([id]) => id === n)) counts.push([n, n]); // set by hand in settings.json
   const f = segRow("refusalRetriesRow", t("Ask again after a refusal"),
     t("When a vendor's safety filter refuses a request before anything is said, how many more accounts or routing group members are asked. Never ask again hands the refusal straight back: Claude Code then switches to its own fallback model, as it does on Anthropic's API"),
     [...counts, ["", t("All")]], n, (v) => savePrefs({ ...keep, refusalRetries: v === "" ? null : Number(v) }));
-  // longest Retry-After an agent is told (#5371): as it came unless set
+  // #5371
   const ra = s.retryAfterCap > 0 ? String(s.retryAfterCap) : "", waits = [60, 300, 900].map((n) => [String(n), t("{n} min", { n: n / 60 })]);
   if (ra && !waits.some(([id]) => id === ra)) waits.push([ra, t("{n} s", { n: ra })]);
   const a = segRow("retryAfterCapRow", t("Longest wait an agent is told"),
     t("When a limit has every account resting, an agent is told when to ask again, which can be hours away. A shorter wait lets an agent with its own fallback models move on sooner. The accounts rest as long either way"),
     [...waits, ["", t("No limit")]], ra, (v) => savePrefs({ ...keep, retryAfterCap: v === "" ? null : Number(v) }));
-  // how long a routing group's classifier is given: 8 seconds unless set (#2934)
+  // #2934
   const k = waitRow("classifyTimeoutRow", t("Intent classifier timeout"), t("How long a routing group's classifier is given to say which intent a turn is. The turn waits for it before it goes anywhere, and past it goes on without its answer. A slow classifier may need longer"),
     [8, 15, 30, 60], s.classifyTimeout > 0 ? s.classifyTimeout : 8, "{n} s", (n) => savePrefs({ ...keep, classifyTimeout: n }));
   // the agent's instructions as a Claude run's system prompt (off unless on)
@@ -21698,32 +21696,52 @@ function renderReplies(s, keep) {
   $("#routeList").replaceChildren(f, a, k, $("#busyLoadRow"));
 }
 
-// renderDisabledModels: models turned off for every request (#1867), a row per pattern
+// renderDisabledModels: models turned off for every request (#1867), a row per
+// pattern; its writes go one after another (disabledSaves)
+let disabledSaves = Promise.resolve();
 function renderDisabledModels(s) {
   const box = $("#disabledModelsList");
   if (!box) return;
   const list = s.disabledModels || [];
-  const save = (next) => writingPrefs(api("settings/disabled-models", { models: next }))
+  const save = (next) => (disabledSaves = disabledSaves.then(() => writingPrefs(api("settings/disabled-models", { models: next }))
     .then((ns) => { prefs = ns; renderSettings(); })
-    .catch(settingsErr);
+    .catch(settingsErr)));
   const add = el("div", "row pref");
   add.id = "disabledAddRow";
   const who = el("div", "who");
   who.append(el("div", "name", t("Disable a model")),
     el("div", "sub wraps", t("A disabled model is refused on every route through magpie (a request, a session, a routing group, a fallback, a sub-agent, a decision model) and left out of magpie's lists and agents' pickers. Only requests through magpie are covered. Type a pattern such as *fable* to disable every model it matches")));
   const val = el("div", "val");
-  const b = el("button", "text action", t("Disable…"));
+  const b = pick?.anchor?.id === "disabledAdd" ? pick.anchor : el("button", "text action", t("Disable…"));
   b.type = "button";
   b.id = "disabledAdd";
   const models = (s.titleModels || []).filter((x) => x.provider);
-  b.onclick = (ev) => openPicker({ id: "", name: "", fields: [] }, { key: "disabledModels", label: "model", value: "",
-    options: models.map(modelOpt),
-    onPick: (id) => {
-      id = String(id || "").trim();
-      if (!id || list.some((p) => p.toLowerCase() === id.toLowerCase())) return;
-      save([...list, id]);
-    } }, b, ev);
+  // several at once, ticked or not (char1es_lu on X)
+  b.onclick = (ev) => {
+    let have = [...list];
+    const at = (id) => have.findIndex((p) => p.toLowerCase() === String(id).toLowerCase());
+    const own = (id) => ({ value: id, label: id, group: "" });
+    const options = models.map(modelOpt);
+    for (const p of [...have].reverse()) if (!options.some((o) => o.value.toLowerCase() === p.toLowerCase())) options.unshift(own(p));
+    openPicker({ id: "", name: "", fields: [] }, { key: "disabledModels", label: "model", value: "", multi: true,
+      options, picked: (id) => at(id) >= 0,
+      onPick: (id) => {
+        id = String(id || "").trim();
+        if (!id) return;
+        const i = at(id);
+        have = i >= 0 ? have.filter((_, j) => j !== i) : [...have, id];
+        if (i < 0 && pick && !pick.options.some((o) => o.value === id)) pick.options.unshift(own(id));
+        save(have);
+      } }, b, ev);
+  };
   val.append(b);
+  if (list.length > 1) {
+    const all = el("button", "text", t("Enable all"));
+    all.type = "button";
+    all.id = "disabledEnableAll";
+    all.onclick = () => save([]);
+    val.append(all);
+  }
   add.append(who, val);
   const rows = list.map((pat) => {
     const r = el("div", "row pref disabled-model");
@@ -22436,7 +22454,7 @@ async function renderUpdate(r, u) {
         sub.textContent = t("Restarting…");
         backAsNew(u.current);
       };
-      const busyNow = updateBusyText(u.busy);
+      const busyNow = updateBusyText(u.busy, u.using);
       if (u.waiting) {
         sub.textContent += " · " + (u.handover ? t("restarts once the Claude subscription's replies have finished") : t("restarts once the gateway is idle")) + (busyNow ? " · " + busyNow : "");
         btn(t("Restart now"), () => install("now"));
@@ -22979,12 +22997,8 @@ function setRoom(v, px) {
   r.style.height = px + "px";
   room.set(v, px);
 }
-// Where what's in the view ends, its padding at the foot included, the room
-// aside. Not scrollHeight less the room: scrollHeight is never less than the
-// view is tall, so under a list shorter than the view (the agents rolled up
-// in a tall window) it counted the empty foot as content, the room made was
-// too short to hold the list, and each frame's hold and fit took turns
-// adding and taking it away, the list swinging between two places (#355).
+// Where the view's content ends, the room aside; never scrollHeight less
+// the room, which is never under the view's height (#355).
 function contentEnd(v) {
   const top = v.getBoundingClientRect().top - v.scrollTop;
   let end = 0;
@@ -23184,7 +23198,7 @@ async function show(v) {
   $("#pageTitle").textContent = t(title);
   if (mode === "window") {
     markNav(v);
-    if (!sideNav()) { slide($("#nav"), "nav"); navInSight(); }
+    if (!sideNav()) slide($("#nav"), "nav");
     else navTopGo($("#nav").querySelector("button[data-view].on"), true);
   }
   $("#prefs").classList.toggle("on", v === "settings");
@@ -23524,18 +23538,9 @@ function wag() {
 document.querySelector(".brand")?.addEventListener("mouseenter", wag);
 setTimeout(wag, 250);
 
-// magpie web on a phone, or a browser as narrow: the header is two rows,
-// the magpie and the icons over the tabs, which scroll sideways when they
-// don't fit, the one open kept in sight
+// magpie web on a phone, or a browser as narrow: the tabs are a bar at the foot
 function phoneWeb() { return document.body.classList.contains("web") && matchMedia("(max-width: 760px), (pointer: coarse) and (max-width: 1024px)").matches; }
-function navInSight() {
-  const nav = $("#nav"), on = nav?.querySelector("button.on");
-  if (!phoneWeb() || !on || nav.scrollWidth <= nav.clientWidth) return;
-  const l = on.offsetLeft - 16, r = on.offsetLeft + on.offsetWidth + 16 - nav.clientWidth;
-  if (nav.scrollLeft > l) nav.scrollLeft = l;
-  else if (nav.scrollLeft < r) nav.scrollLeft = r;
-}
-matchMedia("(max-width: 760px), (pointer: coarse) and (max-width: 1024px)").addEventListener?.("change", () => { layoutNav(); fitTop(); navInSight(); });
+matchMedia("(max-width: 760px), (pointer: coarse) and (max-width: 1024px)").addEventListener?.("change", () => { layoutNav(); fitTop(); });
 
 // A narrow window has no room for the whole header: the name goes, leaving
 // the magpie, and Update becomes its arrow; narrower still, the tabs stop
@@ -23605,7 +23610,8 @@ try { navPick = localStorage.getItem("magpie.navLayout") || ""; } catch { /* by 
 if (navPick !== "side" && navPick !== "top") navPick = "";
 function layoutNav() {
   if (mode !== "window") return;
-  // magpie web on a phone has its own tab bar and no title bar
+  // magpie web on a phone has its own tab bar (phonetabs.js) and no title bar
+  if (phoneWeb()) import("./phonetabs.js").catch(() => {});
   const on = !phoneWeb() && (navPick ? navPick === "side" : sideQuery.matches);
   if (layoutNav.done && on === sideNav()) {
     // the button goes with the phone's layout all the same
@@ -23636,7 +23642,7 @@ function layoutNav() {
   navSubs.quiet = true;
   navSubs();
   navSubs.quiet = false;
-  if (!on) { slide(nav, "nav"); navInSight(); } else { sideGwRead(); renderSideGw(); }
+  if (!on) slide(nav, "nav"); else { sideGwRead(); renderSideGw(); }
   navTopGo(navTopOn(), false);
   sideWidth();
   renderSideToggle();

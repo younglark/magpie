@@ -153,6 +153,16 @@ type Provider struct {
 	// always has (routes.Seat.Lead).
 	UseFirst bool `json:"useFirst,omitempty"`
 
+	// NoStandIn keeps another model's request off it (sonnnnnnnnnnnna on
+	// X): a request that went first to a provider not so marked, such as
+	// a local uncensored model that is down or out of room, is never sent
+	// on to it as a fallback or a routing group's next member, so text
+	// written for that model can't get a vendor's account banned. One
+	// that goes first to it, or to another provider so marked, still
+	// moves on as ever. Off, the default, it stands in for any. See
+	// gateway.standInsOut.
+	NoStandIn bool `json:"noStandIn,omitempty"`
+
 	// Affinity is how long a conversation stays with the key or account
 	// that answered it, so the vendor's prompt cache it filled is read
 	// again rather than lost (see Affinities): "" auto, "session",
@@ -338,6 +348,15 @@ type Provider struct {
 	// once through DeepSeek's Files API, for a day, and the turns name it
 	// by its file id (gateway's deepseek_files.go, #5407).
 	ImageFilesOff bool `json:"imageFilesOff,omitempty"`
+
+	// UpstreamProviders, on a Remote magpie, `upstream-providers=on`, names each
+	// of its models in the agents' lists by the provider serving it on
+	// the other magpie, the first in a chain of them: "Claude Sonnet 5 ·
+	// Office › RelayA", whatever that magpie's own Provider in model names
+	// is, so one model from two of its providers is told apart here
+	// (lcc580 on X). Off, the default, names each as that magpie's list
+	// does. The ids stay as they are: office/relaya/claude-sonnet-5.
+	UpstreamProviders bool `json:"upstreamProviders,omitempty"`
 
 	// PromptAsWritten, on Antigravity's subscription, has the system prompt
 	// go to Google exactly as the agent wrote it. By default the few lines
@@ -1065,6 +1084,7 @@ func accountSettings(a, pk Provider) Provider {
 	a.AccountCaps, a.AccountWindowCaps, a.AccountWindowAmounts = pk.AccountCaps, pk.AccountWindowCaps, pk.AccountWindowAmounts
 	a.CapStop, a.CapCareful = pk.CapStop, pk.CapCareful
 	a.UseFirst = pk.UseFirst
+	a.NoStandIn = pk.NoStandIn
 	a.AccountNames = pk.AccountNames
 	a.MaxConcurrency, a.PinUpstream = pk.MaxConcurrency, pk.PinUpstream
 	a.MaxAccounts = pk.MaxAccounts
@@ -1512,6 +1532,7 @@ func AddCopy(p Provider, from string) (string, error) {
 	}
 	p.Searches = p.Searches || src.Searches
 	p.Unredacted = p.Unredacted || src.Unredacted
+	p.NoStandIn = p.NoStandIn || src.NoStandIn
 	p.CountFree = p.CountFree || src.CountFree
 	if p.Billing == "" {
 		p.Billing = src.Billing
