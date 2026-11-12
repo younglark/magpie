@@ -29,9 +29,16 @@ type Library struct {
 	// Hooks are commands the agents ticked for each run at a point of
 	// their turn (hooks.go, #1790)
 	Hooks []*Hook `json:"hooks,omitempty"`
+	// Env are the environment variables the agents ticked for each are
+	// given in their own settings (env.go)
+	Env []*EnvVar `json:"env,omitempty"`
 	// Subagents are agents of their own the agents ticked for each can
 	// hand a task to (subagents.go, #2283)
 	Subagents []*Subagent `json:"subagents,omitempty"`
+	// Plugins are the Claude Code plugins kept as one item each: its
+	// skills, servers, hooks and subagents are the items above marked
+	// with its name (plugin.go)
+	Plugins []*Plugin `json:"plugins,omitempty"`
 	// Applied is what magpie wrote into each agent, so that what it takes
 	// away is only ever its own.
 	Applied map[string]*Applied `json:"applied,omitempty"`
@@ -75,6 +82,12 @@ type Library struct {
 	// BridgesOn are the Remote magpies (provider ids) the user asked to
 	// give their router a server, in the editor's switch (bridge_mcp.go)
 	BridgesOn []string `json:"bridgesOn,omitempty"`
+	// BorrowOn are the Remote magpies (provider ids) whose Library's
+	// skills and prompts this computer uses, and Borrowed what it took
+	// from each (borrow.go). This computer's own: Collect doesn't carry
+	// either.
+	BorrowOn []string             `json:"borrowOn,omitempty"`
+	Borrowed map[string]*Borrowed `json:"borrowed,omitempty"`
 	// SeenSkills are, by repository and ref ("owner/repo@ref", or a git
 	// address and ref), or by a folder the user added ("folder:<path>"),
 	// the folders of skills there the page has offered: picked or not at
@@ -137,6 +150,9 @@ type Applied struct {
 	// Hooks are the entries magpie wrote into the agent's hooks, each
 	// exactly as written: one changed since is the user's (hooks.go)
 	Hooks []HookEntry `json:"hooks,omitempty"`
+	// Env are the variables magpie wrote into the agent's settings, with
+	// their values: one there with another value since is the user's
+	Env []EnvEntry `json:"env,omitempty"`
 	// Subagents are the files magpie wrote for the subagents, each with
 	// the hash of what it wrote: one changed since is the user's
 	Subagents []SubagentFile `json:"subagents,omitempty"`
@@ -162,7 +178,7 @@ type Applied struct {
 // it looked at the agent through (#4247).
 func (a *Applied) empty() bool {
 	return !a.Instructions && a.InstrHash == "" && len(a.MCP) == 0 && len(a.Skills) == 0 &&
-		len(a.ToolsOff) == 0 && len(a.ToolRules) == 0 && len(a.Hooks) == 0 &&
+		len(a.ToolsOff) == 0 && len(a.ToolRules) == 0 && len(a.Hooks) == 0 && len(a.Env) == 0 &&
 		len(a.Subagents) == 0 && len(a.Startup) == 0 && len(a.Picked) == 0 && !a.Router && len(a.RouterRules) == 0
 }
 
@@ -216,6 +232,10 @@ func (l *Library) save() error {
 	sort.Slice(l.Hooks, func(i, j int) bool { return l.Hooks[i].Name < l.Hooks[j].Name })
 	for _, h := range l.Hooks {
 		h.Agents = orNone(h.Agents)
+	}
+	sort.Slice(l.Env, func(i, j int) bool { return l.Env[i].Name < l.Env[j].Name })
+	for _, e := range l.Env {
+		e.Agents = orNone(e.Agents)
 	}
 	sort.Slice(l.Subagents, func(i, j int) bool { return l.Subagents[i].Name < l.Subagents[j].Name })
 	for _, s := range l.Subagents {

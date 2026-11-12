@@ -24,6 +24,9 @@ type Result struct {
 	// fetched again and the ones that couldn't be (What is skill:<name>)
 	Updated   []string  `json:"updated,omitempty"`
 	Unupdated []Problem `json:"unupdated,omitempty"`
+	// Current is, for an update of one skill, that skill when what was
+	// fetched is the files it already had
+	Current []string `json:"current,omitempty"`
 	// Gone are, for an update of skills, the ones their sources no longer
 	// have: removed there, not failed (skill_gone.go)
 	Gone []string `json:"gone,omitempty"`
@@ -108,6 +111,7 @@ func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
 			l.syncInstructions(t, b, res, true)
 			l.syncMCP(t, b, res)
 			l.syncHooks(t, b, res)
+			l.syncEnv(t, b, res)
 			l.syncSubagents(t, b, res)
 		})
 	}
@@ -119,6 +123,7 @@ func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
 		steps = append(steps, func(l *Library) {
 			l.syncMCP(t, b, res)
 			l.syncHooks(t, b, res)
+			l.syncEnv(t, b, res)
 			l.syncSkills(t, res, all)
 		})
 	}
@@ -458,6 +463,7 @@ type ServerView struct {
 // SkillView is a library skill as the page shows it.
 type SkillView struct {
 	Name        string            `json:"name"`
+	Bundle      string            `json:"bundle,omitempty"` // the plugin it came with
 	Description string            `json:"description"`
 	Source      string            `json:"source,omitempty"`
 	Kind        string            `json:"kind"`             // github, git, folder, or "" for one kept in the library
@@ -506,13 +512,19 @@ type View struct {
 	// this computer can take of them (hooks.go)
 	Hooks      []HookView      `json:"hooks"`
 	HookAgents []HookAgentView `json:"hookAgents"`
+	// Env are the library's variables, and EnvAgents what each agent on
+	// this computer can take of them (env.go)
+	Env       []EnvView      `json:"env"`
+	EnvAgents []EnvAgentView `json:"envAgents"`
 	// Subagents are the library's subagents, and SubagentAgents what
 	// each agent on this computer makes of them (subagents.go)
 	Subagents      []SubagentView      `json:"subagents"`
 	SubagentAgents []SubagentAgentView `json:"subagentAgents"`
 	FoundServers   []Found             `json:"foundServers"`
-	Skills         []SkillView         `json:"skills"`
-	FoundSkills    []FoundSkill        `json:"foundSkills"`
+	// Plugins are the plugins kept as one item each (plugin.go)
+	Plugins     []PluginView `json:"plugins"`
+	Skills      []SkillView  `json:"skills"`
+	FoundSkills []FoundSkill `json:"foundSkills"`
 	// NewSkills are skills a check found its skills' repositories, or
 	// the folders they were added from, to have beside them since, to
 	// add or set aside
@@ -703,10 +715,12 @@ func readView(problems []Problem, glance bool) (*View, error) {
 		v.Servers = append(v.Servers, sv)
 	}
 	v.Hooks, v.HookAgents = l.hooksView(append(slices.Clone(targets), gone...), asleep, of)
+	v.Env, v.EnvAgents = l.envView(append(slices.Clone(targets), gone...), of)
 	v.Subagents, v.SubagentAgents = l.subagentsView(targets, asleep, of)
+	v.Plugins = l.pluginsView()
 	tr := &tracer{}
 	for _, s := range l.Skills {
-		sv := SkillView{Name: s.Name, Agents: append([]string{}, s.Agents...), Icon: skillIcon(s), Problems: of("skill:" + s.Name), Repo: tr.repoOf(s), OffHere: s.OffHere, Note: s.Note, Router: s.Router}
+		sv := SkillView{Name: s.Name, Bundle: s.Bundle, Agents: append([]string{}, s.Agents...), Icon: skillIcon(s), Problems: of("skill:" + s.Name), Repo: tr.repoOf(s), OffHere: s.OffHere, Note: s.Note, Router: s.Router}
 		if s.Source != nil {
 			sv.Source, sv.Kind = s.Source.String(), s.Source.Kind
 		}
@@ -804,6 +818,11 @@ func SaveServer(old string, s Server) (*Result, error) {
 			// the tools turned off stay, the editor not sending them
 			if s.DisabledTools == nil {
 				s.DisabledTools = l.MCP[i].DisabledTools
+			}
+			// so do the accounts, which have calls of their own
+			if s.Accounts == nil && s.Account == "" {
+				s.Accounts, s.Account = l.MCP[i].Accounts, l.MCP[i].Account
+				_ = s.checkAccounts()
 			}
 			// a plugin's server stays the plugin's, and on this computer
 			if p := l.MCP[i].Plugin; p != "" && s.Plugin == "" {

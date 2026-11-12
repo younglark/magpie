@@ -37,6 +37,10 @@ type Bundle struct {
 	// as Subagents are: Put keeps this computer's. Applied.Hooks, the
 	// entries magpie wrote into each agent here, stays out.
 	Hooks *[]*Hook `json:"hooks,omitempty"`
+	// Env is nil in a bundle from a magpie before variables were carried:
+	// Put keeps this computer's. Applied.Env stays out. A backup made
+	// without keys carries the names with empty values (WithoutSecrets).
+	Env *[]*EnvVar `json:"env,omitempty"`
 }
 
 // CarriedSkill is a skill with its folder's files.
@@ -130,6 +134,13 @@ func Collect() (*Bundle, error) {
 		hooks = append(hooks, &c)
 	}
 	b.Hooks = &hooks
+	envs := []*EnvVar{}
+	for _, e := range sorted(l.Env, func(e *EnvVar) string { return e.Name }) {
+		c := *e
+		c.Agents = orNone(slices.Sorted(slices.Values(e.Agents)))
+		envs = append(envs, &c)
+	}
+	b.Env = &envs
 	return b, nil
 }
 
@@ -147,7 +158,10 @@ func orNone(xs []string) []string {
 // readSkills is each skill folder's files. Links in it, .git and what
 // isn't a plain file stay out. What goes is chosen smallest first across
 // every skill, so the text of them all comes before any big file.
-func readSkills(dirs []string) []*CarriedSkill {
+func readSkills(dirs []string) []*CarriedSkill { return readSkillsMax(dirs, maxCarried, maxCarriedAll) }
+
+// readSkillsMax is readSkills with a file's and the whole's budget given.
+func readSkillsMax(dirs []string, perFile, all int64) []*CarriedSkill {
 	type file struct {
 		skill  int
 		rel, p string
@@ -187,10 +201,10 @@ func readSkills(dirs []string) []*CarriedSkill {
 	slices.SortFunc(files, func(a, b file) int {
 		return cmp.Or(cmp.Compare(a.size, b.size), cmp.Compare(a.skill, b.skill), strings.Compare(a.rel, b.rel))
 	})
-	budget := int64(maxCarriedAll)
+	budget := all
 	for _, f := range files {
 		c := out[f.skill]
-		if f.size > maxCarried || f.size > budget {
+		if f.size > perFile || f.size > budget {
 			c.Left = append(c.Left, f.rel)
 			continue
 		}
@@ -198,7 +212,7 @@ func readSkills(dirs []string) []*CarriedSkill {
 		if err != nil {
 			continue
 		}
-		if n := int64(len(data)); n > maxCarried || n > budget { // grew since
+		if n := int64(len(data)); n > perFile || n > budget { // grew since
 			c.Left = append(c.Left, f.rel)
 			continue
 		}
@@ -277,6 +291,21 @@ func (b *Bundle) check() error {
 			seen[s.Name] = true
 		}
 	}
+	if b.Env != nil {
+		seen := map[string]bool{}
+		for _, e := range *b.Env {
+			if e == nil {
+				return fmt.Errorf("an empty variable")
+			}
+			if err := e.check(); err != nil {
+				return err
+			}
+			if seen[e.Name] {
+				return fmt.Errorf("the variable %s twice", e.Name)
+			}
+			seen[e.Name] = true
+		}
+	}
 	if b.Hooks != nil {
 		seen := map[string]bool{}
 		for _, h := range *b.Hooks {
@@ -311,9 +340,25 @@ func localFile(rel string) bool {
 // WithoutSecrets empties the values of the servers' environment variables
 // and headers that secret says hold one; their names stay, to be filled in.
 func (b *Bundle) WithoutSecrets(secret func(string) bool) {
+	// a variable's name says nothing of what its value is: every value
+	// goes, the names stay
+	if b.Env != nil {
+		envs := []*EnvVar{}
+		for _, e := range *b.Env {
+			c := *e
+			c.Value = ""
+			envs = append(envs, &c)
+		}
+		b.Env = &envs
+	}
 	for i, s := range b.MCP {
 		c := *s
 		c.Env, c.Headers = blank(s.Env, secret), blank(s.Headers, secret)
+		c.Accounts = nil
+		for _, a := range s.Accounts {
+			a.Headers = blank(a.Headers, secret)
+			c.Accounts = append(c.Accounts, a)
+		}
 		// an OAuth app's secret is a key too; its client ID isn't
 		if s.OAuth != nil && s.OAuth.ClientSecret != "" {
 			a := *s.OAuth
@@ -347,11 +392,29 @@ func (b *Bundle) WithSecrets(have *Bundle, secret func(string) bool) *Bundle {
 	}
 	out := *b
 	out.MCP = nil
+	if b.Env != nil && have.Env != nil {
+		envs := []*EnvVar{}
+		for _, e := range *b.Env {
+			c := *e
+			if i := slices.IndexFunc(*have.Env, func(h *EnvVar) bool { return h.Name == e.Name }); i >= 0 && c.Value == "" {
+				c.Value = (*have.Env)[i].Value
+			}
+			envs = append(envs, &c)
+		}
+		out.Env = &envs
+	}
 	for _, s := range b.MCP {
 		c := *s
 		i := slices.IndexFunc(have.MCP, func(h *Server) bool { return h.Name == s.Name })
 		if i >= 0 {
 			c.Env, c.Headers = filled(s.Env, have.MCP[i].Env, secret), filled(s.Headers, have.MCP[i].Headers, secret)
+			c.Accounts = nil
+			for _, a := range s.Accounts {
+				if j := slices.IndexFunc(have.MCP[i].Accounts, func(h Account) bool { return h.ID == a.ID }); j >= 0 {
+					a.Headers = filled(a.Headers, have.MCP[i].Accounts[j].Headers, secret)
+				}
+				c.Accounts = append(c.Accounts, a)
+			}
 			// the same app's secret, kept here
 			if h := have.MCP[i].OAuth; s.OAuth != nil && s.OAuth.ClientSecret == "" && h != nil && h.ClientID == s.OAuth.ClientID {
 				a := *s.OAuth
@@ -545,6 +608,16 @@ func Put(b *Bundle) (*Result, error) {
 				hooks = append(hooks, &c)
 			}
 			l.Hooks = hooks
+		}
+		// variables the same way: Applied.Env decides what is taken out
+		if b.Env != nil {
+			envs := []*EnvVar{}
+			for _, e := range *b.Env {
+				c := *e
+				c.Agents = slices.Clone(orNone(e.Agents))
+				envs = append(envs, &c)
+			}
+			l.Env = envs
 		}
 		return nil
 	})

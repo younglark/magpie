@@ -257,6 +257,12 @@ type Row struct {
 	Canceled bool `json:"canceled,omitempty"`
 }
 
+// ModelSpeed is a usage.ModelSpeed with the name the page shows the model by.
+type ModelSpeed struct {
+	usage.ModelSpeed
+	Name string `json:"name"`
+}
+
 type Ledger struct {
 	CallerKeys []Group      `json:"callerKeys"`
 	Period     usage.Period `json:"period"`
@@ -292,6 +298,14 @@ type Ledger struct {
 	// Computers: this one ("this", no name) and the others whose usage
 	// sync brought (#542), for the filter; none while there are none
 	Computers []Share `json:"computers,omitempty"`
+	// Speeds: the models of the rows the filter keeps by the median speed
+	// of their requests and of their wait for the first token (usage.ModelSpeed)
+	Speeds []ModelSpeed `json:"speeds"`
+	// SpeedMin is the fewest output tokens a request wrote to count in it
+	SpeedMin int `json:"speed_min"`
+	// BigWrite: the request that wrote the most to the cache, of the rows
+	// the filter keeps
+	BigWrite usage.BigWrite `json:"big_write"`
 }
 
 // Share is a usage.Share with the name and logo the page shows it by.
@@ -356,6 +370,7 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 	out.Through, out.Direct, out.Reported = l.Through, l.Direct, l.Reported
 	out.Bucket, out.Series = l.Bucket, l.Series
 	out.Purposes = l.Purposes
+	out.BigWrite = l.Big
 	out.Day = f.Day
 	out.CallerKeys = inKeyOrder(callerGroups(usage.Summary{CallerKeys: l.CallerKeys}))
 	callerLabels := map[string]string{}
@@ -450,6 +465,15 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 	out.By = sharesJSON(l.By)
 	if l.ChartBy != nil {
 		out.ChartBy = sharesJSON(l.ChartBy)
+	}
+	out.Speeds = []ModelSpeed{}
+	out.SpeedMin = usage.MinRankTokens
+	for _, s := range l.Speeds {
+		name := s.Model
+		if pub != nil {
+			name = pub(name)
+		}
+		out.Speeds = append(out.Speeds, ModelSpeed{ModelSpeed: s, Name: name})
 	}
 	for _, s := range l.Computers {
 		ls := Share{Share: s, Name: l.Names[s.ID]}

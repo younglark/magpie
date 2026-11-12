@@ -9,3 +9,4 @@
 /internal/update/launcher-*.com
 .DS_Store
 .idea
+/internal/gui/assets.zip

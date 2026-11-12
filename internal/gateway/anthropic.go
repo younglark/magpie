@@ -205,6 +205,16 @@ func readAnthropic(body []byte, clientMarks, facts bool) (*Request, error) {
 					if b.Source != nil {
 						msg.Parts = append(msg.Parts, Part{Kind: Image, MediaType: b.Source.MediaType, Data: b.Source.Data, URL: b.Source.URL, block: true})
 					}
+				case "video":
+					// MiniMax's Anthropic endpoint takes a video in the image
+					// block's shape (#6135): a File of the video, which every
+					// builder sends on or turns away, never leaves out
+					if b.Source != nil {
+						if v, ok := videoPart(cmp.Or(b.Source.Data, b.Source.URL), cmp.Or(b.Source.MediaType, "video/mp4"), ""); ok {
+							v.block = true
+							msg.Parts = append(msg.Parts, v)
+						}
+					}
 				case "tool_use":
 					msg.Parts = append(msg.Parts, Part{Kind: ToolCall, ID: anthropicInID(b.ID), Name: b.Name, Args: b.Input, block: true})
 				case "tool_result":
@@ -289,13 +299,32 @@ func readAnthropic(body []byte, clientMarks, facts bool) (*Request, error) {
 	} else if th != nil && (th.Type == "enabled" || th.Type == "adaptive") {
 		r.Thinking = true
 		r.Effort = effortOfBudget(th.BudgetTokens)
-		if oc := a.OutputConfig; oc != nil {
-			if e := effortOf(oc.Effort); e != "" {
-				r.Effort = e
-			}
+		if oc := a.OutputConfig; oc != nil && effortOf(oc.Effort) != "" {
+			r.Effort = effortOf(oc.Effort)
+		} else if e := turnEffort(body); e != "" {
+			// the level of the turn, kept in a message of its own (Claude
+			// Desktop's and Claude Code's {role: "system"} message with an
+			// output_config), is the one picked; the budget beside it is
+			// only nearest to it (a High asked as 31999 read as Max)
+			r.Effort = e
 		}
 	}
 	return r, nil
+}
+
+// turnEffort is the last effort a message of an Anthropic request carries
+// in its own output_config; "" when none does.
+func turnEffort(body []byte) string {
+	if !bytes.Contains(body, []byte(`"output_config"`)) {
+		return ""
+	}
+	last := ""
+	for _, e := range gjson.GetBytes(body, "messages.#.output_config.effort").Array() {
+		if v := effortOf(e.String()); v != "" {
+			last = v
+		}
+	}
+	return last
 }
 
 // thinkingOffUnlessAsked says thinking is off when the request doesn't
@@ -943,6 +972,12 @@ func anthropicBody(r *Request, model, host string, replay bool) []byte {
 					rest = append(rest, aBlock{Type: "text", Text: p.Text, CacheControl: partMark(p.cache)})
 				}
 			case File:
+				if isVideo(p) && !r.videoOff {
+					b := videoBlock(p)
+					b.CacheControl = partMark(p.cache)
+					rest = append(rest, b)
+					break
+				}
 				rest = append(rest, aBlock{Type: "text", Text: attachmentText(p)})
 			case Image:
 				b := imageBlock(p)
