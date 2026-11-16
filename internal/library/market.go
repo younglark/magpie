@@ -100,6 +100,7 @@ var featured = []MarketServer{
 	searchServer(),
 	visionServer(),
 	memoryServer(),
+	sessionsServer(),
 	evermeServer(),
 	nowledgeServer(),
 	remoteServer("context7", "Context7", "Upstash", gh("upstash"), "https://mcp.context7.com/mcp",
@@ -242,7 +243,8 @@ func visionServer() MarketServer {
 const memoryServerName = "magpie-memory"
 
 // memoryServer is Magpie Memory: what is known about the user, kept by
-// magpie for every agent, as memory_search, memory_save and memory_forget,
+// magpie for every agent, as memory_search, memory_save, memory_forget and
+// memory_context,
 // through `magpie mcp memory`, which passes each call to the gateway's
 // MemoryMCPPath with the folder the agent started it in. It is there to be
 // shared and costs nothing, so, unlike magpie's other servers, it is given
@@ -250,6 +252,22 @@ const memoryServerName = "magpie-memory"
 func memoryServer() MarketServer {
 	return localServer(memoryServerName, "Magpie Memory", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
 		"Memory shared by every agent: your preferences, rules and what each project needs, kept in Magpie. Agents search it before asking again, and save what you ask them to remember.", magpieCommand, []string{"mcp", "memory"})
+}
+
+// sessionsServerName is the name Magpie Sessions' server is written
+// under, the name the gateway's own sessions server goes by (ownMCP).
+const sessionsServerName = "magpie-sessions"
+
+// sessionsServer is Magpie Sessions: what was said in every agent's
+// sessions on this computer, as search_sessions and read_session, through
+// `magpie mcp sessions`, which passes each call to the gateway's
+// SessionsMCPPath (cryingLiu on X). An agent given it reads the user's
+// other conversations, so it is given only to the agents picked for it.
+func sessionsServer() MarketServer {
+	m := localServer(sessionsServerName, "Magpie Sessions", "Magpie", "https://usemagpie.ai/favicon.png", "https://usemagpie.ai",
+		"Search and read what was said in every agent's sessions on this computer: an earlier conversation, decision or fix, from Claude Code, Codex or any agent Magpie reads.", magpieCommand, []string{"mcp", "sessions"})
+	m.OptIn = true
+	return m
 }
 
 // evermeServer is EverMe's memory (EverMind-AI/EverMe, @everme/memory-mcp,
@@ -440,7 +458,7 @@ func serverKey(s *Server) string {
 	if s.Remote() {
 		return strings.TrimSuffix(strings.ToLower(s.URL), "/")
 	}
-	if len(s.Args) == 2 && s.Args[0] == "mcp" && (s.Args[1] == "image" || s.Args[1] == "browser" || s.Args[1] == "search" || s.Args[1] == "vision" || s.Args[1] == "memory") {
+	if len(s.Args) == 2 && s.Args[0] == "mcp" && (s.Args[1] == "image" || s.Args[1] == "browser" || s.Args[1] == "search" || s.Args[1] == "vision" || s.Args[1] == "memory" || s.Args[1] == "sessions") {
 		return "magpie mcp " + s.Args[1] // magpie's own, wherever its binary is
 	}
 	uv := progName(s.Command) == "uvx"
@@ -641,6 +659,13 @@ func rank(r *registryServer, m MarketServer, q string) int {
 	return s
 }
 
+// brandIcons are logos the registry doesn't carry, by repository, taken
+// from the project's own site, so its server isn't shown with its owner's
+// avatar.
+var brandIcons = map[string]string{
+	"https://github.com/morluto/rea": "https://rea.tools/assets/favicon.svg", // MIT, the site's own favicon
+}
+
 // fromRegistry is what a registry entry becomes in the library: its remote
 // when it has one, else the package it's published as.
 func fromRegistry(r *registryServer) (MarketServer, bool) {
@@ -678,6 +703,9 @@ func fromRegistry(r *registryServer) (MarketServer, bool) {
 			m.Icon = ic.Src
 			break
 		}
+	}
+	if m.Icon == "" {
+		m.Icon = brandIcons[strings.ToLower(strings.TrimSuffix(r.Repository.URL, "/"))]
 	}
 	if m.Icon == "" && owner != "" {
 		m.Icon = gh(owner)
@@ -867,6 +895,13 @@ func serverIcon(l *Library, s *Server) string {
 		}
 	}
 	if u := l.Icons[k]; u != "" {
+		if _, avatar := strings.CutPrefix(u, "https://github.com/"); avatar {
+			for _, m := range popularServers() { // added before its logo was known
+				if m.Icon != u && serverKey(&m.server) == k && !strings.HasPrefix(m.Icon, "https://github.com/") {
+					return m.Icon
+				}
+			}
+		}
 		return u
 	}
 	for _, m := range featured {
