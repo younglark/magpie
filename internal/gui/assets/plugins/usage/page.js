@@ -608,6 +608,48 @@ function sharedKeysNote(q) {
   s.title = t("One balance for the account these keys share: {keys}", { keys: q.sharedKeys.join(", ") });
   return s;
 }
+// keysSum: the keys' balances added up, written as theirs are ("$12.50"),
+// when each is one amount in the same currency; "" otherwise
+function keysSum(subs) {
+  let total = 0, unit = null;
+  for (const q of subs) {
+    const m = !q.error && !q.balanceParts?.length && (q.balance || "").match(/^([^\d-]*)(-?\d[\d,]*(?:\.\d+)?)(\D*)$/);
+    if (!m) return "";
+    const u = m[1] + "|" + m[3];
+    if (unit != null && u !== unit) return "";
+    unit = u;
+    total += Number(m[2].replace(/,/g, ""));
+  }
+  return balanceAmount(subs[0], total);
+}
+// A key's balance, as Usage last read it, beside the row's models (lyj1115
+// on X: found, but shown on Usage only); several keys' added up as Usage's
+// card adds them, else the key in use's.
+function rowBalance(p) {
+  if (p.account || featuresOff.has("usage")) return "";
+  const cards = sharedBalances((quotas || []).filter((q) => q.provider === p.id && !q.from && q.balance && !q.error));
+  if (cards.length < 2) return cards[0]?.balance || "";
+  const on = p.keyList?.find((k) => k.active), own = on && cards.find((q) => q.user === (on.name || on.masked));
+  return keysSum(cards) || own?.balance || "";
+}
+// markBalances puts it on the rows drawn, after the list or a read of
+// Usage's (app.js)
+function markBalances() {
+  const byId = new Map((providers?.providers || []).map((p) => [p.id, p]));
+  for (const row of document.querySelectorAll("#providers .row.provider[data-id], #offProviders .row.provider[data-id]")) {
+    const sub = row.querySelector(".who > .sub"), p = byId.get(row.dataset.id);
+    if (!sub || !p) continue;
+    const amount = rowBalance(p), had = sub.querySelector(":scope > .pv-bal");
+    if (had?.dataset.amount === amount) continue;
+    had?.remove();
+    if (!amount) continue;
+    const b = el("span", "pv-bal", " · " + amount);
+    b.title = t("Balance") + " " + amount;
+    b.dataset.amount = amount;
+    sub.append(b);
+  }
+}
+
 // the keys' sum's tooltip: an account several keys share counted once
 function keysSumTip(subs) {
   return subs.some((q) => q.sharedKeys) ? t("The balances added up, each account's once") : t("The {n} keys' balances added up", { n: subs.length });
@@ -2355,14 +2397,44 @@ function ledShowStatus(to) {
 // ledger with the page (usage.ModelSpeed): failed, canceled and short
 // replies are left out. Sortable by any column; the fastest first.
 let ledSpeedSort = { key: "tps", dir: -1 };
+// by model, or each model on each provider it went to (skingstyle48487 on
+// X, with a dozen relays: which one is slow, which one fails, which one
+// answers with another model), kept as left
+let ledSpeedBy = "model";
+try { ledSpeedBy = localStorage.getItem("magpie.ledSpeedBy") === "provider" ? "provider" : "model"; } catch {}
 const LED_SPEED_COLS = [
   { key: "name", label: "Model", dir: 1 },
   { key: "tps", label: "Speed", dir: -1 },
   { key: "ttft_ms", label: "First token", dir: 1 },
   { key: "requests", label: "Requests", dir: -1 },
 ];
+// a provider's row counts its tries, and how many failed or were answered
+// by another model, beside the speed of those answered
+const LED_PROV_COLS = [
+  { key: "name", label: "Model", dir: 1 },
+  { key: "tps", label: "Speed", dir: -1 },
+  { key: "ttft_ms", label: "First token", dir: 1 },
+  { key: "tries", label: "Requests", dir: -1 },
+  { key: "fail", label: "Failed", dir: -1 },
+  { key: "swapped", label: "Other model", dir: -1 },
+  { key: "right", label: "Answers", dir: -1 },
+  { key: "tools", label: "Tool calls", dir: -1 },
+];
+const ledFail = (x) => x.tries ? (x.failed || 0) / x.tries : 0;
+// the last check of each model on each provider (relaycheck.js relayKeep):
+// its right answers and right tool calls, set beside the other providers'
+function ledChecks() {
+  try { return JSON.parse(localStorage.getItem("magpie.relayChecks") || "{}") || {}; } catch { return {}; }
+}
+const ledCheckShare = (x, key) => {
+  const c = x.check, of = c && (key === "tools" ? c.tools_of : c.of);
+  return of ? (key === "tools" ? c.tools : c.right) / of : -1;
+};
+let ledSpeedLast;
+window.addEventListener("magpie-relay-checked", () => { if (ledSpeedLast && $("#ledSpeed")) drawLedSpeed(ledSpeedLast); });
 function ledSpeedOrder(list) {
   const { key, dir } = ledSpeedSort;
+  const nm = (x) => (x.name || x.model) + (x.provider_name ? "\u0000" + x.provider_name : "");
   return [...list].sort((a, b) => {
     // a model with nothing measured goes last, whichever way it is sorted
     if (key === "tps" || key === "ttft_ms") {
@@ -2370,30 +2442,59 @@ function ledSpeedOrder(list) {
       if (!x !== !y) return x ? -1 : 1;
       if (x !== y) return dir * (x - y);
     } else if (key === "name") {
-      const c = (a.name || a.model).localeCompare(b.name || b.model);
+      const c = nm(a).localeCompare(nm(b));
       if (c) return dir * c;
-    } else if (a[key] !== b[key]) return dir * (a[key] - b[key]);
-    return b.requests - a.requests || (a.name || a.model).localeCompare(b.name || b.model);
+    } else if (key === "fail") {
+      const c = ledFail(a) - ledFail(b);
+      if (c) return dir * c;
+    } else if (key === "right" || key === "tools") {
+      // a provider not checked goes last, whichever way it is sorted
+      const x = ledCheckShare(a, key), y = ledCheckShare(b, key);
+      if ((x < 0) !== (y < 0)) return x < 0 ? 1 : -1;
+      if (x !== y) return dir * (x - y);
+    } else if ((a[key] || 0) !== (b[key] || 0)) return dir * ((a[key] || 0) - (b[key] || 0));
+    return (b.requests ?? b.tries) - (a.requests ?? a.tries) || nm(a).localeCompare(nm(b));
   });
 }
 function drawLedSpeed(l) {
   const box = $("#ledSpeed");
-  const list = l.speeds || [];
-  box.hidden = !list.length;
+  ledSpeedLast = l;
+  const byProv = ledSpeedBy === "provider";
+  const checks = byProv ? ledChecks() : {};
+  const list = ((byProv ? l.provider_speeds : l.speeds) || []).map((x) => byProv ? { ...x, check: checks[x.provider + "\u0000" + x.model] } : x);
+  box.hidden = !(l.speeds?.length || l.provider_speeds?.length);
   box.replaceChildren();
   if (box.hidden) return;
   const head = el("div", "led-bar");
   const title = el("b", "led-spd-t", t("Model speed"));
   title.title = t("Medians of the answered requests that wrote {n} tokens or more", { n: l.speed_min || 100 });
-  head.append(title);
-  const table = el("table", "led-spd");
+  const by = sessSegs([["model", "Models"], ["provider", "Providers"]], ledSpeedBy, (to) => {
+    ledSpeedBy = to;
+    try { localStorage.setItem("magpie.ledSpeedBy", to); } catch {}
+    if (!LED_SPEED_COLS.concat(to === "provider" ? LED_PROV_COLS : []).some((c) => c.key === ledSpeedSort.key)) ledSpeedSort = { key: "tps", dir: -1 };
+    drawLedSpeed(l);
+    $("#ledSpeed .segs .opt.on")?.focus({ preventScroll: true });
+  });
+  by.classList.add("led-spd-by");
+  head.append(title, el("span", "grow"), by);
+  // Other model shows once a reply named another model than the one asked
+  // for, and Answers and Tool calls once a provider was checked; nothing
+  // to say before
+  const checked = list.some((x) => x.check);
+  const cols = byProv ? LED_PROV_COLS.filter((c) => (c.key !== "swapped" || list.some((x) => x.swapped)) && (!["right", "tools"].includes(c.key) || checked)) : LED_SPEED_COLS;
+  if (!cols.some((c) => c.key === ledSpeedSort.key)) ledSpeedSort = { key: "tps", dir: -1 };
+  const table = el("table", "led-spd" + (byProv ? " by-prov" : ""));
   const hr = el("tr");
-  for (const c of LED_SPEED_COLS) {
+  for (const c of cols) {
     const th = el("th", c.key === "name" ? "nm" : "n");
     const on = ledSpeedSort.key === c.key;
     th.setAttribute("aria-sort", on ? (ledSpeedSort.dir > 0 ? "ascending" : "descending") : "none");
     const b = el("button", "led-spd-h" + (on ? " on" : ""), t(c.label));
     b.type = "button";
+    if (c.key === "fail") b.title = t("Tries that failed, those handed on to another provider too");
+    if (c.key === "swapped") b.title = t("Replies that named another model than the one asked for");
+    if (c.key === "right") b.title = t("Right answers in the last check of the model on this provider");
+    if (c.key === "tools") b.title = t("Right tool calls in the last check of the model on this provider");
     b.onclick = () => {
       ledSpeedSort = on ? { key: c.key, dir: -ledSpeedSort.dir } : { key: c.key, dir: c.dir };
       drawLedSpeed(l);
@@ -2402,6 +2503,7 @@ function drawLedSpeed(l) {
     th.append(b);
     hr.append(th);
   }
+  if (byProv) hr.append(el("th", "act"));
   const thead = el("thead");
   thead.append(hr);
   const body = el("tbody");
@@ -2409,10 +2511,46 @@ function drawLedSpeed(l) {
     const tr = el("tr");
     const name = el("td", "nm", x.name || x.model);
     name.title = x.name || x.model;
+    if (byProv) {
+      const sub = el("div", "led-spd-prov", x.provider_name || x.provider);
+      name.title += " · " + sub.textContent;
+      name.append(sub);
+    }
     tr.append(name,
       el("td", "n" + (x.tps ? "" : " faint"), x.tps ? t("{n} tok/s", { n: ledNum(Math.round(x.tps)) }) : "—"),
-      el("td", "n" + (x.ttft_ms ? "" : " faint"), x.ttft_ms ? ledTook(x.ttft_ms) : "—"),
-      el("td", "n", ledNum(x.requests)));
+      el("td", "n" + (x.ttft_ms ? "" : " faint"), x.ttft_ms ? ledTook(x.ttft_ms) : "—"));
+    if (!byProv) {
+      tr.append(el("td", "n", ledNum(x.requests)));
+      body.append(tr);
+      continue;
+    }
+    const f = ledFail(x);
+    const fail = el("td", "n" + (x.failed ? "" : " faint"), x.failed ? (f < 0.001 ? "<0.1%" : (f * 100).toFixed(f < 0.1 ? 1 : 0) + "%") : "0");
+    fail.title = t("{n} of {m} failed", { n: ledNum(x.failed || 0), m: ledNum(x.tries) });
+    tr.append(el("td", "n", ledNum(x.tries)), fail);
+    if (cols.some((c) => c.key === "swapped")) {
+      const sw = el("td", "n" + (x.swapped ? "" : " faint"), ledNum(x.swapped || 0));
+      sw.title = t("{n} of {m} replies named another model", { n: ledNum(x.swapped || 0), m: ledNum(x.tries) });
+      tr.append(sw);
+    }
+    for (const key of checked ? ["right", "tools"] : []) {
+      const c = x.check, of = c && (key === "tools" ? c.tools_of : c.of), n = c && (key === "tools" ? c.tools : c.right);
+      const td = el("td", "n" + (!of ? " faint" : n < of ? " off" : ""), of ? n + "/" + of : "—");
+      if (of) td.title = t("{n} of {m} right, checked {when}", { n, m: of, when: ago(c.at) });
+      tr.append(td);
+    }
+    // a check of this model on this provider: a few small real calls, made
+    // only on the press (relaycheck.js)
+    const act = el("td", "act");
+    const go = el("button", "text led-spd-check", t("Check…"));
+    go.type = "button";
+    go.title = t("Check {model} on {provider} with a few small real calls", { model: x.name || x.model, provider: x.provider_name || x.provider });
+    go.onclick = async () => {
+      try { window.relayCheck || await import(new URL("relaycheck.js", document.baseURI).href); } catch (err) { return status(err.message, "err"); }
+      relayCheck(x.provider, x.model, x.provider_name || x.provider, x.name || x.model);
+    };
+    act.append(go);
+    tr.append(act);
     body.append(tr);
   }
   table.append(thead, body);
@@ -2872,7 +3010,9 @@ async function loadLedHeat() {
   if (view === "usage" && usageTab === "requests") drawLedHeat();
 }
 const ledHeatDate = (s) => { const [y, m, d] = String(s).split("-").map(Number); return new Date(y, m - 1, d); };
-function ledHeatTip(x) {
+// metric: what the heatmap is coloured by, shown first; provider: the one
+// the heatmap is of, whose currency its costs are in, or none
+function ledHeatTip(x, metric = ledHeatMetric, provider = new URLSearchParams(ledHeat?.want).get("provider") || "") {
   const loc = intlLang();
   const tip = el("div");
   tip.append(el("b", "", x.day.toLocaleDateString(loc, { year: "numeric", month: "short", day: "numeric", weekday: "short" })));
@@ -2882,9 +3022,9 @@ function ledHeatTip(x) {
   }
   const parts = [t("{n} tokens", { n: fmtN(x.tokens) }), t(x.calls === 1 ? "{n} request" : "{n} requests", { n: ledNum(x.calls) })];
   // of one provider's calls, while the filters keep only its
-  const c = fmtCost(x, new URLSearchParams(ledHeat?.want).get("provider") || "");
+  const c = fmtCost(x, provider);
   if (c) parts.push(c);
-  const order = { tokens: 0, calls: 1, cost: 2 }[ledHeatMetric];
+  const order = { tokens: 0, calls: 1, cost: 2 }[metric];
   if (order && parts[order]) parts.unshift(...parts.splice(order, 1)); // the metric shown first
   tip.append(el("span", "", parts.join(" · ")));
   return tip;
@@ -2922,40 +3062,8 @@ function drawLedHeat() {
   const shape = [h.from, h.to, locale].join("|");
   let grid = scroll.querySelector(".heat-grid");
   if (!grid || grid.dataset.shape !== shape) {
-    grid = el("div", "heat-grid");
+    grid = heatGridOf(days);
     grid.dataset.shape = shape;
-    grid.setAttribute("role", "img");
-    const names = sessWeekdays();
-    // every row has its place at the edge, named every other day
-    for (let i = 0; i < 7; i++) {
-      const l = el("span", "wd", i % 2 ? "" : names[i]);
-      l.style.gridArea = `${i + 2} / 1`;
-      grid.append(l);
-    }
-    const loc = intlLang();
-    const weeks = Math.ceil(days.length / 7), labels = [];
-    let month = -1;
-    days.forEach((x, i) => {
-      const w = Math.floor(i / 7), wd = i % 7;
-      if (wd === 0 && x.day.getMonth() !== month) {
-        month = x.day.getMonth();
-        // a month mostly gone in the first week is left unnamed, so as not
-        // to crowd out the next one's name, and so is one begun in the last
-        // week, with no room for its name
-        if ((!labels.length || w - labels.at(-1).w >= 3) && !(w === 0 && x.day.getDate() > 14) && w < weeks - 1) {
-          const m = el("span", "mo", x.day.toLocaleDateString(loc, { month: "short" }));
-          labels.push({ m, w });
-          grid.append(m);
-        }
-      }
-      const c = el("i");
-      c.dataset.date = sessISO(x.day);
-      c.style.gridArea = `${wd + 2} / ${w + 2}`;
-      grid.append(c);
-    });
-    // a month's name spans its weeks up to the next name, cut there, so a
-    // long one never widens the grid past its last week
-    labels.forEach(({ m, w }, i) => { m.style.gridArea = `1 / ${w + 2} / 2 / ${(labels[i + 1]?.w ?? weeks) + 2}`; });
     grid.onpointerover = (e) => { if (e.target.dataset?.date) ledHeatShow(e.target); };
     grid.onpointerleave = () => { $("#ledHeatTip").hidden = true; };
     scroll.replaceChildren(grid);
@@ -2987,6 +3095,133 @@ function drawLedHeat() {
   if (!tip.hidden && tip.cell?.isConnected) ledHeatShow(tip.cell);
   else tip.hidden = true;
 }
+// heatGridOf lays days, a Monday first, out as weeks of days, Monday on
+// top: the weekdays named every other row at the edge, a month over the
+// week it begins in, and a cell a day (its date in data-date), to colour
+const heatGridOf = (days) => {
+  const grid = el("div", "heat-grid");
+  grid.setAttribute("role", "img");
+  const names = sessWeekdays();
+  // every row has its place at the edge, named every other day
+  for (let i = 0; i < 7; i++) {
+    const l = el("span", "wd", i % 2 ? "" : names[i]);
+    l.style.gridArea = `${i + 2} / 1`;
+    grid.append(l);
+  }
+  const loc = intlLang();
+  const weeks = Math.ceil(days.length / 7), labels = [];
+  grid.style.setProperty("--wk", weeks);
+  let month = -1;
+  days.forEach((x, i) => {
+    const w = Math.floor(i / 7), wd = i % 7;
+    if (wd === 0 && x.day.getMonth() !== month) {
+      month = x.day.getMonth();
+      // a month mostly gone in the first week is left unnamed, so as not
+      // to crowd out the next one's name, and so is one begun in the last
+      // week, with no room for its name
+      if ((!labels.length || w - labels.at(-1).w >= 3) && !(w === 0 && x.day.getDate() > 14) && w < weeks - 1) {
+        const m = el("span", "mo", x.day.toLocaleDateString(loc, { month: "short" }));
+        labels.push({ m, w });
+        grid.append(m);
+      }
+    }
+    const c = el("i");
+    c.dataset.date = sessISO(x.day);
+    c.style.gridArea = `${wd + 2} / ${w + 2}`;
+    grid.append(c);
+  });
+  // a month's name spans its weeks up to the next name, cut there, so a
+  // long one never widens the grid past its last week
+  labels.forEach(({ m, w }, i) => { m.style.gridArea = `1 / ${w + 2} / 2 / ${(labels[i + 1]?.w ?? weeks) + 2}`; });
+  return grid;
+};
+
+// ---------- the tray panel's heatmap ----------
+//
+// The panel's Usage tab ends in the heatmap's recent weeks (eiyuuzaki2333 on
+// X: a heatmap like GitHub's, "also in the tray form"): as many weeks as its
+// card has room for, Monday on top, of the provider and computer picked
+// above, coloured by the tab's own Tokens / Cost / Requests switch, the days
+// graded among the ones shown. It is /api/usage/heatmap, the Requests tab's,
+// read when a pick changes and otherwise at most once a minute; the tab's
+// own reads every 10s don't wait for it. No calls in its weeks, no card.
+let panelHeat = null, panelHeatAt = 0, panelHeatFlight = null; // flight: the picks being read
+const PANEL_HEAT_EVERY = 60e3;
+function panelHeatWant() {
+  const q = new URLSearchParams();
+  if (panelUseProvider) q.set("provider", panelUseProvider);
+  if (panelUseComputer) q.set("computer", panelUseComputer);
+  return q.toString();
+}
+function panelHeatLoad() {
+  const want = panelHeatWant();
+  if (panelHeatFlight === want) return;
+  if (panelHeat?.want === want && performance.now() - panelHeatAt < PANEL_HEAT_EVERY) return;
+  panelHeatFlight = want;
+  api("usage/heatmap?" + want).then((h) => {
+    if (panelHeatWant() !== want) return; // another pick meanwhile: its own read is on its way
+    panelHeatAt = performance.now();
+    const same = panelHeat?.want === want && JSON.stringify(panelHeat.data) === JSON.stringify(h);
+    panelHeat = { want, data: h };
+    const card = $("#panelUsage .pu-heat");
+    if (same || !card) return;
+    card.replaceWith(panelHeatCard());
+    fit();
+  }).catch(() => {}).finally(() => { if (panelHeatFlight === want) panelHeatFlight = null; });
+}
+// The card, drawn from what was read for the picks shown (nothing yet, or
+// another pick's: hidden), and a read asked for when that is old.
+function panelHeatCard() {
+  const card = el("div", "pu-heat");
+  card.hidden = true;
+  panelHeatLoad();
+  const h = panelHeat?.want === panelHeatWant() ? panelHeat.data : null;
+  const at = new Map((h?.days || []).map((d) => [d.date, d]));
+  if (!h?.to || ![...at.values()].some((d) => d.calls > 0)) return card;
+  // the weeks the panel has room for: the card's content width less the
+  // days' names, at a cell of at least 11px and a 3px gap
+  const room = ($("#panelUsage")?.clientWidth || 400) - 2 * 10 - 30;
+  const weeks = Math.max(8, Math.min(53, Math.floor((room + 3) / 14)));
+  const last = ledHeatDate(h.to), first = new Date(last);
+  first.setDate(first.getDate() - ((last.getDay() + 6) % 7) - 7 * (weeks - 1)); // a Monday
+  const days = [];
+  for (const d = new Date(first); d <= last; d.setDate(d.getDate() + 1)) {
+    const x = at.get(sessISO(d)) || { calls: 0, tokens: 0, cost: 0 };
+    days.push({ ...x, day: new Date(d) });
+  }
+  if (!days.some((x) => x.calls > 0)) return card;
+  const metric = panelUseMetric;
+  const value = (x) => metric === "cost" ? x.cost : metric === "calls" ? x.calls : x.tokens;
+  const lv = sessLevels(days.map(value));
+  const grid = heatGridOf(days);
+  grid.setAttribute("aria-label", t("Usage heatmap"));
+  grid.querySelectorAll("i").forEach((c, i) => {
+    c.className = "l" + lv(value(days[i]));
+    c.day = days[i];
+  });
+  const tip = el("div", "heat-tip");
+  tip.hidden = true;
+  grid.onpointerover = (e) => {
+    const c = e.target;
+    if (!c.day) return;
+    tip.replaceChildren(...ledHeatTip(c.day, metric, panelUseProvider).children);
+    tip.hidden = false;
+    const b = card.getBoundingClientRect(), r = c.getBoundingClientRect();
+    const w = tip.offsetWidth, hgt = tip.offsetHeight;
+    tip.style.left = Math.max(6, Math.min(b.width - w - 6, r.left - b.left + r.width / 2 - w / 2)) + "px";
+    let top = r.top - b.top - hgt - 6;
+    if (top < 4) top = r.bottom - b.top + 6;
+    tip.style.top = top + "px";
+  };
+  grid.onpointerleave = () => { tip.hidden = true; };
+  const head = el("div", "pu-heat-head");
+  head.append(el("b", "", t("Usage heatmap")), sessLegend());
+  card.append(head, grid, tip);
+  card.hidden = false;
+  return card;
+}
+// the tab drawn before this script ran is drawn again, with the card
+if (mode === "panel" && panelUse && panelTab === "stats") renderPanelUse();
 let ledHeatAtEnd = true, ledHeatSetAt = -1;
 const ledHeatSized = new ResizeObserver(() => ledHeatKeepEnd());
 function ledHeatKeepEnd() {

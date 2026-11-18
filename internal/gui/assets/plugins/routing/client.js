@@ -1139,14 +1139,18 @@ function routingPage(part) {
   // renews sooner (cmpRenews, as the gateway ranks them), "expires" when
   // the first's credits expire sooner, the key Smart went by (#5646). null when it is
   // first, or behind for what the row or another reason says already.
+  // A conversation kept on one Smart puts first anyway says "sooner" or
+  // "expires", not "kept": a new conversation goes there too, and "kept"
+  // read as every conversation stuck to one account (YsiCing on X: three
+  // Codex accounts, two at 0% "conversation kept on another").
   function behindWhy(r, w) {
     const f = r.order[0], x = r.order.find((y) => y.id === w.id);
     if (!f || !x || x === f || f.rest || f.fallback || x.fallback || x.routing || !x.known || group(x) !== "fine") return null;
     if (!weighedWith(r, x).includes(f) || memberSplit(r, f, x)) return null;
-    if (["session", "turn", "cache"].includes(r.affinity?.why)) return "kept";
-    if (r.sealedTask || ruleWhy(r, true) || f.learns || !f.known || group(f) !== "fine" || f.useFirst && !x.useFirst) return null;
+    const kept = ["session", "turn", "cache"].includes(r.affinity?.why) ? "kept" : null;
+    if (r.sealedTask || ruleWhy(r, true) || f.learns || !f.known || group(f) !== "fine" || f.useFirst && !x.useFirst) return kept;
     const { c, k, lapse } = cmpRenews(f, x);
-    return c >= 0 ? null : lapse || expiresAt(f, k) ? "expires" : "sooner";
+    return c >= 0 ? kept : lapse || expiresAt(f, k) ? "expires" : "sooner";
   }
 
   // memberSplit: the group that put x behind f, when it is one that takes
@@ -1569,7 +1573,7 @@ function routingPage(part) {
     const card = () => {
       const box = el("div", "rt-done");
       const model = w ? (tr.auto?.length ? `${w.model} → ${tr.auto[tr.auto.length - 1].model}` : w.model) : tr.model || "";
-      box.append(el("b", "who", w ? who(w) : tr.id), el("span", "mdl", model || ""), el("span", "effort-of", tr.effort || ""));
+      box.append(el("b", "who", w ? (w.kind === "key" ? where(w) : who(w)) : tr.id), el("span", "mdl", model || ""), el("span", "effort-of", tr.effort || ""));
       const v = speedOf(r, tr.ms, tr.ttft, tr.firstText, tr.flow, tr.firstReasoning || 0, tr.reasoningHidden || false);
       const { prompt, read } = promptOf(r);
       for (const [value, label] of [
@@ -2812,10 +2816,11 @@ function routingPage(part) {
   function makeRow(w) {
     const li = el("li"), b = el("b");
     b.append(icon(w.icon || (w.preset ? w.preset : "generic")));
-    const name = el("span", "who", who(w));
+    // a key's row is headed by its provider's name (prov), set in rebuild
+    const prov = el("span", "prov", ""), name = el("span", "who", who(w));
     // the provider's name heads the card; a row names what differs
-    const sub = el("span", "", rowSub(w, false));
-    b.append(name, " ", sub, el("code", "mdl", w.fixed ? `${w.model}:${w.fixed}` : w.model));
+    const sub = el("span", "", rowSub(w, false, false));
+    b.append(prov, name, " ", sub, el("code", "mdl", w.fixed ? `${w.model}:${w.fixed}` : w.model));
     if (w.fixed) b.title = t("{level} reasoning, fixed on this model in the group", { level: w.fixed });
     if (w.fast) {
       // the group sends this member in its vendor's fast mode
@@ -2838,13 +2843,21 @@ function routingPage(part) {
     st.onpointerleave = () => delete st.dataset.cut;
     li.append(el("i", "dot"), b, st, bar, tg);
     li.title = w.id;
-    return { li, wire: path(), st, bi, tg, w, subEl: sub };
+    return { li, wire: path(), st, bi, tg, w, provEl: prov, subEl: sub };
   }
+  // keyLed: a key's row is headed by its provider's name, the key's
+  // after it, muted: a key's name is often only its masked secret
+  // ("sk-4…ab10"), which says nothing of whose it is, so two relays' keys
+  // each serving one model read alike (iamleehom on X). Under a fold,
+  // whose heading names the provider, the key's name leads the row.
+  const keyLed = (w, folded) => w.kind === "key" && !folded;
   // rowSub is what a row says after the name: a fallback's provider, an
-  // account's plan; and the provider of a key or account named as one of
-  // another provider's on the stage is (twin), so two providers' Key-01
-  // rows, each of the same model, are told apart (iamleehom on Discord)
-  const rowSub = (w, twin) => w.fallback ? w.name : w.kind === "provider" ? "" : twin ? [w.name || w.provider, planName(w.plan)].filter(Boolean).join(" · ") : planName(w.plan) || "";
+  // account's plan; and the provider of an account (or a folded key) named
+  // as one of another provider's on the stage is (twin), so two
+  // providers' Key-01 rows, each of the same model, are told apart
+  // (iamleehom on Discord); a key-led row says its provider before it
+  const rowSub = (w, twin, folded) => keyLed(w, folded) ? planName(w.plan) || ""
+    : w.fallback ? w.name : w.kind === "provider" ? "" : twin ? [w.name || w.provider, planName(w.plan)].filter(Boolean).join(" · ") : planName(w.plan) || "";
 
   // sync puts the staged routes on the stage: each agent on the left, and
   // the accounts they weighed, each route's in the order it weighed them —
@@ -2945,13 +2958,6 @@ function routingPage(part) {
       // its way down: its route's heading, then the groups in the group
       row.path = ways ? [wayAt.get(id), ...(row.w.via || [])] : row.w.via || [];
     }
-    // a name more than one provider's rows go by says the provider too
-    const provsOf = new Map();
-    for (const id of ids) {
-      const w = rows.get(id).w;
-      if (w.kind !== "provider") { const n = who(w); provsOf.set(n, (provsOf.get(n) || new Set()).add(w.provider)); }
-    }
-    for (const id of ids) { const row = rows.get(id); setText(row.subEl, rowSub(row.w, provsOf.get(who(row.w))?.size > 1)); }
     // a group in the group heads its models, which it routes by its own
     // routing, set in under it
     // keys or accounts side by side that fold together, FOLD_AT or more
@@ -2973,6 +2979,20 @@ function routingPage(part) {
       else { flush(); if (folding(w)) run = [id]; }
     }
     flush();
+    // a row's name and what it says after it: a key named by its provider,
+    // unless a fold over it names that; and a name more than one
+    // provider's rows go by says the provider too
+    const provsOf = new Map();
+    for (const id of ids) {
+      const w = rows.get(id).w;
+      if (w.kind !== "provider" && !keyLed(w, foldOf.has(id))) { const n = who(w); provsOf.set(n, (provsOf.get(n) || new Set()).add(w.provider)); }
+    }
+    for (const id of ids) {
+      const row = rows.get(id), folded = foldOf.has(id), led = keyLed(row.w, folded);
+      setText(row.provEl, led ? row.w.name || row.w.provider : "");
+      setText(row.subEl, rowSub(row.w, !led && provsOf.get(who(row.w))?.size > 1, folded));
+      row.li.classList.toggle("keyled", led);
+    }
     // how many each group in the group routes to, which folds it when LONG
     const under = new Map();
     for (const id of ids) {
@@ -3266,6 +3286,7 @@ function routingPage(part) {
           : (b = behindWhy(r, w)) === "kept" ? quota(w, "{n} used · conversation kept on another", "{n} left · conversation kept on another")
           : b === "sooner" && soon ? quota(w, "{n} used · renews in {d} · one renewing sooner goes first", "{n} left · renews in {d} · one renewing sooner goes first", { d: dur(soon - n) })
           : b === "expires" && soon ? quota(w, "{n} used · renews in {d} · one whose credits expire sooner goes first", "{n} left · renews in {d} · one whose credits expire sooner goes first", { d: dur(soon - n) })
+          : b === "sooner" ? quota(w, "{n} used · one renewing sooner goes first", "{n} left · one renewing sooner goes first")
           : soon ? quota(w, "{n} used · renews in {d}", "{n} left · renews in {d}", { d: dur(soon - n) }) : quota(w, "{n} used", "{n} left");
       } else if (w.kind === "account") s = (!day && winsOf(w)[0]) || (!day && cardError(w) ? t("Allowance unavailable — hover for why") : t("what's left not known yet"));
       else if (w.routing === "usage") s = t("{n} tokens lately", { n: tokens(w.tokens || 0) });
@@ -3988,6 +4009,7 @@ function routingPage(part) {
       case "desktop-gone": return t("{agent} asked for {model}, which magpie doesn't serve; magpie served it on {to}, the model of its latest chat turn.", v);
       case "desktop-gone-first": return t("{agent} asked for {model}, which magpie doesn't serve; magpie served it on {to}, the first model it lists.", v);
       case "desktop-tier": return t("Claude Code in {agent} asked for {model}, its own id for a Claude tier; magpie served it on {to}, the model picked for that tier.", v);
+      case "desktop-search": return t("Claude Code in {agent} asked for {model} for WebSearch; magpie served it on {to}, the model picked for haiku.", v);
       case "desktop-beside": return t("Claude Code in {agent} asked for {model} for a call of its own; magpie served it on {to}, that tier's model on the provider the chat is on.", v);
       case "desktop-aside": return t("Claude Code in {agent} asked for {model} for a call of its own; magpie served it on {to}, the chat's model, so it stays with the provider the chat is on.", v);
       case "classifier": return t("{agent}'s auto mode classifier asked for {model}; magpie served it on {to}, the model /model moved its tier to.", v);
@@ -3995,6 +4017,7 @@ function routingPage(part) {
       case "stand-in": return t("{agent} asked for {model}, which magpie doesn't serve; magpie served it on {to}, the model its config names.", v);
       case "codex-turn": return t("{agent} asked for {model} for a call of its own, which magpie doesn't serve; magpie served it on {to}, the model its last turn was answered on.", v);
       case "codex-follow": return t("{agent} asked for {model}, one of its own default models, for its memories, and its config names no model for them; magpie served it on {to}, the model of its conversation.", v);
+      case "codex-suggestions": return t("{agent} asked for {model} to suggest prompts for its home page; magpie served it on {to}, the model set for Codex’s prompt suggestions.", v);
       case "dsh-compact": return t("{agent} asked for {model} to compact its conversation; magpie served it on {to}, the model set for its compaction.", v);
       case "dsh-compact-rested": return t("{agent} asked for {model} to compact its conversation, and its provider is out of its limit; magpie served it on {to}, the same model from another provider.", v);
       case "privacy": return t("Masking would have changed this request, so magpie sent it as written to {to}, the model set for that in Settings › Privacy.", v);
@@ -4016,7 +4039,7 @@ function routingPage(part) {
     if (purposeOf(tagKind(r)) === "kind:collab_spawn") return r.group
       ? t("{agent} requested a subagent; magpie selects its model within this routing group.", { agent })
       : t("{agent} requested a subagent on {model}.", { agent, model: r.model });
-    if (purposeOf(r.kind) === "kind:ambient_suggestions") return t("{agent} drafted the suggested prompts on its home page by itself, in the background, searching the project's files and connected apps, and checked them for safety. Not a turn of the conversation; Codex's Settings › Configuration › Suggested prompts turns it off.", { agent });
+    if (purposeOf(r.kind) === "kind:ambient_suggestions") return t("{agent} drafted the suggested prompts on its home page by itself, in the background, searching the project's files and connected apps, and checked them for safety. Not a turn of the conversation; Codex prompt suggestions, under Settings in Codex's row on the Agents page, picks its model, and Codex's Settings › Configuration › Homepage suggestions turns it off.", { agent });
     if (purposeOf(r.kind) === "kind:composer_predictions") return t("{agent} guessed your next message for its composer by itself, reading the whole conversation again. Not a turn of the conversation; Codex composer predictions, under Settings in Codex's row on the Agents page, picks its model, and Codex's Settings › General › Show predictions turns it off.", { agent });
     // Claude Desktop's check that magpie answers names its model itself
     // (cybercaius on Discord: "Desktop requested deepseek-flash" while
@@ -6614,12 +6637,23 @@ function routingPage(part) {
   // id, both in any case (provider.compilePattern). The group keeps them,
   // and the models they match now follow those it names, in the catalog's
   // order (Group.Matched)
-  const isPattern = (s) => s.startsWith("re:") || s.includes("*");
+  // A free: rule (provider.FreePrefix, #5903) keeps, of the models the
+  // rest of it matches, those the last catalog marks free (m.free): never
+  // a $0 price (m.zero), a rate or an id that says free
+  const isPattern = (s) => s.startsWith("re:") || s.startsWith("free:") || s.includes("*");
   function patternRe(p) {
     try {
       if (p.startsWith("re:")) return goRe(p.slice(3));
       return new RegExp("^" + p.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i");
     } catch { return null; }
+  }
+  // patternTest is the models a pattern takes, as provider.compileRule
+  // reads it; null when it is one magpie can't read
+  function patternTest(p) {
+    const free = p.startsWith("free:"), scope = free ? p.slice(5).trim() : p;
+    if (free && (!scope || scope.startsWith("free:"))) return null;
+    const r = patternRe(scope);
+    return r && ((m) => (!free || m.free === true) && r.test(m.id));
   }
   // goRe is a re: pattern's regexp as Go reads it, in any case: Go's
   // leading flag group, "(?-i)" to make case matter, is JS's flags (U,
@@ -6640,11 +6674,11 @@ function routingPage(part) {
   // the models served now the patterns match, but those the group names
   // (at any reasoning): as provider.matchesIn finds them
   function matchedBy(patterns, named) {
-    const res = patterns.map(patternRe).filter(Boolean);
+    const res = patterns.map(patternTest).filter(Boolean);
     const own = new Set(named.map((id) => splitMember(id)[0]));
-    return (groups?.models || []).filter((m) => !own.has(m.id) && res.some((r) => r.test(m.id))).map((m) => m.id);
+    return (groups?.models || []).filter((m) => !own.has(m.id) && res.some((r) => r(m))).map((m) => m.id);
   }
-  const patternCount = (p) => { const r = patternRe(p); return r ? (groups?.models || []).filter((m) => r.test(m.id)).length : 0; };
+  const patternCount = (p) => { const r = patternTest(p); return r ? (groups?.models || []).filter(r).length : 0; };
   const patternWords = (n) => n ? t(n === 1 ? "1 model" : "{n} models", { n }) : t("matches nothing now");
   // what a group keeps of its members: those it names, not those its
   // patterns matched when it was read — they are found again each time
@@ -6698,14 +6732,41 @@ function routingPage(part) {
   // said whatever the group's routing, so it shows before Free first is
   // picked (jiabubu on Discord)
   const freeIn = (g, id) => !!(g && memberInfoOf(g, id)?.free);
-  function memberLabel(g, id) {
+  // memberParts: a member as who serves it (pv), its model (mn) and what
+  // is said after it (at), for memberLabel's one line of text and
+  // memberLine's card
+  function memberParts(g, id) {
     const i = memberInfoOf(g, id), m = modelOf(id), s = subOf(id), f = fixedOf(id);
-    if (s) return `${t("routing group")} · ${s.name}`;
+    if (s) return { pv: t("routing group"), mn: s.name, at: "" };
     const acct = memberAccount(id);
     const at = (acct ? ` · ${acct.name}` : "") + (f ? ` · ${fixedWords(f)}` : "") + (fastIn(g, id) ? ` · ${t("fast")}` : "") + (freeIn(g, id) ? ` · ${t("free")}` : "");
-    if (m) return `${m.providerName} · ${modelName(m)}${at}`;
-    if (i?.providerOff) return `${i.name} · ${i.model}${at} (${t("switched off")})`;
-    return i?.name ? `${i.name} · ${i.model}${at}` : id;
+    if (m) return { pv: m.providerName, mn: modelName(m), at };
+    if (i?.providerOff) return { pv: i.name, mn: i.model, at: `${at} (${t("switched off")})` };
+    return i?.name ? { pv: i.name, mn: i.model, at } : { pv: "", mn: id, at: "" };
+  }
+  function memberLabel(g, id) {
+    const p = memberParts(g, id);
+    return (p.pv ? p.pv + " · " : "") + p.mn + p.at;
+  }
+  // memberJoin: what goes between a group's members said in a line: an
+  // arrow in order, else the list comma, never the " · " that parts a
+  // member's provider from its model (tmr11235 on X: "Kimi Code · K3.1 Pro
+  // · OpenCode Go · Kimi K3.1 Pro" read as one run of names)
+  const memberJoin = (g) => g?.routing === "order" ? " → " : t(", ");
+  // memberLine: the members on a group's card, each one piece — its
+  // provider quiet, its model after — parted by memberJoin
+  function memberLine(g, ids, offs) {
+    const line = el("div", "mem");
+    ids.forEach((id, n) => {
+      if (n) line.append(el("span", "sep", memberJoin(g)));
+      const p = memberParts(g, id), b = el("span", "mbr");
+      if (p.pv) b.append(el("span", "pv", p.pv), " ");
+      b.append(el("span", "mn", p.mn));
+      const at = p.at + (offs && g.off?.includes(id) ? ` (${t("off")})` : "");
+      if (at) b.append(at);
+      line.append(b);
+    });
+    return line;
   }
   function renderGroups(filterOnly = false) {
     if (!groups) return;
@@ -7270,7 +7331,7 @@ function routingPage(part) {
     const main = el("div", "main"), nm = el("div", "nm");
     nm.append(el("b", "", g.name), el("code", "mdl", g.ref || "group/" + g.id));
     if (g.auto) nm.append(el("small", "auto", t("found by magpie")));
-    main.append(nm, el("div", "mem", shownMembers(g).map((id) => memberLabel(g, id)).join(g.routing === "order" ? " → " : " · ")));
+    main.append(nm, memberLine(g, shownMembers(g)));
     row.append(cb, ics, main);
     return row;
   }
@@ -7421,8 +7482,7 @@ function routingPage(part) {
       main.append(note);
     }
     const manual = g.routing === "manual";
-    const sep = g.routing === "order" ? " → " : " · ";
-    const mem = manual ? pickRow(g) : el("div", "mem", shownMembers(g).map((id) => memberLabel(g, id) + (g.off?.includes(id) ? ` (${t("off")})` : "")).join(sep));
+    const mem = manual ? pickRow(g) : memberLine(g, shownMembers(g), true);
     main.append(mem);
     if (!g.decides) main.append(...groupQuota(g));
     for (const p of g.patterns || []) {
@@ -8072,7 +8132,7 @@ function routingPage(part) {
         // its share by weight (#1910): a click edits it in place, Enter
         // or leaving it keeps it, Escape puts it back
         if (d.routing === "weight") row.append(memberWeight(id, off));
-        if (s) row.title = s.members.map((x) => memberLabel(s, x)).join(s.routing === "order" ? " → " : " · ");
+        if (s) row.title = s.members.map((x) => memberLabel(s, x)).join(memberJoin(s));
         if (!m && !s) { row.classList.add("off"); row.title = info?.providerOff ? offWords(info) : t("No provider serves {id} now; it is skipped", { id }); }
         if (i) { const up = el("button", "text", t("Up")); up.onclick = () => moveMember(i, i - 1); row.append(up); }
         if (i < d.members.length - 1) { const down = el("button", "text", t("Down")); down.onclick = () => moveMember(i, i + 1); row.append(down); }
@@ -8114,17 +8174,19 @@ function routingPage(part) {
       // the image models after them, said as such (jzw690 on X): a group
       // of them is picked in Settings › Models › Images, or named at the images API
       const drawRef = (x) => ({ ...ref(x), note: noted(`${x.providerName} · ${t("Image model")}`, x.id) });
-      const options = [...subs, ...(decides ? [] : groups.models.map(ref)), ...(decides ? [] : (groups.drawers || []).map(drawRef)), ...(chats ? [] : (groups.deciders || []).map(ref))];
-      // the member a model is in the group as: itself, or with its
-      // reasoning fixed (deepseek/x:max), which is ticked as it and taken
-      // out by it rather than added twice (#907)
-      const holding = (id) => d.members.includes(id) ? id : d.members.find((m) => splitMember(m)[0] === id);
-      openPicker({ id: "", name: "", fields: [] }, { key: "member", label: "model", value: "", options, multi: true, picked: (id) => !!holding(id), onPick: (id) => {
+      // a model in the group with its reasoning fixed (deepseek/x:max) or
+      // on one account is a row of its own, ticked, its level or account
+      // in its note, and a click takes that member out (#907); the model's
+      // own row under it adds it again, to be fixed at another level
+      // (visamzh on X: gpt-6.2-sol at high and at xhigh, #189)
+      const withHeld = (mk) => (x) => [...d.members.filter((m) => m !== x.id && !subOf(m) && splitMember(m)[0] === x.id)
+        .map((m) => { const o = mk(x); return { ...o, value: m, note: [fixedOf(m) && fixedWords(fixedOf(m)), memberAccount(m)?.name, o.note].filter(Boolean).join(" · ") }; }), mk(x)];
+      const options = [...subs, ...(decides ? [] : groups.models.flatMap(withHeld(ref))), ...(decides ? [] : (groups.drawers || []).flatMap(withHeld(drawRef))), ...(chats ? [] : (groups.deciders || []).flatMap(withHeld(ref)))];
+      openPicker({ id: "", name: "", fields: [] }, { key: "member", label: "model", value: "", options, multi: true, picked: (id) => d.members.includes(id), onPick: (id) => {
         if (!id) return;
-        const m = holding(id);
-        if (!m) d.members.splice(d.members.findLastIndex((x) => !d.matched.includes(x)) + 1, 0, id); // after the last named
-        else if (d.matched.includes(m)) return status(t("In the group by a pattern: switch it off to send it nothing"), "warn");
-        else { d.members.splice(d.members.indexOf(m), 1); rematch(); }
+        if (!d.members.includes(id)) d.members.splice(d.members.findLastIndex((x) => !d.matched.includes(x)) + 1, 0, id); // after the last named
+        else if (d.matched.includes(id)) return status(t("In the group by a pattern: switch it off to send it nothing"), "warn");
+        else { d.members.splice(d.members.indexOf(id), 1); rematch(); }
         draw(); drawRules();
       } }, addBtn, ev);
     };
@@ -8277,7 +8339,7 @@ function routingPage(part) {
       const p = pin.value.trim();
       if (!p) return "";
       if (!isPattern(p)) return status(t("A pattern has a * in it, or starts with re:"), "warn"), null;
-      if (!patternRe(p)) return status(t("{pattern} is not a regular expression magpie can read", { pattern: p }), "warn"), null;
+      if (!patternTest(p)) return status(t("{pattern} is not a regular expression magpie can read", { pattern: p }), "warn"), null;
       if (!d.match.includes(p)) d.match.push(p);
       pin.value = "";
       rematch(); drawPats(); draw(); drawRules();
@@ -8290,7 +8352,8 @@ function routingPage(part) {
     pbox.append(plist, padd);
     drawPats();
     const pw = el("div");
-    pw.append(pbox, el("div", "hint", t("Every model a pattern matches is in the group, now and as providers list new ones, after the models above: * is any run of characters in provider/model, re: starts a regular expression.")));
+    pw.append(pbox, el("div", "hint", t("Every model a pattern matches is in the group, now and as providers list new ones, after the models above: * is any run of characters in provider/model, re: starts a regular expression.")),
+      el("div", "hint", t("free: before a pattern keeps the models the last catalog marked free, as in free:workbuddy/*. It is the catalog's flag, not a promise of no charge.")));
     // what few change — patterns, the lists, routing, the waits, the
     // window, how long a conversation stays, reasoning — folded under
     // Advanced below the rules, as a provider's editor folds its own (the

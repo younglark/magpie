@@ -135,6 +135,30 @@ handed over as `mcp__linear__…`. A deferred tool the run's model calls
 by the bare client name (`WebFetch`, `mcp__linear__…`) is the run's
 Claude Code's to answer and is not handed over.
 
+Claude Code's `/advisor` (`advisor_20260301`, sent with
+`CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL`, which the Claude Code
+advisor field writes) is a server tool: the run's Claude Code, offered
+magpie's tools only, can't pass it on, and Anthropic's server would not
+take magpie's id for its model anyway. Before #6804 the bridge read the
+request as a translation without one: the advisor was left out and its
+instructions turned into "The advisor tool is no longer available"
+(`advisorGoneIn`), so `/advisor` did nothing (recih on X, #6813).
+`bridgeRequest` now reads a Claude Code request whose advisor model
+magpie serves (`advisedInBridge`: `provider.Resolve` takes it, the client
+has no `advisor` tool of its own) as `readAdvised` does on a translation:
+`Request.Advisor` is set, the instructions and `tool_addition` stay as
+written, and the echoed `server_tool_use` and `advisor_tool_result` go
+back as the model's call and its result (`adviceApart`). The run is
+offered `advisorToolDef` beside magpie's tools, and `adviseOn` gives the
+run, for this request, `adviceRound`. A call of it is answered in
+`mcpCall`, as web search is: the advisor model is asked with what the
+reply said before the call (`adviceSaid`), within 55 seconds, and three
+calls a reply (`max_uses_exceeded` after). `toolStart` keeps the call
+from the client, which is told `KAdvice`'s `server_tool_use` and
+`advisor_tool_result` as on a translation. Claude Desktop, and an
+advisor model magpie doesn't serve, go as before.
+`TestBridgeRequestKeepsTheAdvisor`, `TestClaudeTUIAdvisorAnsweredHere`.
+
 A turn with `tool_choice` none is offered every tool the client sent, as
 any other turn is (bbfatx on X). Anthropic caches a prompt as tools, then
 system, then messages, so a turn offered fewer tools (a title or summary
@@ -469,8 +493,9 @@ path and the padded one were each taken as `[Image #1]`, and the bare
 path with no marks stayed words, as the reporter saw; the helper itself
 on that claude.exe, padded and bracketed, put the image in the
 transcript. Windows 10 itself is not tried; the padded path doesn't
-need the marks. Long pasted text there still loses blocks (#5205),
-which this doesn't change. If the interactive mode still doesn't take the image, the
+need the marks. Long pasted text there lost blocks (#5205); the ConPTY
+below keeps them, and the whole-message check catches what is still cut.
+If the interactive mode still doesn't take the image, the
 turn goes to `-p` as below, which the plan counts at about twice the
 interactive mode's and which starts without the interactive run's
 cache; the Routing chip's reason says so. Then the helper answers such a
@@ -488,6 +513,40 @@ run (Off meanwhile, the client gone) the failure is a 400, not a 502
 `claude_tui_unpasted_test.go` holds each case, and
 `TestShimPaddedImageTakenWithoutMarks` the padded paste on a console that
 drops the marks.
+
+On Windows 10 the helper doesn't use Windows' own ConPTY when it can
+avoid it (#5205; `console` in `child_windows.go`). In order: a `conpty`
+folder beside magpie.exe holding `conpty.dll` and `OpenConsole.exe`, the
+user's own; then, below build 22000 (`win11`), the pair a release carries
+(`internal/conptypair`): Microsoft.Windows.Console.ConPTY
+1.25.260930003 from nuget.org (MIT, both files signed by Microsoft), the
+version 3leg0ocat ran whole on 19044. The release fetches it
+(`go run ./build/conpty`, `make conpty-pair` before `release-cli` and
+`release-windows`), checks the package against the SHA-512 nuget.org
+publishes and each file against its pinned SHA-256, and embeds the pair
+(`-tags conptypair`, about 1.2MB per Windows binary). At run time
+`conptypair.Ready` writes it to `%LocalAppData%\magpie\conpty\<version>\<arch>`
+(temp file and rename) and checks both files there against their pins
+before `conpty.dll` is loaded; a file that doesn't match is written again.
+Anything that fails leaves the system's ConPTY, as does Windows 11, whose
+own keeps the marks. A dev build has no pair (`conptypair.Bundled`).
+
+Whatever the console, the helper checks that a message reached Claude
+Code whole (`whole.go`, from 3leg0ocat's patch). It took one as sent once
+a row of it reached the transcript, whatever the row held, so a cut
+message's tail was answered as the message. Now, while a message just sent
+waits for its row, the rows' words (a user row's text, a queued message's)
+are compared with the words pasted, white space, Claude Code's
+`<pasted_content>` tags, `[Image #N]` marks and format characters aside,
+in place with no copy; the paths of images Claude Code says it took
+(`[Image: source: <path>]` meta rows) are left out, and the images are
+counted. What Claude Code answers meanwhile is held (`hold`) for up to
+`wholeWait`. A message that isn't whole ends the turn as `Unpastable`
+before any of its reply, so the bridge asks it again as `-p`, as an image
+not taken; on Windows 10's own ConPTY the error says a `conpty` folder
+fixes it (`cutHint`). `whole_test.go` holds the comparison and the hold,
+and `TestShimCutMessageIsUnpastable` a fake Claude Code that loses a long
+paste's 1024-byte blocks.
 
 The other exception is Claude Code's auto mode classifier when its own
 cache marks keep a long transcript (#5585, #5655; `keptByPrint`,
@@ -516,7 +575,7 @@ A JSON schema is answered through an answer tool of magpie's
 (`claude_tui_schema.go`): interactive Claude Code takes `--json-schema`
 and does nothing with it (2.1.316, a real run: its result's
 `structured_output` is null), since its `StructuredOutput` tool is
-`-p`'s alone. `serveClaudeSubscription` compiles the schema
+`-p`'s alone, so an interactive run is given no `--json-schema` at all. `serveClaudeSubscription` compiles the schema
 (`compileAnswerSchema`: draft-07 unless it says otherwise, as `-p` reads
 one; a `$ref` outside itself is refused, never fetched) and adds the
 tool, `StructuredOutput` or a numbered name apart from the client's
@@ -532,6 +591,26 @@ the words around it reach the client (`r.schema`). A real run (haiku,
 fit a `pattern`. A schema the compiler can't take is a 400 before any
 run (`TestClaudeTUISchemaAnswer`, `TestClaudeTUISchemaAskedOnce`,
 `TestAnswerTool`).
+
+No value of a request's goes on a run's command line or in its
+environment over `startValueMax` (`claudetui.StartValueMax`, 16KiB):
+Linux refuses to start a program with one argument or variable over
+128KiB (`MAX_ARG_STRLEN`), Windows a variable over 32K characters. A
+long conversation's safeguards grew past it, and every start, the
+resume and the replay alike, failed `fork/exec …: argument list too
+long`, a 502 for every request after (#6848). The system prompt goes in
+files (`--system-prompt-file`), the messages on standard input, `-p`'s
+safeguards by `apply_flag_settings`, the interactive mode's in
+`guard.json` (above). `-p`'s JSON schema goes in `--json-schema` when it
+fits, else with the `initialize` request (`jsonSchema`, as the Agent SDK
+hands one over; a real 2.1.316 run answered `structured_output` from
+it). Claude Code passes over an `initialize` schema it can't use with
+no word of it, where the flag's exits (#3036), so such a schema is
+compiled first (`compileAnswerSchema`) and refused with a 400 before
+any run. `TestClaudeTUIStartBounded`, `TestClaudePrintStartBounded`,
+`TestClaudePrintSchemaPlaces` and
+`TestTapPutsSafeguardsTooLargeForTheEnvironment` hold it; on Linux the
+old code failed them with the real `argument list too long`.
 
 A first message of any length is pasted: a conversation told whole to
 a new Claude Code (one older than its session, or a client's own) can
@@ -556,8 +635,11 @@ Safeguards are taken, each turn's in every request (#4804). Interactive
 Claude Code reads `CLAUDE_CODE_EXTRA_BODY` from its own environment as
 it builds each request, and nothing outside it changes that once it runs
 (2.1.316: a later `apply_flag_settings` or a rewritten `--settings` file
-changes nothing it sends). `startRun` puts them in its environment, and
-writes the same extra body to `guard.json` in the run's temp folder
+changes nothing it sends). `startRun` puts them in its environment
+(`startSafeguards`: all of them when the extra body fits
+`startValueMax`, else without the parts Claude Code itself sheds,
+`safeguardsKept`, else `[]`, a stand-in Claude Code still sends), and
+writes the whole extra body to `guard.json` in the run's temp folder
 (`guardBody`; every interactive run has the file, `{}` with no
 safeguards), named to the helper by `MAGPIE_CLAUDE_GUARD`
 (`claudetui.GuardEnv`). The helper hands it to Claude Code as WSL reads
@@ -565,8 +647,11 @@ it, and takes it out of the environment otherwise. On each
 `/v1/messages` request whose body is a string with a `safeguards` key,
 `tap.js` reads the file, puts its `safeguards` there in place of Claude
 Code's, and sets `CLAUDE_CODE_EXTRA_BODY` in Claude Code's environment
-to it (the file without its `effort`), so the requests after are built
-with it. A JSON parse and stringify of a 2.1.316 body is byte for byte
+to it (the file without its `effort`) when it fits `envValueMax`
+(`StartValueMax`), so the requests after are built with it. A larger
+one leaves the stand-in there: what Claude Code starts (its MCP
+servers, tools) inherits the variable, and Linux starts nothing with
+one over 128KiB. A JSON parse and stringify of a 2.1.316 body is byte for byte
 the same, so the request is what Claude Code sends with that variable.
 At the first such request, or the first of the main turn's
 (`x-claude-code-request-class: main`), it writes `guard.json.live`. `setSafeguards` replaces the file (temp file and
@@ -687,6 +772,40 @@ a quiet variable set in magpie's environment or in their Claude Code's
 `settings.json` env is given to the run as they set it, and the run then
 reads no flags. An interactive run sends Claude Code's quota request as it
 starts, right before the turn's own. `TestClaudeRunReadsItsFlags` holds it.
+
+A turn's run also waits on magpie's MCP calls for as long as the caller's
+tool takes (`claudeToolWaitVars`): `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0`
+and `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0`. The caller runs the tools and
+has its own timeouts. Interactive Claude Code 2.1.322 otherwise moves a call
+still running after 120s to the background ("is still running after 120s.
+It was moved to the background as task …") and its model goes on without
+the result. The result then reaches the run while the model's next step is
+being written, and the caller's turn got a reply with `finish_reason:
+tool_calls` and no calls in it. The run went on making calls no client was
+shown, each moved to the background 120s later, until it was killed (Pi:
+29 such replies in 1341 turns after a tool of over 120s, none in 38735
+after a shorter one). Claude Code also aborts a call that sent nothing for
+30 minutes ("sent no response or progress for 1800s"). Measured on
+`claude -p` 2.1.322 with a stdio tool that sleeps (`-p` backgrounds only
+with `CLAUDE_AUTO_BACKGROUND_TASKS=1`, interactive mode always): a 4s
+background limit moves a 15s call to the background, `0` gets its result;
+a 5s idle limit aborts a 70s call at the 30s check, `0` gets its result. A
+value set in magpie's environment stays. `TestClaudeRunWaitsOnToolCalls`
+holds it, by -p and by the interactive mode, and
+`TestClaudeToolWaitVarsReachWSL` that a run in WSL is handed them.
+
+The same move delayed an answer. Pi's `ask_user_question` waited on its
+user past 120s, was moved to the background, and the model wrote a bash
+call past it that no client runs. The user's answer reached the run at once
+but the model only once the bash call was moved to the background too, its
+own 120s later (~113s after the answer, FunnyPartMent on X). Measured on
+2.1.316 against a fake Anthropic API and a stdio tool that takes 10s: with
+a 3s limit (interactive mode) or 8s (`-p`) the second call was written and
+the result came only as a task notification once that call was moved too;
+with `0` the model had the call's own result at 10.0s, by both, and no
+second call was made. `0` also turns off the move Claude Code makes to hand over a message
+that arrived mid-call (`isMcpCallMovableWithoutTimer` reads the same
+value).
 
 The helper still takes a typed `/usage`, and nothing of magpie's sends it
 now: it is told `{"type":"command","command":"/usage"}`, types it, waits for the
@@ -1072,6 +1191,23 @@ the first message, where its mark holds. Tested by
 `TestClaudeAppendInTheInteractiveMode`,
 `TestClaudeTUIConversationKeepsItsInstructionsWhereTheFirstAskHadThem` and
 `TestClaudeTUIResumedSessionIsGivenItsInstructions`.
+
+A Codex thread's instructions carry its collaboration mode (a
+`<collaboration_mode>` part of a developer message: Default or Plan).
+The Responses read lifts the developer messages before the first reply
+into the system prompt and keeps a later one in its turn as a
+`<system-reminder>` (#502), so the system prompt held the mode the thread
+started in, or was compacted in, for good. After a compaction in Plan
+mode, append.md said Plan "until a developer message explicitly ends it",
+and every switch back to Default was pasted text the model would not take
+from the user: it planned on every turn (#6835; #6100 is the same on a
+Chat provider). Every mode block in the system prompt now says the
+conversation's latest mode (`latestModeInSystem` in `responses.go`), so a
+switch gives the run new instructions, in append.md, in `-p`'s first
+message and in a resumed run alike: one new run per switch, not per turn.
+Codex's words are not changed; the switch stays in its turn too. Tested by
+`TestCollaborationModeInTheSystemIsTheLatest` and
+`TestClaudeRunTakesTheLatestCollaborationMode`.
 
 A request with client cache marks (#1717) is never lean: its system marks
 are placed in the first message. The mode is part of the run's identity
@@ -1501,6 +1637,21 @@ exact hashes. `TestClaudeImagesComingAndGoingInEarlierTurnsGoOnInTheRun`
 sends a 90-message conversation five turns, the images of its earlier
 turns taken out and sent back in turn, both with a line in their place
 and with nothing.
+
+`heardRuns` reads an assistant run's texts in a row as one part, their
+words with no whitespace, as `messageWords` does for the keys (#5705):
+the run keeps its reply as the one text it said, while the client sends
+it back as Anthropic's stream told it, a text block for each run of
+words between thinking blocks. Compared block by block, the first turn
+after such a reply whose client had taken out an earlier image was none
+the run had (Yqihotaru on X: omp keeps 5 images in a request to a
+provider it has no budget for, so each turn with a new image takes out
+the oldest; a turn after a reply with tool calls, or a turn without an
+image, matched). A user's texts stay apart, as the text an image left
+between them is what `lostFromRun` reads.
+`TestClaudeOmpImageBudgetGoesOnInItsRun` sends omp's clamped history
+eight turns, with the reply in one block and split by thinking, and an
+image with words, alone, before words, and two at once.
 
 A client that drops the images' message without adding text to a result
 goes on only when that message held images alone, no text. A tool result of an image alone (pi-ai's "(see attached image)")
